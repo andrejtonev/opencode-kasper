@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.log
+.opencode/
+package-lock.json
+AGENTS.md
+REVIEW_FULL.md
+debug-auto.ts

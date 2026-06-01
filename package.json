@@ -1,0 +1,67 @@
+{
+  "name": "@atonev/opencode-kasper",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenCode plugin that monitors agent sessions, scores adherence to user instructions via LLM-as-judge, and injects corrective instructions into AGENTS.md and per-agent prompt files.",
+  "author": "andrejtonev <29177572+andrejtonev@users.noreply.github.com>",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "plugin",
+    "kasper",
+    "agent",
+    "monitoring",
+    "llm",
+    "scoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andrejtonev/opencode-kasper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/andrejtonev/opencode-kasper/issues"
+  },
+  "homepage": "https://github.com/andrejtonev/opencode-kasper#readme",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ tests/ scripts/",
+    "lint:fix": "biome check --write src/ tests/ scripts/",
+    "format": "biome format --write src/ tests/ scripts/",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
+    "prepublishOnly": "npm run build",
+    "install-plugin": "node scripts/symlink-plugin.mjs"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.14.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.14.25",
+    "@opencode-ai/sdk": "^1.15.11",
+    "@biomejs/biome": "^2.4.15",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}

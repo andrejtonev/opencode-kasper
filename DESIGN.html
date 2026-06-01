@@ -1,0 +1,932 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Observer Plugin — Design &amp; Implementation</title>
+<style>
+  :root { --bg: #0d1117; --fg: #e6edf3; --accent: #58a6ff; --border: #30363d; --code-bg: #161b22; --h1: #f0f6fc; --h2: #79c0ff; --h3: #d2a8ff; --green: #3fb950; --yellow: #d29922; --red: #f85149; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); line-height: 1.7; max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1 { color: var(--h1); font-size: 2.2rem; border-bottom: 1px solid var(--border); padding-bottom: .5rem; margin-bottom: 1.5rem; }
+  h2 { color: var(--h2); font-size: 1.5rem; margin-top: 2.5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: .3rem; }
+  h3 { color: var(--h3); font-size: 1.15rem; margin-top: 1.8rem; margin-bottom: .6rem; }
+  p, li { margin-bottom: .6rem; }
+  ul, ol { padding-left: 1.5rem; margin-bottom: 1rem; }
+  code { background: var(--code-bg); padding: .15em .4em; border-radius: 4px; font-size: .88em; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1rem; overflow-x: auto; margin: 1rem 0; font-size: .85rem; }
+  pre code { background: none; padding: 0; border-radius: 0; }
+  blockquote { border-left: 3px solid var(--accent); padding-left: 1rem; color: #8b949e; margin: 1rem 0; }
+  .tag { display: inline-block; background: #1f2937; color: var(--accent); padding: .1rem .6rem; border-radius: 12px; font-size: .75rem; font-weight: 600; margin-right: .3rem; }
+  .tag-green { background: #0f2d1a; color: var(--green); }
+  .tag-yellow { background: #2d1f0f; color: var(--yellow); }
+  .tag-red { background: #2d0f0f; color: var(--red); }
+  .box { border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin: 1rem 0; background: var(--code-bg); }
+  .box-title { font-weight: 600; margin-bottom: .5rem; color: var(--h2); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { border: 1px solid var(--border); padding: .5rem .8rem; text-align: left; }
+  th { background: var(--code-bg); color: var(--h2); font-weight: 600; }
+  .toc { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px; padding: 1.2rem; margin: 1.5rem 0; }
+  .toc h3 { margin-top: 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .status { display: inline-block; padding: .1rem .5rem; border-radius: 12px; font-size: .75rem; font-weight: 600; }
+  .status-proposed { background: #2d1f0f; color: var(--yellow); }
+  .status-in-progress { background: #0f2d1a; color: var(--green); }
+  .status-done { background: #1f2937; color: #8b949e; }
+  .status-blocked { background: #2d0f0f; color: var(--red); }
+</style>
+</head>
+<body>
+
+<h1>Observer Plugin — Design &amp; Implementation</h1>
+
+<p><span class="tag tag-green">v0.6</span> <span class="tag">2026-05-16</span></p>
+
+<nav class="toc">
+<h3>Contents</h3>
+<ol>
+  <li><a href="#overview">Overview &amp; Goals</a></li>
+  <li><a href="#architecture">Architecture</a></li>
+  <li><a href="#plugin-api">Plugin API Surface</a></li>
+  <li><a href="#scoring">Adherence Scoring Engine</a></li>
+  <li><a href="#subagent-observation">Subagent Observation &amp; Prompt Updates</a></li>
+  <li><a href="#agents-md">AGENTS.md Management</a></li>
+  <li><a href="#backup">Backup &amp; Rollback</a></li>
+  <li><a href="#cross-process">Cross-Process Safety</a></li>
+  <li><a href="#user-interaction">User Interaction Model</a></li>
+  <li><a href="#aggregation">Cross-Session Aggregation</a></li>
+  <li><a href="#data-flow">Data Flow Diagram</a></li>
+  <li><a href="#current-status">Current Status &amp; Known Gaps</a></li>
+  <li><a href="#open-questions">Open Questions</a></li>
+  <li><a href="#dev-log">Dev Log</a></li>
+</ol>
+</nav>
+
+<hr>
+
+<h2 id="overview">1. Overview &amp; Goals</h2>
+
+<p>
+The <strong>Observer Plugin</strong> is an <strong>opencode plugin</strong> that monitors all agent sessions (main + subagents), evaluates how well each agent follows its instructions, and <em>iteratively improves</em> behavior by updating <code>AGENTS.md</code> and agent-specific prompt files.
+</p>
+
+<div class="box">
+<div class="box-title">Core Goals</div>
+<ul>
+  <li><strong>Observe</strong> — passively listen to all session events, tool calls, and messages across main agent and subagent child sessions</li>
+  <li><strong>Evaluate</strong> — score each session against the user's stated goals/instructions via LLM-as-judge</li>
+  <li><strong>Improve</strong> — suggest and apply refinements to <code>AGENTS.md</code> (project-level rules) and individual agent prompt files (<code>.opencode/agents/{name}.md</code> or <code>opencode.json</code>)</li>
+  <li><strong>Backup</strong> — maintain version history of all prompt changes for rollback</li>
+  <li><strong>Cross-session</strong> — aggregate observations across all sessions, including per-agent breakdowns</li>
+  <li><strong>User control</strong> — command-driven interaction: trigger evaluations manually, approve/reject improvements, review history</li>
+</ul>
+</div>
+
+<h2 id="architecture">2. Architecture</h2>
+
+<pre>
+┌─────────────────────────────────────────────────────────────────┐
+│                       opencode Desktop/TUI                       │
+│  ┌──────────────────┐   ┌──────────────┐   ┌──────────────────┐ │
+│  │   Build (primary) │   │  Plan (prim) │   │ General/Explore  │ │
+│  │   Main session    │   │  Main sess   │   │ Scout (subagents)│ │
+│  │                   │   │              │   │ Child sessions   │ │
+│  │ User msg → action │   │ Analysis     │   │ Spawned via Task │ │
+│  │ tool.execute.*    │───┤              │───┤ tool.execute.*   │ │
+│  │ chat.message      │   │              │   │ chat.message     │ │
+│  │ session.* events  │   │              │   │ session.* events │ │
+│  └────────┬──────────┘   └──────┬───────┘   └────────┬─────────┘ │
+└───────────┼─────────────────────┼────────────────────┼───────────┘
+            │                     │                    │
+            ▼                     ▼                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Observer Plugin                             │
+│                                                                  │
+│   event() · chat.message() · tool.execute.after()               │
+│   session.created() · experimental.session.compacting()         │
+│                                                                  │
+│   ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐  │
+│   │  Scorer      │  │  State Store │  │  Prompt Managers     │  │
+│   │  - dedicated │  │  - sessions  │  │  - AGENTS.md (project)│  │
+│   │    child sess │  │  - aggregate │  │  - Agent prompts     │  │
+│   │  - json_schema│  │  - per-agent │  │    (.md or json)     │  │
+│   │  - 5 dimensions│ │  - debounced │  │  - Backups/rollback  │  │
+│   └──────────────┘  └──────────────┘  └─────────────────────┘  │
+│                                                                  │
+│   ┌──────────────────────────────────────────────────────────┐  │
+│   │  Persistence: .opencode/observer/                         │  │
+│   │  - state.json (per-project, cross-session)                │  │
+│   │  - backups/ (AGENTS.md + agent prompt history)            │  │
+│   └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+</pre>
+
+<h3>2.1 Component Breakdown</h3>
+
+<table>
+<tr><th>Component</th><th>Role</th><th>Status</th><th>Mechanism</th></tr>
+<tr>
+  <td><strong>Event Listener</strong></td>
+  <td>Captures raw events from all sessions (main + subagent)</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td><code>event</code>, <code>chat.message</code>, <code>tool.execute.after</code>, <code>session.created</code> hooks</td>
+</tr>
+<tr>
+  <td><strong>Scorer</strong></td>
+  <td>Scores sessions for instruction adherence via LLM-as-judge</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td>Dedicated child session with <code>session.prompt({ format: "json_schema" })</code></td>
+</tr>
+<tr>
+  <td><strong>AGENTS.md Manager</strong></td>
+  <td>Reads, backs up, injects sections, writes project-level AGENTS.md</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td>File system ops, Markdown section injection/removal, timestamped backups</td>
+</tr>
+<tr>
+  <td><strong>Agent Prompt Manager</strong></td>
+  <td>Read/write/backup individual agent prompt files (<code>.opencode/agents/{name}.md</code>, <code>opencode.json</code>)</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td>Parse markdown frontmatter + body, JSON merge for config-based prompts</td>
+</tr>
+<tr>
+  <td><strong>Compaction Injector</strong></td>
+  <td>Injects aggregate observer feedback into compaction summaries with score badges and trend indicators</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td><code>experimental.session.compacting</code> hook — pushes top weaknesses + avg score + per-agent stats + score emoji + trend arrows into context array</td>
+</tr>
+<tr>
+  <td><strong>Cross-Process Lock</strong></td>
+  <td>Prevents data corruption when multiple opencode instances run on the same project</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td>Exclusive file creation (<code>open('wx')</code>) + stale lock detection (30s timeout) + merge-before-write on state.json</td>
+</tr>
+<tr>
+  <td><strong>State Store</strong></td>
+  <td>Persistent cross-session state with per-agent aggregation and rejected patterns</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td><code>.opencode/observer/state.json</code> — sessions aggregated globally + per-agent breakdowns + rejected_patterns</td>
+</tr>
+<tr>
+  <td><strong>Backup System</strong></td>
+  <td>Versioned backups of AGENTS.md and agent prompt files</td>
+  <td><span class="status status-done">DONE</span></td>
+  <td><code>.opencode/observer/backups/</code> — backs up both AGENTS.md and per-agent prompts</td>
+</tr>
+</table>
+
+<h2 id="plugin-api">3. Plugin API Surface</h2>
+
+<p>The plugin exports a server-side plugin function. There is one plugin instance per opencode instance — all state is shared across all sessions (main + subagent child sessions). The plugin receives <code>{ project, directory, client }</code> at init and returns a hooks object.</p>
+
+<h3>3.1 Server Plugin Hooks</h3>
+
+<table>
+<tr><th>Hook</th><th>Status</th><th>Purpose</th></tr>
+<tr><td><code>event</code></td><td><span class="status status-done">DONE</span></td><td>Listen to all session lifecycle events — scoring is triggered by polling (<code>setInterval</code> via <code>pollAndEvaluate()</code>) rather than idle events</td></tr>
+<tr><td><code>chat.message</code></td><td><span class="status status-done">DONE</span></td><td>Capture user instructions (creates PendingEval) and assistant responses (appends to PendingEval)</td></tr>
+<tr><td><code>tool.execute.after</code></td><td><span class="status status-done">DONE</span></td><td>Capture tool calls made by the agent — tool name, args, and actual results recorded</td></tr>
+<tr><td><code>tool.execute.before</code></td><td><span class="status status-done">DONE</span></td><td>Capture tool inputs before execution — used for slash command interception via <code>command.execute.before</code></td></tr>
+<tr><td><code>experimental.session.compacting</code></td><td><span class="status status-done">DONE</span></td><td>Inject top weaknesses + average score + per-agent stats + score emoji + trend arrows into compaction context</td></tr>
+<tr><td><code>experimental.compaction.autocontinue</code></td><td><span class="status status-yellow">TODO</span></td><td>Optionally suppress auto-continue while observer is running an evaluation</td></tr>
+<tr><td><code>session.created</code></td><td><span class="status status-done">DONE</span></td><td>Detect new subagent child sessions — learn agent type/name for per-agent tracking, populate agentSessionIDs</td></tr>
+<tr><td><code>session.deleted</code></td><td><span class="status status-done">DONE</span></td><td>Clean up pending evaluations, agent registry, idle times, and parent/child mappings for deleted sessions</td></tr>
+</table>
+
+<div class="box">
+<div class="box-title">Key Architectural Insight</div>
+<p>The plugin function runs <strong>once</strong> when opencode loads, and the hooks object is used for <strong>ALL</strong> sessions — both primary agent sessions and subagent child sessions. The <code>pendingEvaluations</code> Map is keyed by <code>sessionID</code>, so subagent sessions naturally get their own entries. All state (<code>stateStore</code>, <code>agentsMd</code>, <code>scorer</code>) is shared in the closure across all sessions.</p>
+</div>
+
+<h3>3.2 Custom Tools</h3>
+
+<p>The plugin registers 9 custom tools for the main agent to interact with the observer:</p>
+
+<pre>
+observer_status        — Ask the observer for its current evaluation score and aggregate stats
+observer_improve       — Request that the observer suggest AGENTS.md improvements
+observer_history       — Retrieve adherence history and scores
+observer_auto          — Enable/disable automatic AGENTS.md updates for the session
+observer_score_agent   — View the most recent evaluation for a specific agent type
+observer_reject        — Reject an improvement suggestion by pattern or index
+observer_rejections    — List all rejected weakness patterns
+observer_unreject      — Remove a rejection, restoring the pattern
+observer_steer         — Provide evaluation guidance that influences the scorer
+</pre>
+
+<h3>3.3 TUI Plugin (Optional)</h3>
+
+<p>A TUI plugin registers an observer panel/slot showing:</p>
+<ul>
+  <li>Current session adherence score with emoji indicator</li>
+  <li>ASCII sparkline trend (last 7 sessions)</li>
+  <li>Suggested improvements with reject/apply controls</li>
+  <li>Backup history and rollback</li>
+</ul>
+
+<h2 id="scoring">4. Adherence Scoring Engine</h2>
+
+<h3>4.1 Scoring Model</h3>
+
+<p>The scorer uses an LLM call via a <strong>dedicated child session</strong> with structured output (<code>json_schema</code>). The child session is created, prompted, and immediately deleted — keeping the scoring prompt out of the main session's context.</p>
+
+<pre>
+ScoreCard {
+  session_id: string;
+  message_id?: string;
+  timestamp: number;
+  overall_score: number;          // 0.0 - 1.0
+  categories: {
+    instruction_following: number;  // Did the agent do what was asked?
+    completeness: number;           // Did it finish the task?
+    proactiveness: number;          // Did it over-step or under-step?
+    code_quality: number;           // Quality of generated code
+    communication: number;          // Clarity of explanations
+  };
+  strengths: string[];
+  weaknesses: string[];
+  suggested_agents_md_update?: string;      // A suggested AGENTS.md addition
+  suggested_agent_prompt_update?: string;    // A suggested agent prompt addition
+}
+</pre>
+
+<p>On scoring failure, defaults to 0.5 for all categories with <code>weaknesses: ["Scoring failed: ..."]</code>. Scoring sessions are always deleted in a <code>finally</code> block.</p>
+
+<h3>4.2 Evaluation Trigger Flow</h3>
+
+<p>The judging side-session is triggered <strong>automatically</strong> by a polling timer (<code>setInterval</code> every 10s via <code>pollAndEvaluate()</code>):</p>
+
+<ol>
+  <li><code>chat.message</code> (user role) → creates a <code>PendingEval</code> entry in the Map, keyed by <code>sessionID</code></li>
+  <li><code>chat.message</code> (assistant role) → appends response text parts to the pending eval</li>
+  <li><code>tool.execute.after</code> → appends tool call records (currently with <code>result: "(see output)"</code> — actual outputs discarded)</li>
+  <li><code>setInterval</code> tick → <code>pollAndEvaluate()</code> → calls <code>runEvaluation()</code> which:
+    <ul>
+      <li>Reads current AGENTS.md content</li>
+      <li>Builds <code>ScorerInput</code> from pending data</li>
+      <li>Calls <code>scorer.evaluate()</code> → creates child session, prompts with structured output, deletes child session</li>
+      <li>Records the session + score card in state store</li>
+      <li>If score &lt; threshold: calls <code>considerImprovement()</code></li>
+    </ul>
+  </li>
+</ol>
+
+<p><strong>Code location:</strong> Trigger at <code>src/index.ts:115-142</code>, child session creation at <code>src/scorer.ts:103-120</code>.</p>
+
+<h3>4.3 SCORE_PROMPT</h3>
+
+<p>Defined at <code>src/scorer.ts:16-26</code>. The eval LLM is asked to score on 5 dimensions, identify strengths/weaknesses, and optionally suggest AGENTS.md additions. The full prompt (assembled at <code>src/scorer.ts:201-228</code> in <code>buildEvalPrompt()</code>) appends:</p>
+<ul>
+  <li>User's original instruction</li>
+  <li>Agent's response text</li>
+  <li>Tool calls made (args shown, results truncated to 500 chars)</li>
+  <li>Current AGENTS.md content</li>
+  <li>Current agent prompt (if available)</li>
+  <li>User steering guidance (if set via <code>/observer steer</code>)</li>
+</ul>
+
+<div class="box">
+<div class="box-title">Model Configuration</div>
+<p>The <code>config.model</code> field (default: <code>"opencode/deepseek-v4-flash-free"</code>) is parsed via <code>parseModelString()</code> and passed as <code>model</code> option to both <code>sessionClient.create()</code> and <code>sessionClient.prompt()</code>.</p>
+</div>
+
+<h3>4.5 Scoring Detail Level</h3>
+<p>The <code>config.detail_level</code> field controls what context is included in the scoring prompt, balancing depth against token cost:</p>
+<table>
+<tr><th>Level</th><th>Tool call detail</th><th>AGENTS.md</th><th>Agent prompt</th><th>Result truncation</th></tr>
+<tr><td><code>minimal</code></td><td>Tool names only</td><td>Excluded (noted as present)</td><td>Excluded (noted as present)</td><td>N/A</td></tr>
+<tr><td><code>standard</code> (default)</td><td>Args + 500-char results</td><td>Included</td><td>Included</td><td>500 chars</td></tr>
+<tr><td><code>thorough</code></td><td>Args + 2000-char results</td><td>Included</td><td>Included</td><td>2,000 chars</td></tr>
+</table>
+
+<h3>4.4 Triggers (Design vs Implementation)</h3>
+<ul>
+  <li><del>After each <code>tool.execute.after</code></del> — NOT implemented; only accumulates data</li>
+  <li><del>After each complete assistant response</del> — NOT implemented; only accumulates data</li>
+  <li><strong>Poll-based via <code>setInterval</code></strong> — IMPLEMENTED (primary trigger, 10s <code>pollAndEvaluate()</code>)</li>
+  <li><del>On <code>session.compacted</code></del> — NOT implemented</li>
+</ul>
+
+<p>Currently evaluates only once per session (at poll time, with re-evaluation on new messages). Mid-session evaluation and per-response scoring are design goals but not built.</p>
+
+<h2 id="subagent-observation">5. Subagent Observation &amp; Prompt Updates</h2>
+
+<h3>5.1 OpenCode Subagent Model</h3>
+
+<p>OpenCode has two agent modes:</p>
+<ul>
+  <li><strong>Primary agents</strong> (<code>mode: "primary"</code>): Build, Plan, Compaction, Title, Summary — tab-switchable, main conversation surface</li>
+  <li><strong>Subagents</strong> (<code>mode: "subagent"</code>): General, Explore, Scout, + custom — invoked by the primary agent via the <code>Task</code> tool, or manually by <code>@ mentioning</code></li>
+</ul>
+
+<p>Subagents create child sessions navigable with keybinds. Each agent has its own <strong>system prompt</strong> configured in one of two ways:</p>
+
+<ol>
+  <li><strong>opencode.json</strong>: <code>agent.{name}.prompt: "{file:./prompts/build.txt}"</code> — file path reference</li>
+  <li><strong>Markdown files</strong>: <code>.opencode/agents/{name}.md</code> (project) or <code>~/.config/opencode/agents/{name}.md</code> (global) — frontmatter (mode, description, model, permission, etc.) + body is the system prompt</li>
+</ol>
+
+<h3>5.2 How Subagents Are Observed</h3>
+
+<p>The existing plugin hooks (<code>chat.message</code>, <code>tool.execute.after</code>, <code>event</code>) receive <code>sessionID</code> and fire for <strong>ALL</strong> sessions — including subagent child sessions. Since the <code>pendingEvaluations</code> Map is keyed by <code>sessionID</code>, subagent sessions naturally accumulate their own pending evals. What's missing is:</p>
+
+<ol>
+  <li><strong>Session type detection</strong> — hook <code>session.created</code> to learn which agent type/name spawned each session</li>
+  <li><strong>Per-agent tracking</strong> — extend <code>SessionRecord</code> with <code>agent_name</code> and <code>agent_type</code> fields</li>
+  <li><strong>Per-agent aggregation</strong> — compute separate weakness/strength stats per agent (General's weaknesses differ from Build's)</li>
+  <li><strong>Agent prompt context</strong> — include the agent's current prompt in scoring so the eval LLM can suggest agent-specific improvements</li>
+</ol>
+
+<h3>5.3 Agent Prompt Manager (New Component)</h3>
+
+<p>A new <code>AgentPromptManager</code> class (paralleling <code>AgentsMdManager</code>) would:</p>
+
+<ul>
+  <li><strong>Detect</strong> where an agent's prompt lives: markdown file vs <code>opencode.json</code></li>
+  <li><strong>Read</strong> the current prompt (for inclusion in scoring context)</li>
+  <li><strong>Write</strong> improvements — for markdown agents, inject a new section in the body; for JSON-based agents, add/replace section in the prompt text</li>
+  <li><strong>Update description</strong> — subagent <code>description</code> frontmatter controls when the primary agent invokes it; if the observer detects a capability gap, it should update the description too</li>
+  <li><strong>Backup</strong> before modification, same timestamped scheme as AGENTS.md</li>
+</ul>
+
+<h3>5.4 Update Flow for Subagent Prompts</h3>
+
+<pre>
+Subagent session created (via Task tool or @ mention)
+        │
+        ▼
+session.created hook detects agent type/name
+        │
+        ▼
+Chat + tool hooks accumulate PendingEval (same as main)
+        │
+        ▼
+pollAndEvaluate() triggers runEvaluation()
+        │
+        ▼
+Scorer includes current agent prompt in context
+        │
+        ▼
+ScoreCard + agent_name recorded in state store
+        │
+        ▼
+Per-agent aggregate recalculated
+        │
+        ▼
+If weakness confirmed across N observations for THIS agent:
+        │
+        ▼
+AgentPromptManager.injectImprovement(agentName, suggestion)
+        │
+        ▼
+Backup current prompt → write updated prompt
+        │
+        ▼
+Agent prompt changes take effect on next subagent invocation
+</pre>
+
+<h3>5.5 Design Decisions to Resolve</h3>
+
+<ul>
+  <li><strong>JSON injection</strong>: Modifying agent prompts in <code>opencode.json</code> is messy — should we instead create a companion markdown agent file that overrides/supplements?</li>
+  <li><strong>New agent creation</strong>: If a subagent has no markdown file yet, should the observer create one (preferred) or modify <code>opencode.json</code>?</li>
+  <li><strong>Description updates</strong>: When observer detects that a subagent's description doesn't capture its actual capabilities, should it update the <code>description</code> frontmatter so the primary agent knows when to invoke it?</li>
+  <li><strong>Task permission interaction</strong>: The <code>permission.task</code> config controls which agents can invoke which subagents. The observer should not override these — just improve the prompts.</li>
+</ul>
+
+<h2 id="agents-md">6. AGENTS.md Management</h2>
+
+<h3>6.1 Update Strategy</h3>
+
+<p>When the observer detects a pattern of non-adherence (e.g., "agent keeps using wrong test framework"), it formulates an <code>AGENTS.md</code> update. The strategy:</p>
+
+<ol>
+  <li><strong>Accumulate</strong> — collect weakness signals across multiple sessions</li>
+  <li><strong>Threshold</strong> — only suggest updates after N observations (configurable, default 3)</li>
+  <li><strong>Section injection</strong> — insert/replace a named <code>## Section</code> in AGENTS.md</li>
+  <li><strong>User approval</strong> — ask the user before modifying AGENTS.md (configurable to auto-approve) — <strong>DESIGNED but NOT IMPLEMENTED</strong></li>
+  <li><strong>Auto-apply</strong> — on approval, backup current AGENTS.md, write new version</li>
+</ol>
+
+<div class="box">
+<div class="box-title">Current Behavior</div>
+<p>The implementation respects the <code>auto_update_agents_md</code> config flag. When false (default), improvements queue as pending and await <code>/observer apply</code>. When true, or when session auto-update is toggled on via <code>/observer auto on</code>, improvements auto-apply. Weakness matching uses fuzzy similarity (exact + substring + Jaccard word overlap via <code>weaknessSimilarity()</code>). Rejected patterns are tracked with fuzzy matching and never re-suggested.</p>
+</div>
+
+<h3>6.2 Sections Observer Manages</h3>
+
+<p>The observer maintains a dedicated section in AGENTS.md:</p>
+
+<pre>
+## Observer Inferred Instructions
+*This section is managed by the Observer plugin. Do not edit manually.*
+- Use `vitest` for unit tests (not Jest)
+- Always run `tsc --noEmit` after edits
+- Prefer `path.join()` over string concatenation
+...
+</pre>
+
+<p>It may also update other sections when confidence is high (e.g., updating <code>## Code Standards</code>).</p>
+
+<h2 id="backup">7. Backup &amp; Rollback</h2>
+
+<h3>7.1 Backup Format</h3>
+
+<p>All backups stored in <code>.opencode/observer/backups/</code>:</p>
+
+<pre>
+.opencode/observer/backups/
+  AGENTS.md/
+    2026-05-15T10-30-00Z--pre-improvement.md   # AGENTS.md backup
+    2026-05-15T12-00-00Z--automatic.md
+  agents/                                       # TODO: per-agent prompt backups
+    build/
+      2026-05-15T10-30-00Z--inferred.md
+    explore/
+      2026-05-15T10-30-00Z--inferred.md
+</pre>
+
+<h3>7.2 Rollback</h3>
+<ul>
+  <li>User can run <code>/observer rollback</code> to revert the last change to AGENTS.md or <code>/observer rollback &lt;agent&gt;</code> for an agent prompt</li>
+  <li>Multiple rollbacks revert further back in the backup chain</li>
+  <li>Backup index stored in state store for easy navigation</li>
+  <li><span class="status status-done">DONE</span> for both AGENTS.md and agent prompts</li>
+</ul>
+
+<h2 id="cross-process">8. Cross-Process Safety</h2>
+
+<h3>8.1 Locking Strategy</h3>
+
+<p>When multiple opencode instances run on the same project, concurrent writes to <code>state.json</code>, <code>AGENTS.md</code>, and agent prompt files can cause data loss. The observer now uses cross-process file locking:</p>
+
+<ul>
+  <li><strong>Lock acquisition</strong>: <code>acquireLock(path, timeoutMs)</code> in <code>src/lock.ts</code> — exclusive file creation via <code>fs.open(path, 'wx')</code> (atomic on all platforms)</li>
+  <li><strong>Stale detection</strong>: Locks older than 30 seconds are considered stale and automatically cleaned up — prevents deadlock from crashed processes</li>
+  <li><strong>Retry with backoff</strong>: Exponential backoff (10ms → 20ms → ... → 500ms) up to 5-second default timeout</li>
+  <li><strong>PID tracking</strong>: Lock files contain the owning process PID for debugging</li>
+</ul>
+
+<h3>8.2 State Merge-Before-Write</h3>
+
+<p>For <code>state.json</code>, the flush acquires the lock, then <strong>re-reads</strong> the current file to merge in any sessions/improvements/rejections written by other processes since our last load. Only then does it write. This prevents the classic read-modify-write race.</p>
+
+<h3>8.3 Protected Resources</h3>
+
+<table>
+<tr><th>Resource</th><th>Lock</th><th>Strategy</th></tr>
+<tr><td><code>state.json</code></td><td><code>state.json.lock</code></td><td>Lock → merge external → write → unlock</td></tr>
+<tr><td><code>AGENTS.md</code></td><td><code>AGENTS.md.lock</code></td><td>Lock → read → modify → atomic write → unlock</td></tr>
+<tr><td>Agent prompts</td><td><code>{agent}.md.lock</code></td><td>Lock → read → inject section → atomic write → unlock</td></tr>
+</table>
+
+<h2 id="user-interaction">9. User Interaction Model</h2>
+
+<h3>9.1 Slash Commands</h3>
+
+<p>Thirteen slash commands implemented under <code>/observer</code>:</p>
+
+<table>
+<tr><th>Command</th><th>Description</th></tr>
+<tr><td><code>/observer status [agent]</code></td><td>Show aggregate stats, top weaknesses, recent sessions, ASCII sparkline trend, improvement deltas</td></tr>
+<tr><td><code>/observer score [agent|sessionID]</code></td><td>Trigger manual evaluation, view agent-specific results, or evaluate a historical session by ID</td></tr>
+<tr><td><code>/observer suggest [agent]</code></td><td>Generate improvement suggestions (AGENTS.md + agent prompts), excluding rejected patterns</td></tr>
+<tr><td><code>/observer apply</code></td><td>Apply the next pending improvement to AGENTS.md or agent prompt</td></tr>
+<tr><td><code>/observer accept &lt;index&gt;</code></td><td>Apply a specific pending improvement by its 1-based index number</td></tr>
+<tr><td><code>/observer rollback</code></td><td>Rollback last AGENTS.md change via backup</td></tr>
+<tr><td><code>/observer history [agent]</code></td><td>Full adherence history with score breakdowns and per-improvement deltas</td></tr>
+<tr><td><code>/observer config</code></td><td>Display full configuration + session state + guidance</td></tr>
+<tr><td><code>/observer auto [prompts] [on|off]</code></td><td>Toggle per-session auto-update for AGENTS.md or agent prompts</td></tr>
+<tr><td><code>/observer steer &lt;guidance|reset&gt;</code></td><td>Set evaluation guidance for the scorer</td></tr>
+<tr><td><code>/observer reject [&lt;n&gt;|&lt;pattern&gt;]</code></td><td>Reject an improvement suggestion by index or weakness pattern</td></tr>
+<tr><td><code>/observer rejections</code></td><td>List all rejected weakness patterns</td></tr>
+<tr><td><code>/observer unreject &lt;pattern&gt;</code></td><td>Remove a rejection (fuzzy match), restoring the pattern</td></tr>
+<tr><td><code>/observer help</code></td><td>Show all available commands with descriptions and scoring key</td></tr>
+</table>
+
+<p>Commands are intercepted via <code>command.execute.before</code> hook. Output is set on <code>output.message</code> with <code>output.stop = true</code> to prevent passthrough.</p>
+
+<p>Additionally, 9 custom tools are registered (see §3.2) allowing the agent to query and control the observer programmatically.</p>
+
+<h3>9.2 Configuration Schema</h3>
+
+<pre>
+{
+  "observer": {
+    "enabled": true,
+    "auto_update_agents_md": false,     // Require user approval before AGENTS.md updates
+    "auto_update_agent_prompts": false,  // Require user approval before agent prompt updates
+    "scoring_threshold": 0.6,           // Below this triggers improvement
+    "min_observations_for_update": 3,   // Accumulate before suggesting
+    "max_history": 100,                 // Max score cards to keep
+    "backup_enabled": true,
+    "backup_max_versions": 20,
+    "model": "opencode/deepseek-v4-flash-free",  // Model for scoring
+    "sections_managed": [               // Which AGENTS.md sections to manage
+      "Observer Inferred Instructions"
+    ],
+    "agents_observed": [                // which agents to observe (default: all)
+      "build", "plan", "general", "explore", "scout"
+    ],
+    "detail_level": "standard"          // Scoring context detail: minimal|standard|thorough
+  }
+}
+</pre>
+
+<h3>9.3 Toast Notifications</h3>
+<p>The plugin uses <code>showToast()</code> to notify users non-intrusively:</p>
+<ul>
+  <li>Evaluation start: "Evaluating session `&lt;instruction&gt;`..."</li>
+  <li>Low adherence score (&lt;0.4): warning toast with score percentage</li>
+  <li>Medium/high score (>=0.4): info toast with score emoji (green/yellow/red) and percentage</li>
+  <li>Improvement pending: "Improvement suggestion available. /observer apply to review."</li>
+  <li>Improvement applied: "AGENTS.md updated with new instructions."</li>
+  <li>Rollback: "AGENTS.md rolled back."</li>
+</ul>
+<p><span class="status status-done">DONE</span> — all implemented via <code>tui.showToast()</code>.</p>
+
+<h2 id="aggregation">10. Cross-Session Aggregation</h2>
+
+<h3>9.1 State Store</h3>
+
+<p>File: <code>.opencode/observer/state.json</code></p>
+
+<p>One plugin instance per opencode process = one state store per project. All sessions (main + subagent child sessions) are tracked in the same store and aggregated together.</p>
+
+<pre>
+{
+  "version": 1,
+  "sessions": {
+    "&lt;session_id&gt;": {
+      "title": "...",
+      "agent_name": "build",          // NEW: which agent ran this session
+      "agent_type": "primary",        // NEW: "primary" | "subagent"
+      "parent_session_id": "...",     // NEW: for subagent child sessions
+      "score": 0.75,
+      "score_card": { ... },
+      "weaknesses": ["..."],
+      "timestamp": 1700000000000
+    }
+  },
+  "aggregate": {
+    "total_sessions": 12,
+    "avg_score": 0.72,
+    "top_weaknesses": [ ... ],
+    "top_strengths": [ ... ],
+    "by_agent": {                     // NEW: per-agent breakdown
+      "build": {
+        "total_sessions": 5,
+        "avg_score": 0.80,
+        "top_weaknesses": [ ... ]
+      },
+      "explore": {
+        "total_sessions": 3,
+        "avg_score": 0.65,
+        "top_weaknesses": [
+          { "pattern": "reads too little context before answering", "count": 3 }
+        ]
+      }
+    }
+  },
+  "improvements_applied": [
+    {
+      "id": "uuid-string",
+      "timestamp": 1700000000000,
+      "target": "agents_md",          // NEW: "agents_md" | "agent_prompt"
+      "agent_name": "build",          // NEW: for per-agent improvements
+      "diff": "...",
+      "reason": "...",
+      "backup_path": "...",
+      "outcome_score_delta": +0.05
+    }
+  ],
+  "config": { ... }
+}
+</pre>
+
+<h3>10.2 Per-Agent Aggregation</h3>
+
+<p>Per-agent breakdowns are fully implemented via <code>getAgentAggregate(agentName)</code> and <code>getAgentSessions(agentName)</code>. Each agent's sessions are tracked separately:</p>
+<ul>
+  <li>Build agent weaknesses tracked separately from Explore agent weaknesses</li>
+  <li>Improvements target the right prompt file (AGENTS.md for project-wide issues, agent prompt for agent-specific issues)</li>
+  <li>Agent session IDs tracked via <code>agentSessionIDs</code> map, populated on <code>session.created</code></li>
+  <li>Rejected patterns persisted in <code>state.json</code> under <code>rejected_patterns</code> array</li>
+</ul>
+
+<h3>10.3 Single Instance / Cross-Project</h3>
+
+<p>The observer is <strong>project-scoped</strong> (per <code>.opencode/</code> directory). The plugin context is shared across all sessions in that project instance — the <code>pendingEvaluations</code> Map, <code>stateStore</code>, and <code>agentsMd</code> are all created once in the plugin closure (<code>src/index.ts:25-53</code>) and reused for every session.</p>
+
+<h2 id="data-flow">11. Data Flow Diagram</h2>
+
+<pre>
+User types message (main session) OR primary agent spawns subagent via Task tool
+       │                                    │
+       ▼                                    ▼
+chat.message (user) creates PendingEval    session.created — detect agent type/name
+       │                                    │
+       ▼                                    ▼
+chat.message (assistant) appends response   chat.message + tool.execute.after accumulate
+       │                                    │
+       ▼                                    ▼
+tool.execute.after appends call records     (same PendingEval flow, different sessionID)
+       │                                    │
+       ▼                                    │
+pollAndEvaluate() → runEvaluation() ◄─────────┘
+       │
+       ▼
+Scorer creates dedicated child session
+prompts with structured output (json_schema)
+extracts ScoreCard → deletes child session
+       │
+       ▼
+ScoreCard stored in state store
+Per-agent aggregate recalculated
+       │
+       ├── Score &gt; threshold → nothing (just record)
+       │
+       └── Score &lt; threshold + N observations →
+                │
+                ▼
+         Determine target: AGENTS.md (project-wide weakness)
+                        or agent prompt (agent-specific weakness)
+                │
+                ▼
+         Backup current file
+                │
+                ▼
+         Ask user if auto_update=false
+                │
+                ▼
+         Write updated AGENTS.md or agent prompt file
+                │
+                ▼
+         Record improvement + observe future score delta
+</pre>
+
+<h2 id="current-status">12. Current Status &amp; Known Gaps</h2>
+
+<h3>12.1 What's Fully Working</h3>
+<ul>
+  <li><span class="status status-done">DONE</span> Plugin lifecycle: init, load, hooks registration</li>
+  <li><span class="status status-done">DONE</span> Chat message capture (user instructions + assistant responses)</li>
+  <li><span class="status status-done">DONE</span> Tool call capture with actual results</li>
+  <li><span class="status status-done">DONE</span> Session idle detection and evaluation triggering</li>
+  <li><span class="status status-done">DONE</span> LLM-as-judge scoring via dedicated child session</li>
+  <li><span class="status status-done">DONE</span> State persistence (debounced atomic JSON writes)</li>
+  <li><span class="status status-done">DONE</span> AGENTS.md read/write/inject/backup/rollback</li>
+  <li><span class="status status-done">DONE</span> AgentPromptManager — per-agent prompt read/write/inject/backup/rollback</li>
+  <li><span class="status status-done">DONE</span> Compaction context injection (top weaknesses + avg score + per-agent stats)</li>
+  <li><span class="status status-done">DONE</span> Cross-session aggregate computation with per-agent breakdowns</li>
+  <li><span class="status status-done">DONE</span> Subagent session detection via <code>session.created</code>/<code>session.updated</code></li>
+  <li><span class="status status-done">DONE</span> Session deletion cleanup (pending evals, agent registry, parent/child maps)</li>
+  <li><span class="status status-done">DONE</span> Custom tool registration (<code>observer_status</code>, <code>observer_improve</code>, <code>observer_history</code>)</li>
+  <li><span class="status status-done">DONE</span> Slash commands (<code>/observer status|score|suggest|apply|accept|rollback|history|config|auto|steer|reject|rejections|unreject</code>)</li>
+  <li><span class="status status-done">DONE</span> Subagent prompt auto-update — <code>considerImprovement()</code> writes to agent prompt files via <code>agentPrompts.injectSection()</code></li>
+  <li><span class="status status-done">DONE</span> Duplicate evaluation guard — pre-async <code>sessionsEvaluated</code> check + idle/score handlers</li>
+  <li><span class="status status-done">DONE</span> Toast notifications on low score + improvement events</li>
+  <li><span class="status status-done">DONE</span> Config loading from 4 sources: global, env, project, opencode.json inline</li>
+  <li><span class="status status-done">DONE</span> <code>max_history</code> pruning in state store</li>
+  <li><span class="status status-done">DONE</span> <code>backup_max_versions</code> enforcement (AGENTS.md + per-agent)</li>
+  <li><span class="status status-done">DONE</span> Weakness similarity matching (exact + substring + Jaccard word overlap)</li>
+  <li><span class="status status-done">DONE</span> Scoring retry logic with configurable retries + fallback score card</li>
+  <li><span class="status status-done">DONE</span> Structured JSON-line logging (<code>ObserverLogger</code>) with tail + trim</li>
+  <li><span class="status status-done">DONE</span> Multi-platform atomic writes with Windows EPERM/EBUSY retry</li>
+  <li><span class="status status-done">DONE</span> Per-agent backup directories (<code>.opencode/observer/backups/agents/{name}/</code>)</li>
+  <li><span class="status status-done">DONE</span> Cross-process file locking — <code>acquireLock()</code> with exclusive create + stale detection + merge-before-write on state.json</li>
+  <li><span class="status status-done">DONE</span> Agent prompt rollback — <code>/observer rollback &lt;agent&gt;</code> restores per-agent backups; <code>AgentPromptManager.rollback()</code> with locking and pre-rollback backup</li>
+  <li><span class="status status-done">DONE</span> Separate auto-update toggle for agent prompts — <code>auto_update_agent_prompts</code> config field + <code>autoUpdatePromptsEnabled</code> context + <code>/observer auto prompts on|off</code></li>
+  <li><span class="status status-done">DONE</span> Outcome score delta tracking — <code>score_before</code> captured at improvement time, delta computed on next evaluation, displayed in status/history</li>
+  <li><span class="status status-done">DONE</span> Flush race fix — re-flush at 0ms instead of 2s when version changes during async write</li>
+  <li><span class="status status-done">DONE</span> PendingEval memory — per-part 4K char truncation; <code>compacted</code> flag on pending evals included in scorer prompt</li>
+</ul>
+
+<h3>12.2 Critical Gaps (Blockers to Usefulness)</h3>
+<ul>
+  <li><span class="status status-done">DONE</span> <strong>User approval flow</strong> — <code>auto_update_agents_md</code> config flag IS respected; when false, improvements queue for <code>/observer apply</code></li>
+  <li><span class="status status-done">DONE</span> <strong>config.model IS passed through</strong> — model is parsed and sent to both <code>sessionClient.create()</code> and <code>sessionClient.prompt()</code></li>
+  <li><span class="status status-done">DONE</span> <strong>Tool output captured</strong> — actual tool results recorded with full args</li>
+  <li><span class="status status-done">DONE</span> <strong>User interaction available</strong> — 12 slash commands + 9 custom tools + toast notifications</li>
+  <li><span class="status status-done">DONE</span> <strong>Rejection tracking</strong> — fuzzy pattern matching rejects and persists in state.json; never re-suggests blocked patterns</li>
+</ul>
+
+<h3>12.3 Feature Gaps</h3>
+<ul>
+  <li><span class="status status-done">DONE</span> Per-session auto-update toggle (<code>/observer auto on|off</code>)</li>
+  <li><span class="status status-done">DONE</span> Subagent-specific scoring (<code>/observer score &lt;agent&gt;</code>)</li>
+  <li><span class="status status-done">DONE</span> User rejection tracking with fuzzy pattern matching</li>
+  <li><span class="status status-done">DONE</span> User steering guidance (<code>/observer steer</code>) for scorer bias</li>
+  <li><span class="status status-done">DONE</span> Rich visual display — score emoji, ASCII sparkline, trend arrows</li>
+  <li><span class="status status-done">DONE</span> Weakness similarity matching (exact + substring + Jaccard word overlap)</li>
+  <li><span class="status status-done">DONE</span> Subagent prompt auto-update — scorer suggests agent-specific fixes via <code>suggested_agent_prompt_update</code> field; <code>considerImprovement()</code> routes to <code>agentPrompts.injectSection()</code> when <code>agentName</code> is set</li>
+  <li><span class="status status-done">DONE</span> <code>/observer accept &lt;n&gt;</code> — applies a specific pending improvement by index, not just the oldest</li>
+  <li><span class="status status-done">DONE</span> Duplicate evaluation guard — <code>sessionsEvaluated.add()</code> fires before async work; idle handler and <code>/observer score</code> both check before calling <code>runEvaluation()</code></li>
+  <li><span class="status status-done">DONE</span> Guidance visibility — <code>/observer steer</code> with no arg shows current guidance; only <code>reset</code> clears</li>
+  <li><span class="status status-done">DONE</span> Cross-process file locking — <code>acquireLock()</code> with stale detection, merge-before-write for state.json, locks on AGENTS.md and agent prompts</li>
+  <li><span class="status status-done">DONE</span> Agent prompt rollback — <code>/observer rollback &lt;agent&gt;</code> via <code>AgentPromptManager.rollback()</code> with locking + pre-rollback backup</li>
+  <li><span class="status status-done">DONE</span> Separate auto-update toggle for agent prompts — <code>auto_update_agent_prompts</code> config field, <code>/observer auto prompts on|off</code></li>
+  <li><span class="status status-done">DONE</span> Outcome score delta tracking — <code>score_before</code> at improvement time, delta computed on next eval, displayed in status</li>
+  <li><span class="status status-done">DONE</span> Flush race fix — re-flush at 0ms delay instead of 2s when state version changes mid-write</li>
+  <li><span class="status status-done">DONE</span> PendingEval memory caps — 4K char per-part truncation; <code>compacted</code> flag in scorer prompt</li>
+  <li><span class="status status-yellow">TODO</span> TUI plugin for sidebar panel + trend graph + suggestions</li>
+  <li><span class="status status-yellow">TODO</span> Mid-session per-response evaluation (not just at session idle)</li>
+</ul>
+
+<h3>12.4 Code Quality</h3>
+<ul>
+  <li><span class="status status-done">DONE</span> 234 tests across 11 files, 0 failures</li>
+  <li><span class="status status-done">DONE</span> Cross-platform atomic writes with Windows EPERM/EBUSY retry</li>
+  <li><span class="status status-done">DONE</span> TypeScript strict mode, typecheck clean</li>
+  <li><span class="status status-done">DONE</span> E2E integration tests covering improvement cycle, auto-update, rejection loop, steering, toasts</li>
+</ul>
+
+<h2 id="open-questions">13. Open Questions</h2>
+
+<ul>
+  <li><strong>Scoring latency:</strong> LLM-as-judge calls take time. Should scoring be async (fire-and-forget) or block? Async seems safer but we lose real-time feedback.</li>
+  <li><strong>Scoring cost:</strong> Each evaluation costs tokens. How frequently should we evaluate? Every message, or only at session end?</li>
+  <li><strong>Cross-session identity:</strong> How does the observer correlate that two sessions belong to the same "task"? Via user session title? Manual tagging?</li>
+  <li><strong>Conflict resolution:</strong> RESOLVED — The rejection system tracks user-rejected patterns with fuzzy matching and persists them in state.json. Rejected patterns are never re-suggested. Users can unreject via <code>/observer unreject</code>.</li>
+  <li><strong>Agent prompt vs AGENTS.md:</strong> RESOLVED — The observer updates BOTH: AGENTS.md for project-wide patterns, and individual agent prompt files for agent-specific issues. See §5 for design.</li>
+  <li><strong>Agent prompt modification format:</strong> When an agent's prompt lives in <code>opencode.json</code> (as a <code>{file:...}</code> reference), should the observer inject improvements into the referenced file, or create a companion <code>.opencode/agents/{name}.md</code> file?</li>
+  <li><strong>Integration with <code>/init</code>:</strong> The <code>/init</code> command also modifies AGENTS.md. How do we reconcile observer updates with <code>/init</code>?</li>
+  <li><strong>Plugin load order:</strong> If multiple plugins hook <code>experimental.session.compacting</code>, our context injection must compose with theirs.</li>
+  <li><strong>Desktop vs TUI vs CLI:</strong> The plugin API is the same across all runtimes, but the TUI plugin can provide richer UI (panels, dialogs). Should we support both?</li>
+  <li><strong>How do we inject updated rules into a running session?</strong> AGENTS.md and agent prompts are read at session start and after compaction. We could use <code>tui.prompt.append</code> or inject via <code>experimental.session.compacting</code>. The compaction hook is our key injection point.</li>
+  <li><strong>Scoring model passthrough:</strong> How exactly do we specify a model when creating a child session? Need to check SDK API for model override in <code>session.create()</code> or <code>session.prompt()</code>.</li>
+  <li><strong>Subagent session identity:</strong> How does <code>session.created</code> tell us which agent type/name spawned the session? Need to inspect the event shape — is there an <code>agent</code> or <code>agent_id</code> field?</li>
+</ul>
+
+<h2 id="dev-log">14. Dev Log</h2>
+
+<table>
+<tr><th>Date</th><th>Entry</th></tr>
+
+<tr>
+  <td>2026-05-15</td>
+  <td>
+    <strong>Initial design exploration</strong><br>
+    - Researched opencode plugin system (v1.14.25)<br>
+    - Plugin types discovered: <code>@opencode-ai/plugin</code> exports <code>Plugin</code>,
+    <code>Hooks</code>, <code>tool</code>, <code>TuiPlugin</code><br>
+    - Key hooks for observer: <code>event</code>, <code>chat.message</code>,
+    <code>tool.execute.before/after</code>, <code>experimental.session.compacting</code><br>
+    - SDK v2 provides <code>session.prompt</code> with structured output (<code>json_schema</code>)<br>
+    - AGENTS.md location: project root, read at session init and after compaction<br>
+    - Key insight: <code>experimental.session.compacting</code> hook allows injecting context
+    and replacing the compaction prompt entirely — this is the mechanism for
+    injecting observer-sourced instructions into agent context<br>
+    - Plugin directory: <code>.opencode/plugins/</code> for project-local or <code>~/.config/opencode/plugins/</code> for global<br>
+    - Created initial DESIGN.html document
+  </td>
+</tr>
+<tr>
+  <td>2026-05-15</td>
+  <td>
+    <strong>Implementation v0.1</strong><br>
+    <span class="status status-done">DONE</span> Project structure: <code>package.json</code>, <code>tsconfig.json</code><br>
+    <span class="status status-done">DONE</span> <code>src/types.ts</code> — <code>ObserverConfig</code>, <code>ScoreCard</code>, <code>ObserverState</code>, etc.<br>
+    <span class="status status-done">DONE</span> <code>src/state.ts</code> — <code>ObserverStateStore</code> manages <code>.opencode/observer/state.json</code> with debounced writes<br>
+    <span class="status status-done">DONE</span> <code>src/agents-md.ts</code> — <code>AgentsMdManager</code> with: read/write, section injection/removal, timestamped backups, rollback<br>
+    <span class="status status-done">DONE</span> <code>src/scorer.ts</code> — <code>Scorer</code> uses a dedicated observer child session with <code>json_schema</code> structured output for LLM-as-judge scoring. Five dimensions: instruction_following, completeness, proactiveness, code_quality, communication. Deletes the scoring session after use.<br>
+    <span class="status status-done">DONE</span> <code>src/index.ts</code> — Main plugin entry. Hooks: <code>event</code> (session idle/status), <code>chat.message</code> (user/assistant), <code>tool.execute.after</code>, <code>experimental.session.compacting</code> (injects aggregate feedback). Auto-improves AGENTS.md when score below threshold for N observations.<br>
+    <span class="status status-done">DONE</span> Build successful (TypeScript, no errors)<br>
+    <span class="status status-done">DONE</span> Plugin loader file at <code>.opencode/plugins/observer.ts</code> for dev loading<br>
+    <span class="status status-yellow">TODO</span> Install to global plugin dir (<code>~/.config/opencode/plugins/</code>)<br>
+    <span class="status status-yellow">TODO</span> TUI plugin for sidebar panel + dialogs<br>
+    <span class="status status-yellow">TODO</span> Custom tool registration (<code>observer_status</code>, <code>observer_improve</code>, <code>observer_history</code>)<br>
+    <span class="status status-yellow">TODO</span> User approval flow (question tool / toast)<br>
+    <span class="status status-yellow">TODO</span> Scoring model config via <code>opencode.json</code><br>
+    <br>
+    <strong>Key architectural decisions:</strong><br>
+    - Scorer creates a SEPARATE child session per evaluation request, avoiding polluting the main session's context<br>
+    - State stored at <code>.opencode/observer/state.json</code> — project-scoped, cross-session aggregation built in<br>
+    - AGENTS.md backups at <code>.opencode/observer/backups/AGENTS.md/</code> with ISO timestamp filenames<br>
+    - Compaction hook injects aggregate feedback as extra context (top 3 weaknesses + avg score)<br>
+    - Plugin auto-apply threshold-controlled: waits for N observations of the same weakness before modifying AGENTS.md<br>
+    - Uses Bun's native TypeScript loading — no separate compilation step needed for dev
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-15</td>
+  <td>
+    <strong>Design Review &amp; Q&A Session</strong><br>
+    Reviewed the v0.1 codebase end-to-end and answered key design questions:<br>
+    <br>
+    <strong>Q1: Scoring trigger</strong> — Evaluations fire via polling (<code>pollAndEvaluate()</code> every 10s via <code>setInterval</code>), not mid-session. The flow: chat accumulates in PendingEval → poll tick → runEvaluation() → dedicated child session scored → child deleted.<br>
+    <strong>Q2: SCORE_PROMPT</strong> — Defined in <code>src/scorer.ts:18-28</code>. Full prompt assembled in <code>buildEvalPrompt()</code> at line 135.<br>
+    <strong>Q3: User interaction</strong> — Currently zero user-facing features. Plan: slash commands + custom tools for command-driven scoring, user approval gating for improvements.<br>
+    <strong>Q4: Plugin scope</strong> — One plugin instance per opencode process, shared across all sessions. <code>pendingEvaluations</code> Map keyed by <code>sessionID</code> naturally handles subagent sessions.<br>
+    <strong>Q5: Cross-session aggregation</strong> — Already done via <code>recalcAggregate()</code> in state store. Weakness N-count threshold gates AGENTS.md updates.<br>
+    <strong>Q6: Subagents</strong> — Not handled at all in v0.1. No code references subagent prompts or subagent session detection. Design added in §5 of this document.<br>
+    <br>
+    <strong>OpenCode docs research findings:</strong><br>
+    - Agent system: primary (Build, Plan) vs subagent (General, Explore, Scout)<br>
+    - Agent prompts live in <code>.opencode/agents/{name}.md</code> (markdown frontmatter + body) or <code>opencode.json</code> (<code>agent.{name}.prompt</code>)<br>
+    - Plugin hooks fire for ALL sessions, including subagent child sessions<br>
+    - <code>session.created</code> hook available for detecting new sessions (subagent detection)<br>
+    - <code>tui.command.execute</code> hook available for slash command handling<br>
+    - Custom tools registerable via <code>tool</code> helper from SDK<br>
+    - Configuration can be placed in <code>opencode.json</code> (observer config should integrate here)<br>
+    <br>
+    <strong>Updated DESIGN.html to v0.2</strong> with all findings integrated.
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-15</td>
+  <td>
+    <strong>Code quality improvements (v0.1.1)</strong><br>
+    - Replaced Windows-only xcopy install script with cross-platform Node.js script (<code>scripts/copy-plugin.mjs</code>)<br>
+    - Simplified <code>evaluate()</code> retry loop — removed unused <code>lastError</code> variable, extracted <code>fallbackCard()</code> helper<br>
+    - Replaced <code>console.error</code> in scorer cleanup with logger call<br>
+    - Refactored <code>tryEvaluate</code> catch to reuse <code>fallbackCard()</code>, reducing code duplication<br>
+    - Added <code>.editorconfig</code> for consistent formatting across editors<br>
+    - All 123 tests passing, typecheck clean
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-16</td>
+  <td>
+    <strong>Phases 1–5 Complete (v0.3)</strong><br>
+    <span class="status status-done">Phase 1</span> Per-session auto-update toggle — <code>/observer auto on|off</code>, <code>observer_auto</code> tool, <code>ctx.autoUpdateEnabled</code> respected in <code>considerImprovement()</code><br>
+    <span class="status status-done">Phase 2</span> Subagent-specific scoring — <code>/observer score &lt;agent&gt;</code> shows latest eval + breakdown + trend line for any observed agent<br>
+    <span class="status status-done">Phase 3</span> User rejection tracking — <code>/observer reject|rejections|unreject</code>, fuzzy pattern matching via <code>weaknessSimilarity()</code>, persisted in state.json, guards in <code>considerImprovement()</code><br>
+    <span class="status status-done">Phase 4</span> User steering — <code>/observer steer &lt;guidance&gt;</code> injects guidance into scorer prompt; <code>observer_steer</code> tool<br>
+    <span class="status status-done">Phase 5</span> Richer visual display — progress/score toasts with emoji (green >=80%, yellow >=60%, red &lt;60%), score badge + trend in compaction context, ASCII sparkline in status<br>
+    <br>
+    <strong>Analysis &amp; Documentation:</strong><br>
+    - Created <code>ANALYSIS.md</code> — singleton scope, thread safety, multi-session handling, multi-instance risks, atomic write protocol<br>
+    - Created <code>IMPLEMENTATION.md</code> — 5-phase plan with detailed steps<br>
+    - All 177 tests passing, typecheck clean after Phase 5
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-16</td>
+  <td>
+    <strong>Test Coverage Improvements</strong><br>
+    - Added <code>tests/prompt-utils.test.ts</code> (13 tests) — previously untested <code>timestampFilename()</code>, <code>exists()</code>, <code>parseTimestampFromFilename()</code><br>
+    - Scorer edge cases (5 new tests) — null/missing structured output, non-object output, missing categories<br>
+    - E2E integration tests (12 new tests): improvement cycle (pending → apply → AGENTS.md), auto-update, rejection feedback loop, un-rejection, suggest filtering, user steering, score toasts (low/medium/high thresholds)<br>
+    - Total: 207 tests across 11 files, 0 failures
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-16</td>
+  <td>
+    <strong>Polish Phases — Production Hardening (v0.4)</strong><br>
+    <span class="status status-done">P1 — Subagent Prompt Auto-Update</span>: Scorer now generates both <code>suggested_agents_md_update</code> (global) and <code>suggested_agent_prompt_update</code> (agent-specific); <code>considerImprovement()</code> routes to <code>agentPrompts.injectSection()</code> when <code>agentName</code> is set; <code>/observer apply</code> handles both targets<br>
+    <span class="status status-done">P2 — Rejection Index Robustness</span>: Added <code>id: randomUUID()</code> to <code>ImprovementRecord</code>; added <code>/observer accept &lt;index&gt;</code> command; extracted <code>applyImprovement()</code> helper shared by apply and accept; <code>suggestionListText</code> shows target labels (<code>[build prompt]</code>/<code>[AGENTS.md]</code>)<br>
+    <span class="status status-done">P3 — Duplicate Evaluation Guard</span>: Moved <code>sessionsEvaluated.add()</code> to BEFORE async work in <code>runEvaluation()</code>, closing the race window where two concurrent calls both pass the guard; idle handler and <code>/observer score</code> both check <code>sessionsEvaluated</code> before calling <code>runEvaluation</code><br>
+    <span class="status status-done">P4 — Race Tests + Fix</span>: Added rapid-fire idle+score deduplication test; verified single session record even after re-idle; removed stale duplicate <code>sessionsEvaluated.add()</code> call<br>
+    <span class="status status-done">P5 — Guidance Visibility</span>: <code>/observer steer</code> with no arg now shows current guidance; only <code>reset</code> clears it; tool description updated<br>
+    - <code>ImprovementRecord</code> now has required <code>id: string</code> field, all records get <code>randomUUID()</code><br>
+    - All 217 tests passing, typecheck clean<br>
+    - README.md updated with new commands, line counts<br>
+    - DESIGN.html updated to v0.4 with ScoreCard changes, state.json structure, new dev log entries
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-16</td>
+  <td>
+    <strong>Gap Closure — Production Hardening (v0.5)</strong><br>
+    <span class="status status-done">P1 — Cross-Process File Locking</span>: New <code>src/lock.ts</code> — <code>acquireLock()</code> via exclusive file creation (<code>open('wx')</code>), stale lock detection (30s timeout), exponential backoff retry. Integrated into <code>state.ts</code> (merge-before-write), <code>agents-md.ts</code> (read-modify-write under lock), <code>agent-prompts.ts</code> (injectSection/write under lock). Closed read-modify-write race across multiple opencode instances.<br>
+    <span class="status status-done">P2 — Agent Prompt Rollback</span>: <code>/observer rollback &lt;agent&gt;</code> restores per-agent prompt from backups; <code>AgentPromptManager.rollback()</code> now acquires cross-process lock and performs pre-rollback backup. AGENTS.md rollback unchanged without arg.<br>
+    <span class="status status-done">P3 — Separate Auto-Update Toggle for Prompts</span>: Added <code>auto_update_agent_prompts: boolean</code> to <code>ObserverConfig</code> (default <code>false</code>), <code>autoUpdatePromptsEnabled</code> to <code>ObserverContext</code>. <code>/observer auto prompts on|off</code> toggles independently. <code>considerImprovement()</code> gates AGENTS.md and agent prompt auto-apply separately. <code>observer_auto</code> tool accepts <code>target</code> parameter.<br>
+    <span class="status status-done">P4 — Outcome Score Delta Tracking</span>: <code>ImprovementRecord.score_before</code> captures relevant aggregate score at improvement time. <code>closePendingScoreDeltas()</code> runs after each evaluation, computes delta (<code>after - before</code>) for improvements missing it. Delta displayed in <code>/observer status</code> (e.g. "score +2.5%"). <code>setImprovementDelta()</code> method on state store.<br>
+    <span class="status status-done">P5 — Flush Race Fix</span>: Re-flush delay reduced from 2000ms to 0ms when state version changes during async write. Closes the data-loss window from 2 seconds to microtask-level.<br>
+    <span class="status status-done">P6 — PendingEval Memory + Compaction Awareness</span>: Per-part char cap of 4000 chars on agent response accumulation. <code>compacted: boolean</code> flag added to <code>PendingEval</code>, set to <code>true</code> on compaction hook. <code>ScorerInput.compacted</code> field triggers "session was compacted" note in scorer prompt for fairer evaluation.<br>
+    - All 234 tests passing, typecheck clean<br>
+    - README.md updated: features, commands, config schema, line counts<br>
+    - DESIGN.html updated to v0.5 with cross-process safety section, renumbered sections, new dev log
+  </td>
+</tr>
+
+<tr>
+  <td>2026-05-16</td>
+  <td>
+    <strong>UX Polish (v0.6)</strong><br>
+    <span class="status status-done">Default model changed</span>: <code>DEFAULT_CONFIG.model</code> from <code>anthropic/claude-sonnet-4-20250514</code> to <code>opencode/deepseek-v4-flash-free</code> — cheaper default for new installs.<br>
+    <span class="status status-done">Detail level config</span>: New <code>detail_level</code> field (<code>minimal|standard|thorough</code>, default <code>standard</code>). Controls tool call detail, AGENTS.md/agent prompt inclusion, and result truncation in scoring prompts — balancing evaluation quality against token cost.<br>
+    <span class="status status-done">First-run guard</span>: <code>sessionsCreatedSinceInit</code> set in <code>index.ts</code> — only sessions created via <code>session.created</code> after plugin init are auto-evaluated. Pre-existing sessions are skipped to avoid unwanted evaluations on first install.<br>
+    <span class="status status-done">Help command</span>: New <code>/observer help</code> slash command listing all 14 commands with descriptions, scoring dimensions, and emoji key. Added <code>executeObserverHelp()</code> to <code>handlers.ts</code>.<br>
+    <span class="status status-done">Improvement delta visibility</span>: <code>/observer status</code> now shows avg delta across all improvements + helped/hurt counts. <code>/observer history</code> appends per-improvement deltas (e.g. <code>[score +5.2%]</code>).<br>
+    <span class="status status-done">Manual eval by session ID</span>: <code>/observer score &lt;sessionID&gt;</code> fetches message history via SDK <code>session.messages()</code> and evaluates any session on demand. New <code>manualEvaluateSession()</code> in <code>evaluate.ts</code>.<br>
+    - All 242 tests passing, typecheck clean, lint clean<br>
+    - README.md updated: 14 commands, 12 config keys, new detail_level docs<br>
+    - UX_IMPROVEMENTS.md added with detailed implementation plan
+  </td>
+</tr>
+
+</table>
+
+</body>
+</html>
