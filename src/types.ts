@@ -13,7 +13,6 @@ export interface KasperConfig {
   weakness_decay_days: number
   detail_level: "minimal" | "standard" | "thorough"
   quiet: boolean
-  evaluate_subagents: boolean
   min_session_messages: number
   debug: boolean
   state_dir: string
@@ -21,6 +20,12 @@ export interface KasperConfig {
   scoring_retries: number
   scoring_timeout_ms: number
   max_score_input_chars: number
+  max_agent_guidance_chars: number
+  improvement_expiry_days: number
+  min_observations_for_update: number
+  strict_sanitize: boolean
+  agent_prompt_inject_mode: "section" | "inline"
+  config_version?: number
 }
 
 export const DEFAULT_CONFIG: KasperConfig = {
@@ -31,14 +36,88 @@ export const DEFAULT_CONFIG: KasperConfig = {
   weakness_decay_days: 30,
   detail_level: "standard",
   quiet: false,
-  evaluate_subagents: false,
-  min_session_messages: 3,
+  min_session_messages: 1,
   debug: false,
   state_dir: "",
   evaluation_poll_interval_ms: 10000,
   scoring_retries: 2,
   scoring_timeout_ms: 120000,
   max_score_input_chars: 10000,
+  max_agent_guidance_chars: 1200,
+  improvement_expiry_days: 60,
+  min_observations_for_update: 2,
+  strict_sanitize: true,
+  agent_prompt_inject_mode: "section",
+}
+
+export type WeaknessCategory =
+  | "tool-use"
+  | "reasoning"
+  | "planning"
+  | "communication"
+  | "safety"
+  | "code-quality"
+  | "completeness"
+  | "unknown"
+
+export function categorizeWeakness(weakness: string): WeaknessCategory {
+  const lower = weakness.toLowerCase()
+  if (
+    /\b(tool|select|choo[sc]e|pick|command|bash|run)\b.*\b(wrong|incorrect|inappropriate|unnecessary|missing|fail|error)\b/i.test(
+      lower,
+    ) ||
+    /\b(wrong|incorrect|inappropriate|unnecessary|missing)\b.*\b(tool|command|bash)\b/i.test(
+      lower,
+    )
+  ) {
+    return "tool-use"
+  }
+  if (
+    /\b(reason|logic|think|assum|analy[sz]e|understand|misinterpret|misjudge)\b/i.test(
+      lower,
+    ) ||
+    /\b(incorrect.*conclusion|wrong.*approach|flawed.*reasoning)\b/i.test(lower)
+  ) {
+    return "reasoning"
+  }
+  if (
+    /\b(plan|step|sequence|order|organi[sz]e|structure|approach|strategy)\b/i.test(
+      lower,
+    ) ||
+    /\b(no plan|lack.*plan|skip.*step)\b/i.test(lower)
+  ) {
+    return "planning"
+  }
+  if (
+    /\b(communicat|explain|clar|verbose|concis|detail|summar|respond|reply|answer|tell|say|write)\b/i.test(
+      lower,
+    )
+  ) {
+    return "communication"
+  }
+  if (
+    /\b(secur|safe|danger|risk|vulnerab|secret|key|token|password|credential|expos|leak|inject|sanitiz)\b/i.test(
+      lower,
+    )
+  ) {
+    return "safety"
+  }
+  if (
+    /\b(code|quality|style|bug|error|typo|syntax|convention|lint|type|test)\b/i.test(
+      lower,
+    ) ||
+    /\b(correctness|maintainab|readab|clean)\b/i.test(lower)
+  ) {
+    return "code-quality"
+  }
+  if (
+    /\b(complet|finish|partial|incomplete|half|missing|left|remain|unfinished|forgot)\b/i.test(
+      lower,
+    )
+  ) {
+    return "completeness"
+  }
+  return "unknown"
 }
 
 export interface ScoreCard {
@@ -56,6 +135,9 @@ export interface ScoreCard {
   scoring_prompt_hash?: string
   agent_prompt_hash?: string
   agents_md_hash?: string
+  judge_version?: string
+  rubric_version?: string
+  model_name?: string
 }
 
 export interface ScoreCategories {
@@ -78,6 +160,10 @@ export interface WeaknessPattern {
   suggested_fix: string
   agent_name?: string
   target?: "agents_md" | "agent_prompt"
+  category?: WeaknessCategory
+  confidence?: number
+  evidence_count?: number
+  expires_at?: number
 }
 
 export interface KasperRunningData {
@@ -106,6 +192,8 @@ export interface KasperState {
   rejected_patterns: string[]
   installed_at?: number
   _running?: KasperRunningData
+  _integrity?: string
+  improvement_budget_used?: number
 }
 
 export interface PerAgentStats {
@@ -149,6 +237,7 @@ export interface ImprovementRecord {
   score_before?: number
   outcome_score_delta?: number
   weaknesses?: string[]
+  expires_at?: number
 }
 
 export interface BackupEntry {

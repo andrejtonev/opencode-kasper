@@ -1,11 +1,11 @@
 import { describe, expect, mock, test } from "bun:test"
 import {
   buildApplyPromptForPendings,
-  executeKasperConfig,
   executeKasperHistory,
   executeKasperImprove,
   executeKasperStatus,
   handleBatchScoreSession,
+  summarizeValidationInProgress,
 } from "../src/handlers.js"
 import { AsyncMutex } from "../src/mutex.js"
 import type {
@@ -110,6 +110,7 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
     kasperPaused: false,
     registeredCommands: new Set(),
     sessionMsgCount: new Map(),
+    idleSessions: new Set<string>(),
     ...overrides,
   }
 }
@@ -318,35 +319,6 @@ describe("executeKasperHistory", () => {
       ctx,
     )
     expect(result).toContain("No sessions recorded yet")
-  })
-})
-
-describe("executeKasperConfig", () => {
-  test("returns config with current settings", async () => {
-    const result = await executeKasperConfig(mockCtx())
-    expect(result).toContain("## Kasper Configuration")
-    expect(result).toContain(`- **Enabled**: ${DEFAULT_CONFIG.enabled}`)
-    expect(result).toContain(
-      `- **Scoring threshold**: ${DEFAULT_CONFIG.scoring_threshold}`,
-    )
-    expect(result).toContain(`- **Model**: ${DEFAULT_CONFIG.model}`)
-    expect(result).toContain(
-      `- **Detail level**: ${DEFAULT_CONFIG.detail_level}`,
-    )
-  })
-
-  test("shows pending improvement count", async () => {
-    const ctx = mockCtx()
-    ctx.improvementsPending.push({
-      id: "test-id",
-      timestamp: Date.now(),
-      target: "agents_md",
-      agents_md_diff: "diff",
-      reason: "reason",
-      backup_path: "",
-    })
-    const result = await executeKasperConfig(ctx)
-    expect(result).toContain("**Pending improvements**: 1")
   })
 })
 
@@ -660,5 +632,133 @@ describe("handleBatchScoreSession with subagents", () => {
     } catch {
       // Expected: may fail without full mocks
     }
+  })
+})
+
+describe("summarizeValidationInProgress", () => {
+  test("returns empty array when nothing is in flight", () => {
+    const lines = summarizeValidationInProgress(mockCtx())
+    expect(lines).toEqual([])
+  })
+
+  test("shows paused banner when kasperPaused is true", () => {
+    const lines = summarizeValidationInProgress(mockCtx({ kasperPaused: true }))
+    expect(lines.length).toBe(1)
+    expect(lines[0]).toContain("paused")
+    expect(lines[0]).toContain("/kasper resume")
+  })
+
+  test("shows 'Validation in progress' with idle count when evaluation is running", () => {
+    const idleSessions = new Set<string>(["s1", "s2", "s3"])
+    const lines = summarizeValidationInProgress(
+      mockCtx({
+        evaluationRunning: true,
+        evaluationStartedAt: Date.now() - 5_000,
+        idleSessions,
+      }),
+    )
+    expect(lines.some((l) => l.includes("Validation in progress"))).toBe(true)
+    expect(lines.some((l) => l.includes("3 idle sessions queued"))).toBe(true)
+    expect(lines.some((l) => l.includes("5s"))).toBe(true)
+  })
+
+  test("uses singular 'session' for exactly one idle queued", () => {
+    const idleSessions = new Set<string>(["only-one"])
+    const lines = summarizeValidationInProgress(
+      mockCtx({
+        evaluationRunning: true,
+        evaluationStartedAt: Date.now(),
+        idleSessions,
+      }),
+    )
+    expect(lines.some((l) => l.includes("1 idle session queued"))).toBe(true)
+    expect(lines.some((l) => l.includes("1 idle sessions queued"))).toBe(false)
+  })
+
+  test("formats elapsed time in m:ss when over a minute", () => {
+    const lines = summarizeValidationInProgress(
+      mockCtx({
+        evaluationRunning: true,
+        evaluationStartedAt: Date.now() - 125_000, // 2m 5s
+        idleSessions: new Set(),
+      }),
+    )
+    expect(lines.some((l) => l.includes("2m 5s"))).toBe(true)
+  })
+
+  test("shows 'idle, waiting for next poll' when sessions are queued but evaluation is not running", () => {
+    const lines = summarizeValidationInProgress(
+      mockCtx({
+        evaluationRunning: false,
+        idleSessions: new Set(["a", "b"]),
+      }),
+    )
+    expect(lines.some((l) => l.includes("idle, waiting for next poll"))).toBe(
+      true,
+    )
+    expect(lines.some((l) => l.includes("Validation in progress"))).toBe(false)
+  })
+
+  test("shows weakness-merge banner when isMergingWeaknesses is true", () => {
+    const lines = summarizeValidationInProgress(
+      mockCtx({ isMergingWeaknesses: true }),
+    )
+    expect(lines.some((l) => l.includes("Merging weaknesses"))).toBe(true)
+  })
+
+  test("shows pending-improvements banner with count and singular/plural handling", () => {
+    const improvements: ImprovementRecord[] = [
+      {
+        id: "1",
+        timestamp: 1,
+        target: "agents_md",
+        agents_md_diff: "",
+        reason: "x",
+        backup_path: "",
+      },
+    ]
+    const one = summarizeValidationInProgress(
+      mockCtx({ improvementsPending: improvements }),
+    )
+    expect(one.some((l) => l.includes("1 pending improvement awaiting"))).toBe(
+      true,
+    )
+
+    const many = summarizeValidationInProgress(
+      mockCtx({
+        improvementsPending: [
+          ...improvements,
+          { ...improvements[0], id: "2" },
+          { ...improvements[0], id: "3" },
+        ],
+      }),
+    )
+    expect(
+      many.some((l) => l.includes("3 pending improvements awaiting")),
+    ).toBe(true)
+  })
+
+  test("status command surfaces the In Progress banner", async () => {
+    const result = await executeKasperStatus(
+      { agent: undefined, limit: 10 },
+      mockCtx({
+        evaluationRunning: true,
+        evaluationStartedAt: Date.now() - 2_000,
+        idleSessions: new Set(["x"]),
+        improvementsPending: [
+          {
+            id: "1",
+            timestamp: 1,
+            target: "agents_md",
+            agents_md_diff: "",
+            reason: "x",
+            backup_path: "",
+          },
+        ],
+      }),
+    )
+    expect(result).toContain("### In Progress")
+    expect(result).toContain("Validation in progress")
+    expect(result).toContain("1 pending improvement")
   })
 })

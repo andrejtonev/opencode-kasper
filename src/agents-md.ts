@@ -174,10 +174,14 @@ export class AgentsMdManager {
     const sectionRegex = new RegExp(
       `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
     )
-    const sectionBlock = `${header}\n${content.trim()}\n`
+    const provenance = `<!-- kasper: ${new Date().toISOString()} -->\n`
+    const sectionBlock = `${header}\n${provenance}${content.trim()}\n`
 
     if (sectionRegex.test(existing)) {
-      return existing.replace(sectionRegex, `$1\n${content.trim()}`)
+      return existing.replace(
+        sectionRegex,
+        `$1\n${provenance}${content.trim()}`,
+      )
     }
 
     const eofSection = `${sectionBlock}\n`

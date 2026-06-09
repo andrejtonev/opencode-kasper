@@ -28,6 +28,30 @@ export const LOG_MAX_LINES = 300
 export const MAX_HISTORY = 100
 export const MIN_OBSERVATIONS_FOR_UPDATE = 2
 
+// Built-in opencode agent names per https://opencode.ai/docs/agents.
+// Primary: build, plan. Subagents: general, explore, scout. Hidden system: compaction, title, summary.
+// These agents have hard-coded prompts shipped with opencode. The markdown file
+// at `.opencode/agents/<name>.md` is only loaded if the user explicitly sets
+// `agent.<name>.prompt` in `opencode.json` to `{file:...}` or to an inline
+// string — a bare file at the conventional path is NOT consulted. Kasper must
+// therefore avoid creating dead `.opencode/agents/<name>.md` files for these
+// agents; if the agent has no defined prompt, improvements are rerouted to
+// AGENTS.md (the rule file the built-in agents actually read).
+export const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([
+  "build",
+  "plan",
+  "general",
+  "explore",
+  "scout",
+  "compaction",
+  "title",
+  "summary",
+])
+
+export function isBuiltinAgentName(name: string): boolean {
+  return BUILTIN_AGENT_NAMES.has(name)
+}
+
 // Weakness pattern matching thresholds
 export const WEAKNESS_SIMILARITY_THRESHOLD = 0.5
 export const WEAKNESS_SUBSTRING_SCORE = 0.85

@@ -2,14 +2,13 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   BACKUP_ENABLED,
   BACKUP_MAX_VERSIONS,
+  isBuiltinAgentName,
   MAX_EVALUATED_SESSION_SET,
   MAX_MESSAGE_CHARS,
   MAX_MESSAGE_PARTS,
   MAX_PENDING_IMPROVEMENTS,
   MAX_TOOL_CALLS_EVAL,
   MAX_USER_INSTRUCTION_CHARS,
-  MIN_OBSERVATIONS_FOR_UPDATE,
-  WEAKNESS_SIMILARITY_THRESHOLD,
 } from "./constants.js"
 import type { ScorerInput } from "./scorer.js"
 import type {
@@ -25,8 +24,10 @@ import {
   formatScore,
   isKasperSession,
   isRegisteredCommand,
+  isValidGuidanceText,
+  sanitizeImprovementText,
   showToast,
-  weaknessSimilarity,
+  weaknessesMergeable,
 } from "./utils.js"
 
 function closePendingScoreDeltas(ctx: KasperContext): void {
@@ -336,6 +337,11 @@ export async function runEvaluation(
         }
       }
 
+      const expired = ctx.stateStore.expireOldImprovements?.() ?? 0
+      if (expired > 0) {
+        await ctx.logger.log("improvements_expired", { count: expired })
+      }
+
       closePendingScoreDeltas(ctx)
 
       ctx.logger.trim().catch(() => {})
@@ -584,10 +590,18 @@ export function buildEvalFromMessages(
 
       if (currentUserMsg) {
         keptMsgs.push(msg)
+      } else if (text.trim()) {
+        currentUserMsg = msg
+        keptMsgs.push(msg)
+        userMessageCount++
       }
     } else {
       if (currentUserMsg) {
         keptMsgs.push(msg)
+      } else if (text.trim()) {
+        currentUserMsg = msg
+        keptMsgs.push(msg)
+        userMessageCount++
       }
     }
   }
@@ -630,7 +644,7 @@ export function buildEvalFromMessages(
       .map((p) => p.text as string)
       .join(" ")
 
-    if (role === "user") {
+    if (role === "user" || (!currentPairUser && text.trim())) {
       if (
         currentPairUser &&
         (currentPairResponse.trim() || currentPairToolCalls.length > 0)
@@ -647,7 +661,7 @@ export function buildEvalFromMessages(
       currentPairResponse = ""
       currentPairToolCalls = []
       currentPairSubagents = []
-    } else if (role === "assistant") {
+    } else {
       if (currentPairResponse) currentPairResponse += "\n"
       currentPairResponse += text
       currentPairToolCalls.push(...extractToolCallsFromMessages([msg]))
@@ -862,15 +876,69 @@ export async function manualEvaluateSession(
       msgRoles,
     })
 
+    const agentInfo = ctx.agentRegistry.get(sessionID)
+    const minUserMsgs =
+      agentInfo?.agentType === "subagent" ? 1 : ctx.config.min_session_messages
+
     const pending = buildEvalFromMessages(
       msgList,
       sessionID,
       agentName,
-      ctx.config.min_session_messages,
+      minUserMsgs,
       ctx.registeredCommands,
       lastMsgId,
       true,
     )
+    if (!pending && minUserMsgs > 1) {
+      // Retry with minUserMsgs=1 so explicit manual eval still scores
+      // sessions that have fewer user messages than the auto-poll threshold.
+      const fallbackPending = buildEvalFromMessages(
+        msgList,
+        sessionID,
+        agentName,
+        1,
+        ctx.registeredCommands,
+        lastMsgId,
+        true,
+      )
+      if (fallbackPending) {
+        await ctx.logger.log("manual_eval_fallback", {
+          sessionID,
+          agentName,
+          originalMin: minUserMsgs,
+          fallbackMin: 1,
+          userMsgCount: fallbackPending.userInstruction ? 1 : 0,
+        })
+        const evalOk = await runEvaluation(fallbackPending, ctx)
+        if (evalOk) {
+          ctx.sessionMsgCount.set(sessionID, msgList.length)
+        }
+        const recent = ctx.stateStore.getRecentSessions(5)
+        const session = recent.find((s) => s.id === sessionID)
+
+        await ctx.logger.log("manual_eval_after_run", {
+          sessionID,
+          foundInRecent: !!session,
+          totalSessionsInStore:
+            typeof ctx.stateStore.getTotalSessions === "function"
+              ? ctx.stateStore.getTotalSessions()
+              : undefined,
+          reEvaluated,
+          fallback: true,
+        })
+
+        if (session) {
+          const { emoji, pct } = formatScore(session.score)
+          let msg = `Session scored: ${emoji} ${pct}%`
+          if (session.weaknesses.length > 0) {
+            msg += `\n\n**Weaknesses:** ${session.weaknesses.slice(0, 3).join(", ")}`
+          }
+          msg += `\n\n*Note: This session only had 1 user message, so the usual threshold (${minUserMsgs}) was bypassed for manual evaluation.*`
+          return msg
+        }
+        return "Session scored successfully."
+      }
+    }
     if (!pending) {
       const diag = {
         sessionID,
@@ -890,7 +958,6 @@ export async function manualEvaluateSession(
       pending.existingWeaknesses = existingWeaknesses
     }
 
-    const agentInfo = ctx.agentRegistry.get(sessionID)
     if (agentInfo) {
       pending.agentType = agentInfo.agentType
       pending.parentSessionID = agentInfo.parentSessionID
@@ -956,18 +1023,20 @@ export async function manualEvaluateSession(
 
     if (ctx.sessionsEvaluated.has(evalKey)) continue
 
+    const agentInfo = ctx.agentRegistry.get(sessionID)
+    const minUserMsgs =
+      agentInfo?.agentType === "subagent" ? 1 : ctx.config.min_session_messages
+
     const pending = buildEvalFromMessages(
       seg.msgs,
       evalKey,
       seg.agentName,
-      ctx.config.min_session_messages,
+      minUserMsgs,
       ctx.registeredCommands,
       undefined,
       true,
     )
     if (!pending) continue
-
-    const agentInfo = ctx.agentRegistry.get(sessionID)
     if (agentInfo) {
       pending.agentType = agentInfo.agentType
       pending.parentSessionID = agentInfo.parentSessionID
@@ -1053,6 +1122,13 @@ export async function evaluateChildSessions(
               childIDs.add(s.id)
               const agent = s.agent || s.agentName || s.subagent_type
               if (agent) childAgentHints.set(s.id, agent)
+              if (!ctx.agentRegistry.has(s.id)) {
+                ctx.agentRegistry.set(s.id, {
+                  agentName: agent || s.id.slice(0, 8),
+                  agentType: "subagent",
+                  parentSessionID: parentID,
+                })
+              }
             }
           }
         }
@@ -1263,6 +1339,15 @@ async function queueImprovement(
   }
 }
 
+async function shouldRerouteBuiltinAgentPrompt(
+  agentName: string,
+  ctx: KasperContext,
+): Promise<boolean> {
+  if (!isBuiltinAgentName(agentName)) return false
+  const source = await ctx.agentPrompts.resolve(agentName)
+  return source.kind === "missing"
+}
+
 async function applyAgentPromptImprovement(
   updateText: string,
   weaknesses: string[],
@@ -1272,12 +1357,109 @@ async function applyAgentPromptImprovement(
 ): Promise<void> {
   const agentName = pending.agentName
   if (!agentName) return
+
+  // Built-in opencode agents (build, plan, general, ...) have hard-coded
+  // prompts shipped with opencode. `.opencode/agents/<name>.md` is only
+  // consulted when `agent.<name>.prompt` in `opencode.json` is set to a
+  // `{file:...}` directive or inline string. If a built-in agent has no
+  // defined prompt, creating a markdown file at the conventional path
+  // produces a dead file that opencode never reads. Reroute the
+  // improvement to AGENTS.md in that case — built-in agents always
+  // honour the project rules file.
+  if (await shouldRerouteBuiltinAgentPrompt(agentName, ctx)) {
+    if (pending.agentType === "subagent") {
+      // Subagent sessions must not write to AGENTS.md. Drop the
+      // improvement rather than silently write a project-wide rule
+      // that came from a subagent's local view.
+      await ctx.logger.log("improvement_reroute_dropped_subagent", {
+        sessionID: pending.sessionID,
+        agentName,
+        reason: "built-in subagent with no defined prompt",
+      })
+      return
+    }
+    await ctx.logger.log("improvement_rerouted_to_agents_md", {
+      sessionID: pending.sessionID,
+      agentName,
+      reason: "built-in agent has no defined prompt",
+    })
+    await applyAgentsMdImprovement(
+      updateText,
+      weaknesses,
+      ctx,
+      _config,
+      pending,
+    )
+    return
+  }
+
+  if (_config.strict_sanitize) {
+    const result = sanitizeImprovementText(updateText)
+    if (!result.safe) {
+      await ctx.logger.log("improvement_rejected_sanitize", {
+        sessionID: pending.sessionID,
+        target: "agent_prompt",
+        agentName,
+        rejections: result.rejections,
+        textPreview: updateText.slice(0, 100),
+      })
+      showToast(
+        ctx.client,
+        "Kasper",
+        `Improvement for ${agentName} rejected: contains ${result.rejections.join(", ")}`,
+        "warning",
+        6000,
+      )
+      return
+    }
+  }
+
+  if (!isValidGuidanceText(updateText)) {
+    await ctx.logger.log("improvement_rejected_invalid", {
+      sessionID: pending.sessionID,
+      agentName,
+      textPreview: updateText.slice(0, 100),
+    })
+    return
+  }
+
+  const budgetMax = ctx.stateStore.getImprovementBudget?.()
+  if (budgetMax && updateText.length > budgetMax) {
+    await ctx.logger.log("improvement_skipped_budget", {
+      sessionID: pending.sessionID,
+      agentName,
+      textLen: updateText.length,
+      budgetMax,
+    })
+    showToast(
+      ctx.client,
+      "Kasper",
+      `Improvement for ${agentName} skipped: exceeds guidance budget (${updateText.length} > ${budgetMax} chars)`,
+      "warning",
+      6000,
+    )
+    return
+  }
+
+  const existingPrompt = await ctx.agentPrompts.read(agentName)
+  const dupeResult = checkImprovementDuplicate(updateText, existingPrompt)
+  if (dupeResult) {
+    await ctx.logger.log("improvement_skipped_duplicate", {
+      sessionID: pending.sessionID,
+      agentName,
+      reason: dupeResult,
+    })
+    return
+  }
+
   await ctx.agentPrompts.injectSection(
     agentName,
     "Kasper Inferred Instructions",
     updateText,
     BACKUP_ENABLED,
     BACKUP_MAX_VERSIONS,
+    "subagent",
+    _config.agent_prompt_inject_mode,
   )
   ctx.stateStore.recordImprovement({
     id: randomUUID(),
@@ -1317,6 +1499,62 @@ async function applyAgentsMdImprovement(
   _config: KasperConfig,
   pending: PendingEval,
 ): Promise<void> {
+  if (_config.strict_sanitize) {
+    const result = sanitizeImprovementText(updateText)
+    if (!result.safe) {
+      await ctx.logger.log("improvement_rejected_sanitize", {
+        sessionID: pending.sessionID,
+        target: "agents_md",
+        rejections: result.rejections,
+        textPreview: updateText.slice(0, 100),
+      })
+      showToast(
+        ctx.client,
+        "Kasper",
+        `AGENTS.md improvement rejected: contains ${result.rejections.join(", ")}`,
+        "warning",
+        6000,
+      )
+      return
+    }
+  }
+
+  if (!isValidGuidanceText(updateText)) {
+    await ctx.logger.log("improvement_rejected_invalid", {
+      sessionID: pending.sessionID,
+      textPreview: updateText.slice(0, 100),
+    })
+    return
+  }
+
+  const budgetMax = ctx.stateStore.getImprovementBudget?.()
+  if (budgetMax && updateText.length > budgetMax) {
+    await ctx.logger.log("improvement_skipped_budget", {
+      sessionID: pending.sessionID,
+      target: "agents_md",
+      textLen: updateText.length,
+      budgetMax,
+    })
+    showToast(
+      ctx.client,
+      "Kasper",
+      `AGENTS.md improvement skipped: exceeds guidance budget (${updateText.length} > ${budgetMax} chars)`,
+      "warning",
+      6000,
+    )
+    return
+  }
+
+  const existingContent = await ctx.agentsMd.read()
+  const dupeResult = checkImprovementDuplicate(updateText, existingContent)
+  if (dupeResult) {
+    await ctx.logger.log("improvement_skipped_duplicate", {
+      sessionID: pending.sessionID,
+      reason: dupeResult,
+    })
+    return
+  }
+
   let backupPath = ""
   await ctx.agentsMd.lockedUpdate(async (existing) => {
     if (BACKUP_ENABLED) {
@@ -1357,20 +1595,70 @@ async function applyAgentsMdImprovement(
   )
 }
 
+function checkImprovementDuplicate(
+  newText: string,
+  existingTarget: string,
+): string | false {
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
+  const newNorm = norm(newText)
+  if (!newNorm || newNorm.length < 10) return "text too short"
+
+  const existingNorm = norm(existingTarget)
+  if (existingNorm.includes(newNorm)) return "already present verbatim"
+
+  const newSentences = newNorm.split(/[.!?]\s*/).filter((s) => s.length > 10)
+  for (const sentence of newSentences) {
+    if (existingNorm.includes(sentence)) return "sentence already present"
+  }
+
+  const newWords = new Set(newNorm.split(/\s+/).filter((w) => w.length > 3))
+  if (newWords.size === 0) return "no substantial content"
+
+  const existingWords = new Set(
+    existingNorm.split(/\s+/).filter((w) => w.length > 3),
+  )
+  let overlap = 0
+  for (const w of newWords) {
+    if (existingWords.has(w)) overlap++
+  }
+  if (newWords.size > 0 && overlap / newWords.size > 0.8) {
+    return "too similar to existing content"
+  }
+
+  return false
+}
+
 export async function considerImprovement(
   card: ScoreCard,
   ctx: KasperContext,
   config: KasperConfig,
   pending: PendingEval,
 ): Promise<void> {
-  if (!card.suggested_agents_md_update && !card.suggested_agent_prompt_update)
-    return
+  // Use weakness_suggestions as the primary source (LLM prompt instructs
+  // the model to populate this and leave deprecated fields empty).
+  // Fall back to deprecated fields only for backward compatibility.
+  const suggestions = card.weakness_suggestions ?? []
+  const agentPromptSuggestions = suggestions
+    .filter((s) => s.target === "agent_prompt" && s.suggested_fix)
+    .map((s) => s.suggested_fix)
+  const agentsMdSuggestions = suggestions
+    .filter((s) => s.target === "agents_md" && s.suggested_fix)
+    .map((s) => s.suggested_fix)
+
+  const agentPromptUpdate =
+    agentPromptSuggestions.length > 0
+      ? agentPromptSuggestions.join("\n\n")
+      : card.suggested_agent_prompt_update
+  const agentsMdUpdate =
+    agentsMdSuggestions.length > 0
+      ? agentsMdSuggestions.join("\n\n")
+      : card.suggested_agents_md_update
+
+  if (!agentPromptUpdate && !agentsMdUpdate) return
 
   const nonRejectedWeaknesses = card.weaknesses.filter((weakness) => {
     for (const rejected of ctx.rejectedPatterns) {
-      if (
-        weaknessSimilarity(weakness, rejected) >= WEAKNESS_SIMILARITY_THRESHOLD
-      ) {
+      if (weaknessesMergeable(weakness, rejected)) {
         ctx.logger.log("improvement_rejected_cached", {
           sessionID: pending.sessionID,
           weakness,
@@ -1388,17 +1676,25 @@ export async function considerImprovement(
   const matchingWeakness = findMatchingWeakness(
     nonRejectedWeaknesses,
     agg.top_weaknesses,
-    MIN_OBSERVATIONS_FOR_UPDATE,
+    config.min_observations_for_update,
   )
 
   if (!matchingWeakness) return
 
   const isAuto = config.auto_update || ctx.autoUpdateEnabled
 
-  const agentPromptUpdate = card.suggested_agent_prompt_update
-  const agentsMdUpdate = card.suggested_agents_md_update
-  const hasAgentPrompt = agentPromptUpdate && pending.agentName
-  const hasAgentsMd = agentsMdUpdate && pending.agentType !== "subagent"
+  const hasAgentPrompt = !!agentPromptUpdate && !!pending.agentName
+  const hasAgentsMd = !!agentsMdUpdate && pending.agentType !== "subagent"
+
+  // Reroute: built-in opencode agents with no defined prompt cannot
+  // accept a per-agent file write (the file would be a dead drop).
+  // The auto path handles this inside applyAgentPromptImprovement.
+  // The non-auto path queues the text as an agents_md improvement.
+  const rerouteToAgentsMd =
+    hasAgentPrompt &&
+    !!pending.agentName &&
+    pending.agentType !== "subagent" &&
+    (await shouldRerouteBuiltinAgentPrompt(pending.agentName, ctx))
 
   // Prefer local agent/subagent prompt over global AGENTS.md
   if (isAuto) {
@@ -1425,9 +1721,18 @@ export async function considerImprovement(
   }
 
   // Non-auto: queue improvements
-  if (hasAgentPrompt) {
+  if (hasAgentPrompt && !rerouteToAgentsMd) {
     await queueImprovement(
       "agent_prompt",
+      pending.agentName,
+      agentPromptUpdate,
+      ctx,
+      pending.sessionID,
+      card.weaknesses,
+    )
+  } else if (rerouteToAgentsMd && agentPromptUpdate) {
+    await queueImprovement(
+      "agents_md",
       pending.agentName,
       agentPromptUpdate,
       ctx,

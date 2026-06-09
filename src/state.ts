@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import {
   MAX_EVALUATED_SESSION_SET,
@@ -22,8 +23,8 @@ import type {
   SessionRecord,
   WeaknessPattern,
 } from "./types.js"
-import { DEFAULT_CONFIG } from "./types.js"
-import { weaknessSimilarity } from "./utils.js"
+import { categorizeWeakness, DEFAULT_CONFIG } from "./types.js"
+import { weaknessesMergeable, weaknessSimilarity } from "./utils.js"
 
 interface AgentRunningStats {
   sum: number
@@ -93,6 +94,8 @@ export function computeStats(
       pattern,
       count: Math.round(count),
       suggested_fix: "",
+      category: categorizeWeakness(pattern),
+      evidence_count: Math.round(count),
     }))
 
   return {
@@ -139,6 +142,23 @@ export class KasperStateStore {
       const raw = await readFile(this.statePath, "utf-8")
       const parsed = JSON.parse(raw)
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (parsed._integrity) {
+          const storedHash = parsed._integrity as string
+          const verifyJson = JSON.stringify(parsed, null, 2)
+          const computedHash = createHash("sha256")
+            .update(
+              verifyJson.replace(/"(_integrity|_running)":\s*"[^"]*"/g, ""),
+            )
+            .digest("hex")
+            .slice(0, 32)
+          if (storedHash !== computedHash) {
+            this.logger?.log("state_integrity_warn", {
+              stored: storedHash,
+              computed: computedHash,
+              note: "State file integrity check failed — data may be corrupted. Continuing with parsed state.",
+            })
+          }
+        }
         this.state = { ...defaultState(this.configDefaults), ...parsed }
         this.state.config = { ...this.configDefaults, ...parsed.config }
         if (parsed.aggregate) {
@@ -253,10 +273,8 @@ export class KasperStateStore {
       for (const w of weaknesses) {
         if (w.suggested_fix && w.target) continue
 
-        const ws = card.weakness_suggestions?.find(
-          (s) =>
-            weaknessSimilarity(s.weakness, w.pattern) >=
-            WEAKNESS_SIMILARITY_THRESHOLD,
+        const ws = card.weakness_suggestions?.find((s) =>
+          weaknessesMergeable(s.weakness, w.pattern, undefined, w.category),
         )
 
         if (ws) {
@@ -267,10 +285,12 @@ export class KasperStateStore {
             const entry = Object.values(this.state.sessions).find(
               (s) =>
                 s.agent_name &&
-                weaknessSimilarity(
+                weaknessesMergeable(
                   s.score_card.weaknesses.join(" "),
                   w.pattern,
-                ) >= WEAKNESS_SIMILARITY_THRESHOLD,
+                  undefined,
+                  w.category,
+                ),
             )
             if (entry?.agent_name) w.agent_name = entry.agent_name
           }
@@ -285,8 +305,7 @@ export class KasperStateStore {
         if (suggestion) {
           for (const weakness of card.weaknesses) {
             if (
-              weaknessSimilarity(weakness, w.pattern) >=
-              WEAKNESS_SIMILARITY_THRESHOLD
+              weaknessesMergeable(weakness, w.pattern, undefined, w.category)
             ) {
               w.suggested_fix = suggestion
               w.target = card.suggested_agents_md_update
@@ -314,8 +333,32 @@ export class KasperStateStore {
   }
 
   recordImprovement(record: ImprovementRecord): void {
+    record.expires_at =
+      this.configDefaults.improvement_expiry_days > 0
+        ? Date.now() + this.configDefaults.improvement_expiry_days * 86400000
+        : undefined
     this.state.improvements_applied.push(record)
     this.markDirty()
+  }
+
+  expireOldImprovements(): number {
+    const now = Date.now()
+    const before = this.state.improvements_applied.length
+    this.state.improvements_applied = this.state.improvements_applied.filter(
+      (i) => !i.expires_at || i.expires_at > now,
+    )
+    const removed = before - this.state.improvements_applied.length
+    if (removed > 0) this.markDirty()
+    return removed
+  }
+
+  getImprovementBudget(): number {
+    return this.configDefaults.max_agent_guidance_chars
+  }
+
+  recordBudgetUsage(chars: number): void {
+    this.state.improvement_budget_used =
+      (this.state.improvement_budget_used ?? 0) + chars
   }
 
   setImprovementDelta(id: string, delta: number): void {
@@ -476,8 +519,9 @@ export class KasperStateStore {
     map: Map<string, number>,
     pattern: string,
   ): void {
+    const cat = categorizeWeakness(pattern)
     for (const [key] of map) {
-      if (weaknessSimilarity(pattern, key) >= WEAKNESS_SIMILARITY_THRESHOLD) {
+      if (weaknessesMergeable(pattern, key, cat, categorizeWeakness(key))) {
         map.delete(key)
       }
     }
@@ -582,8 +626,9 @@ export class KasperStateStore {
       map.set(cached, (map.get(cached) ?? 0) + delta)
       return
     }
+    const cat = categorizeWeakness(weakness)
     for (const [key] of map) {
-      if (weaknessSimilarity(weakness, key) >= WEAKNESS_SIMILARITY_THRESHOLD) {
+      if (weaknessesMergeable(weakness, key, cat, categorizeWeakness(key))) {
         this.weaknessCache.set(weakness, key)
         map.set(key, (map.get(key) ?? 0) + delta)
         return
@@ -603,7 +648,10 @@ export class KasperStateStore {
   ): void {
     let bestKey: string | undefined
     let bestScore = 0
+    const cat = categorizeWeakness(weakness)
     for (const [key] of map) {
+      if (!weaknessesMergeable(weakness, key, cat, categorizeWeakness(key)))
+        continue
       const score = weaknessSimilarity(weakness, key)
       if (score > bestScore) {
         bestScore = score
@@ -746,6 +794,8 @@ export class KasperStateStore {
         pattern,
         count,
         suggested_fix: "",
+        category: categorizeWeakness(pattern),
+        evidence_count: count,
       }))
 
     this.state.aggregate = {
@@ -768,6 +818,8 @@ export class KasperStateStore {
           pattern,
           count,
           suggested_fix: "",
+          category: categorizeWeakness(pattern),
+          evidence_count: count,
         }))
 
       this.state.aggregate.by_agent[name] = {
@@ -792,10 +844,8 @@ export class KasperStateStore {
     const copyFrom = (source: WeaknessPattern[], target: WeaknessPattern[]) => {
       for (const tw of target) {
         if (tw.suggested_fix && tw.target) continue
-        const match = source.find(
-          (s) =>
-            weaknessSimilarity(s.pattern, tw.pattern) >=
-            WEAKNESS_SIMILARITY_THRESHOLD,
+        const match = source.find((s) =>
+          weaknessesMergeable(s.pattern, tw.pattern, s.category, tw.category),
         )
         if (match) {
           if (!tw.suggested_fix && match.suggested_fix)
@@ -803,6 +853,9 @@ export class KasperStateStore {
           if (!tw.target && match.target) tw.target = match.target
           if (!tw.agent_name && match.agent_name)
             tw.agent_name = match.agent_name
+          if (!tw.category && match.category) tw.category = match.category
+          if (!tw.confidence && match.confidence)
+            tw.confidence = match.confidence
         }
       }
     }
@@ -988,6 +1041,11 @@ export class KasperStateStore {
       running_sum: this.runningSum,
       by_agent: byAgent,
     }
+    const json = JSON.stringify(this.state, null, 2)
+    this.state._integrity = createHash("sha256")
+      .update(json.replace(/"(_integrity|_running)":\s*"[^"]*"/g, ""))
+      .digest("hex")
+      .slice(0, 32)
     await writeTextAtomic(this.statePath, JSON.stringify(this.state, null, 2))
   }
 }

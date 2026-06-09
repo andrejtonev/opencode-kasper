@@ -38,7 +38,7 @@ export function createKasperTools(
     }),
     kasper_improve: tool({
       description:
-        "Get a numbered table of suggested improvements for AGENTS.md or agent prompts. AFTER calling this, show the user the table. Apply suggestions via /kasper apply <n>.",
+        "Get a numbered table of suggested improvements for AGENTS.md or agent prompts. AFTER calling this, show the user the table. Apply suggestions via /kasper apply <n>. Use dry_run=true to preview without queuing.",
       args: {
         agent: $z
           .string()
@@ -50,10 +50,17 @@ export function createKasperTools(
           .describe(
             "Show all weaknesses regardless of min observation threshold",
           ),
+        dry_run: $z
+          .boolean()
+          .optional()
+          .describe("Preview improvements without adding to the pending queue"),
       },
       execute: async (args, _toolCtx) => {
-        const a = args as { agent?: string; force?: boolean }
-        return executeKasperImprove(a, ctx)
+        const a = args as { agent?: string; force?: boolean; dry_run?: boolean }
+        return executeKasperImprove(
+          { agent: a.agent, force: a.force, dryRun: a.dry_run },
+          ctx,
+        )
       },
     }),
     kasper_apply: tool({
@@ -146,9 +153,16 @@ export function createKasperTools(
     kasper_reset: tool({
       description:
         "Clear all kasper state — sessions, scores, rejected patterns, and pending improvements",
-      args: {},
-      execute: async (_args, _toolCtx) => {
-        return executeKasperReset(ctx)
+      args: {
+        force: $z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("Must be true to confirm the destructive reset"),
+      },
+      execute: async (args, _toolCtx) => {
+        const a = args as { force?: boolean }
+        return executeKasperReset(a.force ? "--force" : "", ctx)
       },
     }),
   }

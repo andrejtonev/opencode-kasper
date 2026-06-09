@@ -247,8 +247,9 @@ describe("KasperStateStore", () => {
     await store1.init()
     store1.recordSession("s1", "test", makeScoreCard({ overall_score: 0.9 }))
 
-    // flush writes happen after 2s debounce; force flush by reconstructing
-    await new Promise((resolve) => setTimeout(resolve, 2100))
+    // Force flush — the 2s debounce timer is unreliable on Windows under
+    // fast CI runners, and reload() needs the on-disk state.
+    await store1.flush()
 
     const store2 = createStore()
     await store2.init()
@@ -437,7 +438,9 @@ describe("KasperStateStore", () => {
       const store = createStore()
       await store.init()
       store.addRejectedPattern("persistent pattern")
-      await new Promise((r) => setTimeout(r, 2100))
+      // Force flush — the 2s debounce timer is unreliable on Windows under
+      // fast CI runners.
+      await store.flush()
       await store.destroy()
 
       const store2 = createStore()

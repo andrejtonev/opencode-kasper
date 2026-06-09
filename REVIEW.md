@@ -47,7 +47,6 @@ Each comment from the review session is listed below, analyzed against the curre
 **Recommendation:** Consider whether subagent evaluations are meaningful. A subagent's "user instruction" is whatever the primary agent delegated to it — scoring it against that may not reflect user intent. Options:
   - **Filter subagents** from auto-evaluation in the `pollAndEvaluate()` handler by checking `agentInfo?.agentType === "subagent"`  
   - Keep evaluating but mark subagent scores with a `subagent` flag in the score card to exclude them from primary agent aggregates  
-  - Add a config key `evaluate_subagents: boolean` (default `false`)
 
 ---
 
@@ -203,7 +202,6 @@ The `AgentsMdManager` reads from project-root `AGENTS.md` with fallback to `.ope
 | # | Fix | Effort | Impact |
 |---|---|---|---|
 | 11 | Persist `sessionsEvaluated` to state file | Small | Prevents duplicate LLM calls across restarts + instances |
-| 3 | Add `evaluate_subagents` config (default false) + filter in polling handler | Small | Prevents noisy subagent scores in primary aggregates |
 | 7 | Global agent prompt fallback in `AgentPromptManager` | Small | Captures global agent prompts, not just project ones |
 | 8 | Use `client.app.agents()` API for authoritative agent prompts | Medium | Eliminates file I/O races, captures inline config prompts |
 

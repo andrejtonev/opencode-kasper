@@ -3,7 +3,8 @@ import { randomBytes } from "node:crypto"
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import KasperPlugin, { flushKasperState } from "../src/index.js"
+import KasperPlugin from "../src/index.js"
+import { flushKasperState } from "../src/registry.js"
 
 function tmpDir(): string {
   return join(tmpdir(), `kasper-int-${randomBytes(6).toString("hex")}`)
@@ -609,47 +610,6 @@ describe("score toasts", () => {
 })
 
 // [removed] agent prompt update cycle — old apply pattern with kasper_reject
-
-describe("config hot-reload", () => {
-  test("picks up kasper.jsonc changes while plugin is running", async () => {
-    const dir = await setupTestDir()
-    const client = makeClient()
-    const hooks = await KasperPlugin({
-      client: client as any,
-      directory: dir,
-    })
-
-    const out1: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "config" },
-      out1,
-    )
-    expect(out1.message).toContain("Scoring threshold")
-    expect(out1.message).not.toContain("0.15")
-
-    const obsDir = join(dir, ".opencode")
-    const obsPath = join(obsDir, "kasper.jsonc")
-    await mkdir(obsDir, { recursive: true })
-    await writeFile(
-      obsPath,
-      JSON.stringify({ scoring_threshold: 0.15, model: "openai/gpt-4o" }),
-      "utf-8",
-    )
-
-    await new Promise((r) => setTimeout(r, 6000))
-
-    const out2: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "config" },
-      out2,
-    )
-    expect(out2.message).toContain("0.15")
-    expect(out2.message).toContain("gpt-4o")
-
-    await hooks.close()
-    await rm(dir, { recursive: true, force: true })
-  }, 30000)
-})
 
 describe("tool coverage", () => {
   test("kasper_status tool returns aggregate and recent sessions", async () => {
@@ -1260,60 +1220,6 @@ describe("kasper help", () => {
 
 // [removed] suggest force — "suggest" command was replaced by "improve"
 
-describe("kasper config", () => {
-  test("config command displays current configuration", async () => {
-    const dir = await setupTestDir()
-    const client = makeClient()
-    const hooks = await KasperPlugin({
-      client: client as any,
-      directory: dir,
-    })
-
-    const output: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "config" },
-      output,
-    )
-    expect(output.stop).toBe(true)
-    expect(output.message).toContain("Kasper Configuration")
-    expect(output.message).toContain("Scoring threshold")
-    expect(output.message).toContain("Model")
-    expect(output.message).toContain("Detail level")
-    expect(output.message).toContain("State")
-
-    await hooks.close()
-    await rm(dir, { recursive: true, force: true })
-  })
-
-  test("config command shows current kasper settings", async () => {
-    const dir = await setupTestDir()
-    await writeFile(
-      join(dir, "opencode.json"),
-      JSON.stringify({
-        kasper: { scoring_threshold: 0.3, min_session_messages: 1 },
-      }),
-      "utf-8",
-    )
-
-    const client = makeClient()
-    const hooks = await KasperPlugin({
-      client: client as any,
-      directory: dir,
-    })
-
-    const output: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "config" },
-      output,
-    )
-    expect(output.message).toContain("Kasper Configuration")
-    expect(output.message).toContain("0.3")
-
-    await hooks.close()
-    await rm(dir, { recursive: true, force: true })
-  })
-})
-
 describe("state eviction", () => {
   test("records multiple sessions correctly", async () => {
     const dir = await setupTestDir()
@@ -1368,7 +1274,7 @@ describe("kasper reset", () => {
 
     const resetOutput: any = {}
     await hooks2["command.execute.before"](
-      { command: "kasper", argument: "reset" },
+      { command: "kasper", argument: "reset --force" },
       resetOutput,
     )
     expect(resetOutput.stop).toBe(true)
@@ -1393,7 +1299,7 @@ describe("kasper reset", () => {
 
     await fullSession(dir, hooks, "tool-reset-test")
 
-    const result = await hooks.tool.kasper_reset.execute({}, {})
+    const result = await hooks.tool.kasper_reset.execute({ force: true }, {})
     expect(result).toContain("Kasper state reset")
     expect(result).toContain("Cleared 1 session")
 
@@ -1417,7 +1323,7 @@ describe("kasper reset", () => {
 
     const resetOutput: any = {}
     await hooks["command.execute.before"](
-      { command: "kasper", argument: "reset" },
+      { command: "kasper", argument: "reset --force" },
       resetOutput,
     )
 

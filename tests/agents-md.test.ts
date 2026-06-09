@@ -99,7 +99,10 @@ describe("AgentsMdManager", () => {
     test("trims trailing whitespace from replacement", () => {
       const existing = "## My Section\nold\n"
       const result = manager.injectSection(existing, "My Section", "new\n\n")
-      expect(result).toBe("## My Section\nnew")
+      expect(result).toContain("## My Section")
+      expect(result).toContain("new")
+      expect(result).toMatch(/<!-- kasper:/)
+      expect(result).not.toContain("old")
     })
 
     test("section header includes section name", () => {

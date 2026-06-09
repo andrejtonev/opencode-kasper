@@ -94,7 +94,6 @@ These are the **real-world scenarios** that would give us confidence:
 | **Low score triggers warning toast** | Mock/freeze a low score, verify warning variant toast | P1 |
 | **AGENTS.md auto-update** | Run with low score + `auto_update: true`, verify `AGENTS.md` is modified | P1 |
 | **Agent prompt auto-update** | Run with agent-specific weakness + `auto_update: true`, verify `.opencode/agents/{name}.md` | P1 |
-| **Subagent evaluation disabled** | `evaluate_subagents: false`, verify child sessions not scored | P1 |
 | **Cross-process state merge** | Run two `opencode` instances on same project, verify state merges safely | P2 |
 | **Compaction hook injection** | Trigger compaction, verify kasper feedback in system context | P2 |
 | **Manual `kasper score session <id>`** | Use `opencode run` or tool call to trigger retroactive eval | P2 |
@@ -201,7 +200,6 @@ Line 641: `await new Promise((r) => setTimeout(r, 6000))` — the 6-second sleep
 | # | Fix | Effort | Impact |
 |---|-----|--------|--------|
 | 11 | **Persist `sessionsEvaluated` to state file** | Small | Prevents duplicate LLM calls across restarts + instances |
-| 3 | **Add `evaluate_subagents` config (default false)** | Small | Prevents noisy subagent scores in primary aggregates |
 | 7 | **Global agent prompt fallback** | Small | Captures global agent prompts, not just project ones |
 | 8 | **Use `client.app.agents()` API** | Medium | Eliminates file I/O races, captures inline config prompts |
 | 12 | **Capture system prompt via `experimental.chat.system.transform`** | Medium | Full prompt provenance for scoring |
@@ -274,7 +272,6 @@ Add to `package.json`:
 
 ### Phase 4: Architectural Fixes (Parallel)
 - [ ] Persist `sessionsEvaluated` to state file
-- [ ] Add `evaluate_subagents` config + filter
 - [ ] Use `client.app.agents()` for authoritative prompts
 - [ ] Implement `experimental.chat.system.transform` capture
 

@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto"
 import {
+  type AgentPromptSource,
+  materializeInlinePrompt,
+  resolveAgentPromptSource,
+} from "./agent-prompt-resolver.js"
+import {
   BACKUP_ENABLED,
   BACKUP_MAX_VERSIONS,
-  MIN_OBSERVATIONS_FOR_UPDATE,
-  WEAKNESS_SIMILARITY_THRESHOLD,
+  isBuiltinAgentName,
 } from "./constants.js"
 import { batchEvaluateSessions, manualEvaluateSession } from "./evaluate.js"
 import type {
@@ -12,13 +16,69 @@ import type {
   PerAgentStats,
   WeaknessPattern,
 } from "./types.js"
+import { categorizeWeakness } from "./types.js"
 import {
   formatScore,
   isKasperSession,
+  isValidGuidanceText,
   renderSparkline,
+  sanitizeImprovementText,
   showToast,
-  weaknessSimilarity,
+  weaknessesMergeable,
 } from "./utils.js"
+
+/**
+ * Build a list of human-readable lines describing what kasper is currently
+ * doing in the background. Returned lines start with a leading marker so
+ * they render as their own block in the status output. Returns an empty
+ * array when nothing is in flight.
+ */
+export function summarizeValidationInProgress(ctx: KasperContext): string[] {
+  const lines: string[] = []
+
+  if (ctx.kasperPaused) {
+    lines.push("⏸ Validation paused — `/kasper resume` to re-enable")
+  }
+
+  if (ctx.evaluationRunning) {
+    const startedAt = ctx.evaluationStartedAt
+    const elapsed =
+      typeof startedAt === "number"
+        ? Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        : null
+    const idleCount = ctx.idleSessions.size
+    const idleSuffix =
+      idleCount > 0
+        ? ` (${idleCount} idle session${idleCount === 1 ? "" : "s"} queued)`
+        : ""
+    const elapsedSuffix = elapsed !== null ? ` — ${formatElapsed(elapsed)}` : ""
+    lines.push(`🔄 Validation in progress${idleSuffix}${elapsedSuffix}`)
+  } else if (ctx.idleSessions.size > 0) {
+    lines.push(
+      `⏳ ${ctx.idleSessions.size} session${ctx.idleSessions.size === 1 ? "" : "s"} idle, waiting for next poll`,
+    )
+  }
+
+  if (ctx.isMergingWeaknesses) {
+    lines.push("🧠 Merging weaknesses across sessions — LLM call in flight")
+  }
+
+  if (ctx.improvementsPending.length > 0) {
+    const n = ctx.improvementsPending.length
+    lines.push(
+      `📝 ${n} pending improvement${n === 1 ? "" : "s"} awaiting application — review with \`/kasper improve\``,
+    )
+  }
+
+  return lines
+}
+
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return s === 0 ? `${m}m` : `${m}m ${s}s`
+}
 
 export async function executeKasperStatus(
   args: { agent?: string; limit: number },
@@ -44,6 +104,11 @@ export async function executeKasperStatus(
     `**Average adherence score:** ${scoreEmoji} ${scorePct}%`,
     ``,
   ]
+
+  const progress = summarizeValidationInProgress(ctx)
+  if (progress.length > 0) {
+    lines.push(`### In Progress`, ...progress, ``)
+  }
 
   const agentNames = Object.keys(agg.by_agent).filter((n) => n !== "unknown")
   const showPerAgent = !args.agent && agentNames.length > 0
@@ -128,8 +193,8 @@ export async function executeKasperStatus(
         const contributing = agentNames.filter((name) => {
           const pa = agg.by_agent[name]
           if (!pa) return false
-          return pa.top_weaknesses.some(
-            (pw) => weaknessSimilarity(pw.pattern, w.pattern) >= 0.6,
+          return pa.top_weaknesses.some((pw) =>
+            weaknessesMergeable(pw.pattern, w.pattern, pw.category, w.category),
           )
         })
         const agentLabel =
@@ -168,8 +233,8 @@ export async function executeKasperStatus(
         const contributing = agentNames.filter((name) => {
           const pa = agg.by_agent[name]
           if (!pa) return false
-          return pa.top_weaknesses.some(
-            (pw) => weaknessSimilarity(pw.pattern, w.pattern) >= 0.6,
+          return pa.top_weaknesses.some((pw) =>
+            weaknessesMergeable(pw.pattern, w.pattern, pw.category, w.category),
           )
         })
         const agentLabel =
@@ -233,9 +298,6 @@ export async function executeKasperStatus(
 
   const autoLabel = ctx.autoUpdateEnabled ? "ON" : "OFF"
   lines.push(``, `Auto-update: ${autoLabel} | /kasper auto for details`)
-  if (ctx.kasperPaused) {
-    lines.push(`Kasper is PAUSED — /kasper resume to re-enable`)
-  }
 
   return lines.join("\n")
 }
@@ -247,10 +309,8 @@ function resolveWeaknessAgentLabels(
   const agents: string[] = []
   if (agg.by_agent) {
     for (const [name, pa] of Object.entries(agg.by_agent)) {
-      const hasMatch = pa.top_weaknesses.some(
-        (aw: WeaknessPattern) =>
-          weaknessSimilarity(w.pattern, aw.pattern) >=
-          WEAKNESS_SIMILARITY_THRESHOLD,
+      const hasMatch = pa.top_weaknesses.some((aw: WeaknessPattern) =>
+        weaknessesMergeable(w.pattern, aw.pattern, w.category, aw.category),
       )
       if (hasMatch) agents.push(name)
     }
@@ -276,7 +336,7 @@ function collectAgentWeaknesses(agg: {
     const key = w.pattern.toLowerCase().trim()
     let dup = false
     for (const s of seen) {
-      if (weaknessSimilarity(key, s) >= WEAKNESS_SIMILARITY_THRESHOLD) {
+      if (weaknessesMergeable(key, s, w.category, categorizeWeakness(s))) {
         dup = true
         break
       }
@@ -295,10 +355,7 @@ function weaknessToPending(
   agentFallback?: string,
 ): void {
   for (const existing of ctx.improvementsPending) {
-    if (
-      weaknessSimilarity(w.pattern, existing.reason) >=
-      WEAKNESS_SIMILARITY_THRESHOLD
-    ) {
+    if (weaknessesMergeable(w.pattern, existing.reason)) {
       return
     }
   }
@@ -344,7 +401,7 @@ export function resolveTargetOverride(
 }
 
 export async function executeKasperImprove(
-  args: { agent?: string; force?: boolean },
+  args: { agent?: string; force?: boolean; dryRun?: boolean },
   ctx: KasperContext,
 ): Promise<string> {
   const config = ctx.stateStore.getConfig()
@@ -360,27 +417,21 @@ export async function executeKasperImprove(
   }
 
   const top = weaknesses.filter((w: WeaknessPattern) => {
-    if (!args.force && w.count < MIN_OBSERVATIONS_FOR_UPDATE) return false
+    if (!args.force && w.count < ctx.config.min_observations_for_update)
+      return false
     for (const rejected of ctx.rejectedPatterns) {
-      if (
-        weaknessSimilarity(w.pattern, rejected) >= WEAKNESS_SIMILARITY_THRESHOLD
-      )
-        return false
+      if (weaknessesMergeable(w.pattern, rejected, w.category)) return false
     }
     return true
   })
 
   if (top.length === 0) {
-    return `No weaknesses have reached the minimum observation threshold (${MIN_OBSERVATIONS_FOR_UPDATE}). Current top weakness: "${weaknesses[0].pattern}" (${weaknesses[0].count}x).`
-  }
-
-  for (const w of top) {
-    weaknessToPending(w, ctx, args.agent)
+    return `No weaknesses have reached the minimum observation threshold (${ctx.config.min_observations_for_update}). Current top weakness: "${weaknesses[0].pattern}" (${weaknesses[0].count}x).`
   }
 
   const header = args.agent
-    ? `## Suggested Improvements for ${args.agent}`
-    : `## Suggested Improvements`
+    ? `## ${args.dryRun ? "Dry-Run: " : ""}Suggested Improvements for ${args.agent}`
+    : `## ${args.dryRun ? "Dry-Run: " : ""}Suggested Improvements`
 
   const rows = top.map((w: WeaknessPattern, i: number) => {
     const agentLabel =
@@ -404,7 +455,7 @@ export async function executeKasperImprove(
     return `Fix #${i + 1}: ${fix}`
   })
 
-  return [
+  const result = [
     header,
     ``,
     ...tableLines,
@@ -413,8 +464,18 @@ export async function executeKasperImprove(
     ``,
     `Auto-update: ${config.auto_update ? "ON" : "OFF"} (session: ${ctx.autoUpdateEnabled ? "ON" : "OFF"})`,
     ``,
-    `Use /kasper apply <n> to apply.`,
+    args.dryRun
+      ? `Dry-run mode: nothing was queued. Remove --dry-run to actually queue improvements.`
+      : `Use /kasper apply <n> to apply.`,
   ].join("\n")
+
+  if (args.dryRun) return result
+
+  for (const w of top) {
+    weaknessToPending(w, ctx, args.agent)
+  }
+
+  return result
 }
 
 export async function executeKasperAuto(
@@ -757,40 +818,136 @@ export async function executeKasperHistory(
   return lines.join("\n")
 }
 
-export async function executeKasperConfig(ctx: KasperContext): Promise<string> {
-  const cfg = ctx.stateStore.getConfig()
-  const agg = ctx.stateStore.getAggregate()
-  return [
-    `## Kasper Configuration`,
-    ``,
-    `- **Enabled**: ${cfg.enabled}`,
-    `- **Auto-update**: ${ctx.autoUpdateEnabled ? "ON" : "OFF"} (config: ${cfg.auto_update ? "ON" : "OFF"})`,
-    `- **Scoring threshold**: ${cfg.scoring_threshold}`,
-    `- **Model**: ${cfg.model}`,
-    `- **Detail level**: ${cfg.detail_level}`,
-    `- **Evaluate subagents**: ${cfg.evaluate_subagents ? "ON" : "OFF"}`,
-    `- **Min session messages**: ${cfg.min_session_messages}`,
-    `- **Weakness decay**: ${cfg.weakness_decay_days} days`,
-    `- **Quiet mode**: ${cfg.quiet ? "ON (only warning toasts)" : "OFF"}`,
-    `- **Poll interval**: ${cfg.evaluation_poll_interval_ms}ms`,
-    `- **Scoring retries**: ${cfg.scoring_retries}`,
-    `- **Scoring timeout**: ${cfg.scoring_timeout_ms}ms`,
-    `- **Max score input**: ${cfg.max_score_input_chars} chars`,
-    `- **State directory**: ${cfg.state_dir || ".opencode/kasper/ (default)"}`,
-    ``,
-    `**State**: ${agg.total_sessions} sessions tracked, ${ctx.stateStore.getImprovements().length} improvements applied`,
-    `**Pending improvements**: ${ctx.improvementsPending.length}`,
-    ctx.kasperPaused
-      ? `**Kasper is PAUSED** — /kasper resume to re-enable`
-      : "",
-    ctx.userGuidance.size > 0 ? `` : "",
-    ctx.userGuidance.size > 0
-      ? `**Active guidance sessions**: ${[...ctx.userGuidance.keys()].join(", ")}`
-      : "",
-  ].join("\n")
+export function describeAgentPromptSource(source: AgentPromptSource): string {
+  switch (source.kind) {
+    case "external_file":
+      return `{file:...} directive → ${source.path}\n  declared in: ${source.configPath}`
+    case "project_file":
+      return `project file: ${source.path}`
+    case "global_file":
+      return `global file: ${source.path}`
+    case "inline":
+      return `inline string in ${source.configPath} (${source.prompt.length} chars)`
+    case "missing":
+      return `no prompt source found for this agent`
+  }
 }
 
-export async function executeKasperReset(ctx: KasperContext): Promise<string> {
+export async function executeKasperMigrate(
+  rawArg: string,
+  ctx: KasperContext,
+): Promise<string> {
+  const arg = rawArg.trim()
+  const showOnly = /\bshow\b|\b--show\b/.test(arg)
+  const name = arg.replace(/\b(show|--show)\b/g, "").trim()
+  if (!name) {
+    return [
+      "Usage:",
+      "  /kasper migrate <agent-name>           extract inline prompt to a file",
+      "  /kasper migrate <agent-name> --show    report the current source without changing it",
+    ].join("\n")
+  }
+
+  const projectRoot = (ctx.agentPrompts as unknown as { projectRoot: string })
+    .projectRoot
+  const globalOpencodeDir = (
+    ctx.agentPrompts as unknown as { globalOpencodeDir?: string }
+  ).globalOpencodeDir
+
+  const source = await resolveAgentPromptSource(
+    name,
+    projectRoot,
+    globalOpencodeDir,
+  )
+  const description = describeAgentPromptSource(source)
+
+  if (showOnly) {
+    return [`## Agent prompt source: \`${name}\``, ``, description].join("\n")
+  }
+
+  if (source.kind !== "inline") {
+    if (source.kind === "missing") {
+      return [
+        `## Nothing to migrate for \`${name}\``,
+        ``,
+        "No prompt source exists for this agent in any opencode config or conventional file location.",
+        "",
+        "If you want to create a new prompt file, use your editor or a /kasper apply workflow to inject the initial section.",
+      ].join("\n")
+    }
+    return [
+      `## Nothing to migrate for \`${name}\``,
+      ``,
+      `Current source: ${description}`,
+      "",
+      "Migration only applies when the prompt is an inline string in opencode.json. Kasper already writes to this source directly.",
+    ].join("\n")
+  }
+
+  let mode: "primary" | "subagent" = "subagent"
+  for (const [, info] of ctx.agentRegistry) {
+    if (info.agentName === name) {
+      mode = info.agentType === "primary" ? "primary" : "subagent"
+      break
+    }
+  }
+
+  try {
+    const result = await materializeInlinePrompt(
+      name,
+      projectRoot,
+      globalOpencodeDir,
+      {
+        mode,
+      },
+    )
+    ctx.agentPrompts.invalidateSourceCache(name)
+    await ctx.logger.log("agent_prompt_migrated", {
+      agent: name,
+      filePath: result.filePath,
+      configPath: result.configPath,
+      configModified: result.configModified,
+    })
+    showToast(
+      ctx.client,
+      "Kasper",
+      `Migrated ${name} inline prompt to ${result.filePath}. Restart opencode.`,
+      "success",
+    )
+    return [
+      `## Migrated \`${name}\` prompt`,
+      ``,
+      `**New prompt file:** \`${result.filePath}\`${result.fileCreated ? " (created)" : " (left in place)"}`,
+      `**Source opencode.json:** \`${result.configPath}\`${result.configModified ? " (inline `prompt` field replaced with `{file:...}` directive)" : " (no changes needed)"}`,
+      ``,
+      "**Restart opencode** to load the new prompt. From now on, kasper will edit the file directly.",
+    ].join("\n")
+  } catch (err) {
+    return `Migration failed: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+export async function executeKasperReset(
+  arg: string,
+  ctx: KasperContext,
+): Promise<string> {
+  const normalized = arg.trim().toLowerCase()
+  if (normalized !== "--force" && normalized !== "confirm") {
+    return [
+      "## ⚠️ Dangerous Operation",
+      "",
+      "This will permanently delete all Kasper state including:",
+      "- All session scores and evaluations",
+      "- All tracked weaknesses and strengths",
+      "- All pending and applied improvements",
+      "- All agent registry data",
+      "",
+      "This action **cannot be undone**.",
+      "",
+      "To confirm, run: `/kasper reset --force`",
+    ].join("\n")
+  }
+
   const before = ctx.stateStore.getAggregate()
   ctx.kasperPaused = true
   await ctx.stateStore.reset()
@@ -821,8 +978,8 @@ export function executeKasperHelp(): string {
     `| \`/kasper improve [agent]\` | Show suggested improvements as a table with weakness, count, agent, target |`,
     `| \`/kasper apply [n|all]\` | Apply a pending improvement (first if no index, at index, or all) |`,
     `| \`/kasper history [agent]\` | View session history with score breakdowns and improvement log |`,
-    `| \`/kasper config\` | Display current plugin configuration |`,
     `| \`/kasper reset\` | Clear all kasper state (sessions, scores, improvements) |`,
+    `| \`/kasper migrate <name> [--show]\` | Extract an inline (opencode.json) agent prompt to a file so kasper can edit it |`,
     `| \`/kasper help\` | Show this help |`,
     ``,
     `Scoring dimensions: instruction following, completeness, proactiveness, code quality, communication.`,
@@ -841,16 +998,17 @@ export async function dispatchKasperCommand(
     const agg = ctx.stateStore.getAggregate()
     const { emoji: scoreEmoji, pct: scorePct } = formatScore(agg.avg_score)
     const autoLabel = ctx.autoUpdateEnabled ? "ON" : "OFF"
+    const progress = summarizeValidationInProgress(ctx)
     return [
       `## Kasper`,
       ``,
       `${scoreEmoji} Average score: ${scorePct}% across ${agg.total_sessions} session(s)`,
+      ...(progress.length > 0 ? ["", ...progress] : []),
       ``,
       `Auto-update: ${autoLabel} | /kasper status for details`,
-      ctx.kasperPaused ? `Kasper is PAUSED — /kasper resume to re-enable` : ``,
       `Type /kasper help for all commands`,
     ]
-      .filter(Boolean)
+      .filter((line) => line !== undefined && line !== null)
       .join("\n")
   }
 
@@ -859,8 +1017,11 @@ export async function dispatchKasperCommand(
       return executeKasperStatus({ agent: arg || undefined, limit: 15 }, ctx)
     case "score":
       return handleScoreCommand(arg, sessionID, ctx)
-    case "improve":
-      return executeKasperImprove({ agent: arg || undefined }, ctx)
+    case "improve": {
+      const dryRun = /\b--dry-run\b/.test(arg)
+      const cleanArg = arg.replace(/\b--dry-run\b/, "").trim()
+      return executeKasperImprove({ agent: cleanArg || undefined, dryRun }, ctx)
+    }
     case "apply": {
       if (arg === "all") {
         if (ctx.improvementsPending.length === 0) {
@@ -890,16 +1051,16 @@ export async function dispatchKasperCommand(
     }
     case "history":
       return executeKasperHistory({ agent: arg || undefined, limit: 20 }, ctx)
-    case "config":
-      return executeKasperConfig(ctx)
     case "auto":
       return executeKasperAuto(arg, ctx)
     case "help":
       return executeKasperHelp()
     case "reset":
-      return executeKasperReset(ctx)
+      return executeKasperReset(arg, ctx)
+    case "migrate":
+      return executeKasperMigrate(arg, ctx)
     default:
-      return `Unknown /kasper command: "${action}". Available: status, score, improve, apply, history, config, reset, help`
+      return `Unknown /kasper command: "${action}". Available: status, score, improve, apply, history, reset, help`
   }
 }
 
@@ -932,18 +1093,46 @@ export function buildApplyPromptForPendings(
       lines.push(
         `${prefix}**Target**: \`${name}\` agent prompt`,
         `**Description**: ${p.reason}`,
-        "",
+        ``,
         `The \`${name}\` agent prompt may be defined in one of:`,
         `  1. \`.opencode/agents/${name}.md\` (project-specific markdown)`,
         `  2. \`~/.config/opencode/agents/${name}.md\` (global markdown)`,
         `  3. \`opencode.json\` under \`"agent"."${name}"."prompt"\` (inline or \`{file:...}\` reference)`,
-        "",
+        ``,
         "Check each location to find where the prompt is defined, then add under the prompt:",
         `> ${p.reason}`,
         "",
+        `Kasper's default style adds a visible \`## Kasper Inferred Instructions\` section. If \`agent_prompt_inject_mode = "inline"\` is set in kasper.json(c), kasper appends the guidance directly with no section header (wrapped only in \`<!-- kasper-injected:begin/end -->\` HTML comments for rollback).`,
         "If the prompt already has a `## Kasper Inferred Instructions` section, add a bullet point there.",
-        "If the prompt is an inline string in opencode.json, write it as a markdown file at",
-        `  \`.opencode/agents/${name}.md\` with the existing prompt preserved, then add the entry.`,
+        `If the prompt is an inline string in opencode.json, run \`/kasper migrate ${name}\` first to extract it, then add the entry.`,
+      )
+    }
+    lines.push("")
+  }
+
+  if (pending.length === 1) {
+    const p = pending[0]
+    if (!p) return lines.join("\n")
+    if (p.target === "agents_md") {
+      lines.push(
+        `**Instructions**:`,
+        `1. Read the full AGENTS.md to understand its current structure and existing guidelines`,
+        `2. Check if this improvement (or something very similar) already exists in the file`,
+        `3. If missing, determine the best section to introduce it — it may belong under \`## Kasper Inferred Instructions\` or a more specific section`,
+        `4. If adding to Kasper Inferred Instructions, find or create that section; otherwise add where it fits best`,
+        `5. Verify the file is well-formed and no duplication occurred before finishing`,
+      )
+    } else {
+      const name = p.agent_name || "unknown"
+      lines.push(
+        `**Instructions**:`,
+        `1. Look up the \`${name}\` agent prompt in the locations listed above`,
+        `2. Read the full prompt to understand its current structure and existing guidelines`,
+        `3. Check if this improvement (or something very similar) already exists`,
+        `4. If missing, determine the best section — look for \`## Kasper Inferred Instructions\` or a natural heading. If \`agent_prompt_inject_mode = "inline"\` is set, append directly at the end of the file (after any existing \`<!-- kasper-injected:end -->\` block).`,
+        `5. Add the improvement, preserving all existing content`,
+        `6. If the prompt lives in opencode.json as an inline string, run \`/kasper migrate ${name}\` to extract it before editing`,
+        `7. Verify the change is well-formed and no duplication occurred before finishing`,
       )
     }
     lines.push("")
@@ -970,7 +1159,7 @@ export function buildApplyPromptForPendings(
         `3. Check if this improvement (or something very similar) already exists`,
         `4. If missing, determine the best section — look for \`## Kasper Inferred Instructions\` or a natural heading`,
         `5. Add the improvement, preserving all existing content`,
-        `6. If the prompt lives in opencode.json, create \`.opencode/agents/${name}.md\` and move the prompt there before editing`,
+        `6. If the prompt lives in opencode.json as an inline string, run \`/kasper migrate ${name}\` to extract it before editing`,
         `7. Verify the change is well-formed and no duplication occurred before finishing`,
       )
     }
@@ -992,9 +1181,47 @@ export async function applyImprovement(
   pending: ImprovementRecord,
   ctx: KasperContext,
 ): Promise<string> {
+  const config = ctx.stateStore.getConfig()
+  if (config.strict_sanitize) {
+    const sanResult = sanitizeImprovementText(pending.reason)
+    if (!sanResult.safe) {
+      showToast(
+        ctx.client,
+        "Kasper",
+        `Improvement rejected: contains ${sanResult.rejections.join(", ")}`,
+        "warning",
+        6000,
+      )
+      return `Improvement rejected by sanitization: ${sanResult.rejections.join(", ")}`
+    }
+  }
+
+  if (!isValidGuidanceText(pending.reason)) {
+    return "Improvement rejected: text fails validation (may contain special instructions or be too short)."
+  }
+
   const patterns = pending.weaknesses ?? [pending.reason]
 
   if (pending.target === "agent_prompt" && pending.agent_name) {
+    // Built-in opencode agents (build, plan, general, ...) have hard-coded
+    // prompts shipped with opencode. `.opencode/agents/<name>.md` is only
+    // consulted when `agent.<name>.prompt` in `opencode.json` is set to a
+    // `{file:...}` directive or inline string. If a built-in agent has no
+    // defined prompt, creating a markdown file at the conventional path
+    // produces a dead file that opencode never reads. Reroute the
+    // improvement to AGENTS.md in that case — built-in agents always
+    // honour the project rules file.
+    const source = await ctx.agentPrompts.resolve(pending.agent_name)
+    if (source.kind === "missing" && isBuiltinAgentName(pending.agent_name)) {
+      const rerouted: ImprovementRecord = {
+        ...pending,
+        target: "agents_md",
+      }
+      return applyAgentsMd(rerouted, patterns, ctx, {
+        rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
+      })
+    }
+
     const promptExisted = await ctx.agentPrompts.exists(pending.agent_name)
 
     let agentMode = "subagent"
@@ -1012,6 +1239,7 @@ export async function applyImprovement(
       BACKUP_ENABLED,
       BACKUP_MAX_VERSIONS,
       agentMode,
+      ctx.config.agent_prompt_inject_mode,
     )
     ctx.stateStore.recordImprovement({
       ...pending,
@@ -1036,6 +1264,15 @@ export async function applyImprovement(
     return `${pending.agent_name} agent prompt updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${restartNote}`
   }
 
+  return applyAgentsMd(pending, patterns, ctx)
+}
+
+async function applyAgentsMd(
+  pending: ImprovementRecord,
+  patterns: string[],
+  ctx: KasperContext,
+  opts: { rerouteNote?: string } = {},
+): Promise<string> {
   let backupPath = ""
   await ctx.agentsMd.lockedUpdate(async (existing) => {
     if (BACKUP_ENABLED) {
@@ -1060,5 +1297,6 @@ export async function applyImprovement(
     remaining > 0
       ? `\n\nUse /kasper apply <n> to apply remaining (${remaining} pending).`
       : ""
-  return `AGENTS.md updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}`
+  const reroute = opts.rerouteNote ? `\n\n${opts.rerouteNote}` : ""
+  return `AGENTS.md updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${reroute}`
 }
