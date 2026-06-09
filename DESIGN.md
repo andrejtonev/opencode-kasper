@@ -289,7 +289,6 @@ The PLAN.md command audit (written after this design doc) removed several featur
 | **File locking** | Cross-process `flock`-style locks on state.json with stale detection |
 | **Structured logging** | `KasperLogger` class with JSON-line logs, log rotation, debug levels |
 | **Debug mode** | `debug: true` enables verbose SDK event logging, diagnostic message dumps |
-| **Evaluate subagents** | `evaluate_subagents: false` default — subagent filtering |
 | **Detail level** | `detail_level: minimal\|standard\|thorough` controls scoring prompt verbosity |
 | **Quiet mode** | `quiet: true` suppresses all non-critical toasts |
 | **Atomic writes** | `prompt-utils.ts` — temp+rename atomic file writes for state.json |

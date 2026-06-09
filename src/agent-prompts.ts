@@ -1,5 +1,10 @@
 import { copyFile, mkdir, readdir, readFile, unlink } from "node:fs/promises"
 import { basename, join } from "node:path"
+import {
+  type AgentPromptSource,
+  defaultAgentFilePath,
+  resolveAgentPromptSource,
+} from "./agent-prompt-resolver.js"
 import { acquireLock } from "./lock.js"
 import {
   escapeRegex,
@@ -12,64 +17,161 @@ function sanitizeAgentName(name: string): string {
   return basename(name.replace(/[\\/]/g, "_"))
 }
 
+const INLINE_BEGIN = "<!-- kasper-injected:begin -->"
+const INLINE_END = "<!-- kasper-injected:end -->"
+const INLINE_BLOCK = new RegExp(
+  `${escapeRegex(INLINE_BEGIN)}[\\s\\S]*?${escapeRegex(INLINE_END)}\\n?`,
+  "g",
+)
+
+/**
+ * Append a kasper improvement to a prompt file in "inline" mode: no `## `
+ * section header, no visible provenance comment. The improvement is wrapped
+ * in a `<!-- kasper-injected:begin/end -->` block so subsequent runs can
+ * locate, dedupe, and roll it back. If the exact text is already present
+ * anywhere in the file (case-insensitive, whitespace-normalised), this is
+ * a no-op.
+ */
+export function appendInlineImprovement(
+  existing: string,
+  content: string,
+): string {
+  const trimmed = content.trim()
+  if (!trimmed) return existing
+
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
+  if (norm(existing).includes(norm(trimmed))) return existing
+
+  const block = `${INLINE_BEGIN}\n${trimmed}\n${INLINE_END}\n`
+  const trimmedExisting = existing.trimEnd()
+  return trimmedExisting ? `${trimmedExisting}\n\n${block}` : block
+}
+
+export const _inlineInjectionMarkers = {
+  INLINE_BEGIN,
+  INLINE_END,
+  INLINE_BLOCK,
+}
+
+/**
+ * Error raised when the caller tries to write or mutate an agent prompt
+ * whose source is an inline string in opencode.json. Callers should
+ * surface the `migration` hint to the user.
+ */
+export class InlinePromptError extends Error {
+  readonly agentName: string
+  readonly migration: string
+  constructor(agentName: string) {
+    super(
+      `Agent "${agentName}" prompt is defined inline in opencode.json. ` +
+        `Run \`/kasper migrate ${agentName}\` to extract it to a file, then retry.`,
+    )
+    this.name = "InlinePromptError"
+    this.agentName = agentName
+    this.migration = `kasper migrate ${agentName}`
+  }
+}
+
 export class AgentPromptManager {
   private readonly backupsDir: string
-  private readonly globalAgentsDir: string
+  private sourceCache = new Map<
+    string,
+    { source: AgentPromptSource; ts: number }
+  >()
+  private static readonly SOURCE_CACHE_TTL_MS = 30_000
 
   constructor(
     private readonly projectRoot: string,
     readonly kasperStateDir: string,
-    globalOpencodeDir?: string,
+    private readonly globalOpencodeDir?: string,
   ) {
     this.backupsDir = join(kasperStateDir, "backups", "agents")
-    this.globalAgentsDir = globalOpencodeDir
-      ? join(globalOpencodeDir, "agents")
-      : ""
   }
 
   async init(): Promise<void> {
     await mkdir(this.backupsDir, { recursive: true })
   }
 
-  getAgentPath(agentName: string): string {
-    return join(
+  /**
+   * Resolve the agent's prompt source. Cached for 30s per agent to avoid
+   * hammering the filesystem on every improvement.
+   */
+  async resolve(agentName: string): Promise<AgentPromptSource> {
+    const cached = this.sourceCache.get(agentName)
+    if (
+      cached &&
+      Date.now() - cached.ts < AgentPromptManager.SOURCE_CACHE_TTL_MS
+    ) {
+      return cached.source
+    }
+    const source = await resolveAgentPromptSource(
+      agentName,
       this.projectRoot,
-      ".opencode",
-      "agents",
-      `${sanitizeAgentName(agentName)}.md`,
+      this.globalOpencodeDir,
     )
+    this.sourceCache.set(agentName, { source, ts: Date.now() })
+    return source
   }
 
-  private getGlobalAgentPath(agentName: string): string {
-    if (!this.globalAgentsDir) return ""
-    return join(this.globalAgentsDir, `${sanitizeAgentName(agentName)}.md`)
+  invalidateSourceCache(agentName?: string): void {
+    if (agentName) this.sourceCache.delete(agentName)
+    else this.sourceCache.clear()
   }
 
+  /**
+   * The file path kasper will read from and write to for this agent.
+   * - external_file / project_file / global_file: the actual file
+   * - inline: not applicable (callers should check `resolve` first)
+   * - missing: the conventional default where a new file would be created
+   */
+  async getAgentPath(agentName: string): Promise<string> {
+    const source = await this.resolve(agentName)
+    if (source.kind === "external_file") return source.path
+    if (source.kind === "project_file") return source.path
+    if (source.kind === "global_file") return source.path
+    if (source.kind === "inline") {
+      // Reading/writing an inline prompt is not supported; return the path
+      // where it WOULD be if materialized, for diagnostic display.
+      return defaultAgentFilePath(this.projectRoot, agentName)
+    }
+    return defaultAgentFilePath(this.projectRoot, agentName)
+  }
+
+  /**
+   * True when an agent prompt is reachable (file on disk, {file:...} reference,
+   * or inline string in opencode.json).
+   */
   async exists(agentName: string): Promise<boolean> {
-    if (await exists(this.getAgentPath(agentName))) return true
-    const globalPath = this.getGlobalAgentPath(agentName)
-    if (globalPath) return exists(globalPath)
-    return false
+    const source = await this.resolve(agentName)
+    return source.kind !== "missing"
   }
 
+  /**
+   * Read the current prompt content. Returns the inline string verbatim if
+   * the source is inline; returns the file body if the source is a file;
+   * returns "" if no source can be found.
+   */
   async read(agentName: string): Promise<string> {
+    const source = await this.resolve(agentName)
+    if (source.kind === "missing") return ""
+    if (source.kind === "inline") return source.prompt
     try {
-      return await readFile(this.getAgentPath(agentName), "utf-8")
+      return await readFile(source.path, "utf-8")
     } catch {
-      const globalPath = this.getGlobalAgentPath(agentName)
-      if (globalPath) {
-        try {
-          return await readFile(globalPath, "utf-8")
-        } catch {
-          return ""
-        }
-      }
       return ""
     }
   }
 
+  /**
+   * Write the entire prompt body, replacing the previous content. Throws
+   * InlinePromptError for inline sources — use /kasper migrate first.
+   */
   async write(agentName: string, content: string): Promise<void> {
-    const filePath = this.getAgentPath(agentName)
+    const filePath = await this.getAgentPath(agentName)
+    const source = await this.resolve(agentName)
+    if (source.kind === "inline") {
+      throw new InlinePromptError(agentName)
+    }
     const lockPath = `${filePath}.lock`
     const unlock = await acquireLock(lockPath)
     try {
@@ -77,31 +179,47 @@ export class AgentPromptManager {
     } finally {
       await unlock()
     }
+    this.invalidateSourceCache(agentName)
   }
 
   private agentDir(agentName: string): string {
     return join(this.backupsDir, sanitizeAgentName(agentName))
   }
 
+  /**
+   * Snapshot the current prompt to a timestamped backup file. No-op for
+   * inline sources (we have nothing on disk to back up).
+   */
   async backup(
     agentName: string,
     label: string,
     maxBackups = 20,
-  ): Promise<string> {
+  ): Promise<string | undefined> {
+    const source = await this.resolve(agentName)
+    if (source.kind === "missing" || source.kind === "inline") {
+      return undefined
+    }
     const agentBackupDir = this.agentDir(agentName)
     await mkdir(agentBackupDir, { recursive: true })
     const name = timestampFilename(label)
     const dest = join(agentBackupDir, name)
-    const sourcePath = this.getAgentPath(agentName)
-    if (await exists(sourcePath)) {
-      await copyFile(sourcePath, dest)
+    if (await exists(source.path)) {
+      await copyFile(source.path, dest)
     }
     await this.enforceMaxBackups(agentName, maxBackups)
     return dest
   }
 
   async rollback(agentName: string): Promise<boolean> {
-    const filePath = this.getAgentPath(agentName)
+    const source = await this.resolve(agentName)
+    if (source.kind === "inline") {
+      // Nothing on disk to roll back. The original config snapshot lives
+      // in a separate kasper state file (not implemented here yet).
+      return false
+    }
+    if (source.kind === "missing") return false
+
+    const filePath = source.path
     const lockPath = `${filePath}.lock`
     const unlock = await acquireLock(lockPath)
     try {
@@ -135,30 +253,52 @@ export class AgentPromptManager {
     backupEnabled = true,
     maxBackups = 20,
     mode = "subagent",
+    injectMode: "section" | "inline" = "section",
   ): Promise<string | undefined> {
-    const filePath = this.getAgentPath(agentName)
+    const source = await this.resolve(agentName)
+    if (source.kind === "inline") {
+      throw new InlinePromptError(agentName)
+    }
+
+    const filePath =
+      source.kind === "missing"
+        ? defaultAgentFilePath(this.projectRoot, agentName)
+        : source.path
     const lockPath = `${filePath}.lock`
 
     const unlock = await acquireLock(lockPath)
     try {
-      const existing = await this.read(agentName)
-      const header = `## ${sectionName}`
-      const sectionRegex = new RegExp(
-        `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
-      )
-      const sectionBlock = `${header}\n${content.trim()}\n`
+      // Always read the actual file at filePath, regardless of source.kind.
+      // The source cache can be stale (TTL or invalidated by external writes),
+      // and the file at the conventional path may exist from a prior write
+      // even when the resolver says "missing". Use the file as the source of
+      // truth for content; use source.kind only for control flow.
+      const existing = await readFile(filePath, "utf-8").catch(() => "")
 
       let updated: string
-      if (!existing.trim()) {
-        // File doesn't exist — create with frontmatter so opencode recognizes it as an agent
-        const frontmatter = `---\nmode: ${mode}\n---\n\n`
-        updated = `${frontmatter + sectionBlock}\n`
-      } else if (sectionRegex.test(existing)) {
-        updated = existing.replace(sectionRegex, `$1\n${content.trim()}`)
+      if (injectMode === "inline") {
+        updated = appendInlineImprovement(existing, content.trim())
       } else {
-        const eofSection = `${sectionBlock}\n`
-        const trimmed = existing.trimEnd()
-        updated = trimmed ? `${trimmed}\n\n${eofSection}` : eofSection
+        const header = `## ${sectionName}`
+        const sectionRegex = new RegExp(
+          `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
+        )
+        const provenance = `<!-- kasper: ${new Date().toISOString()} -->\n`
+        const sectionBlock = `${header}\n${provenance}${content.trim()}\n`
+
+        if (!existing.trim()) {
+          const frontmatter = `---\nmode: ${mode}\n---\n\n`
+          updated = `${frontmatter + sectionBlock}\n`
+        } else if (sectionRegex.test(existing)) {
+          updated = existing.replace(
+            sectionRegex,
+            `$1\n${provenance}${content.trim()}`,
+          )
+        } else {
+          const eofSection = `${sectionBlock}\n`
+          const trimmed = existing.trimEnd()
+          updated = trimmed ? `${trimmed}\n\n${eofSection}` : eofSection
+        }
       }
 
       let backupPath: string | undefined
@@ -166,6 +306,8 @@ export class AgentPromptManager {
         backupPath = await this.backup(agentName, "pre-improvement", maxBackups)
       }
       await writeTextAtomic(filePath, updated)
+      // Refresh cache for this agent so subsequent reads see the change
+      this.invalidateSourceCache(agentName)
       return backupPath
     } finally {
       await unlock()

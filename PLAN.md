@@ -290,7 +290,7 @@ The slash command template in `index.ts` gets simplified to only handle the 7 ke
 | **Weakness merge de-dup** | `mergeAllWeaknesses()` — LLM consolidates similar weakness patterns |
 | **Compaction context injection** | `experimental.session.compacting` injects top weaknesses + per-agent stats into agent context |
 | **Debug logs** | `manual_eval_msg_diag`, `batch_eval_*`, `state_flush_*`, `state_merge_*`, `run_eval_*` — full pipeline observability |
-| **Config keys added** | `state_dir`, `max_score_input_chars`, `scoring_timeout`, `debug`, `log_max_lines`, `detail_level`, `evaluate_subagents`, `quiet`, `config_poll_interval_ms`, `weakness_decay_days` |
+| **Config keys added** | `state_dir`, `max_score_input_chars`, `scoring_timeout`, `debug`, `log_max_lines`, `detail_level`, `quiet`, `config_poll_interval_ms`, `weakness_decay_days` |
 
 ### Removals (from original design)
 

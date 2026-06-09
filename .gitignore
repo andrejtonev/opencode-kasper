@@ -6,3 +6,4 @@ package-lock.json
 AGENTS.md
 REVIEW_FULL.md
 debug-auto.ts
+tests/e2e/debug-*.ts

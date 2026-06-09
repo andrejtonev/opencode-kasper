@@ -4,7 +4,11 @@ import {
   WEAKNESS_SIMILARITY_THRESHOLD,
   WEAKNESS_SUBSTRING_SCORE,
 } from "./constants.js"
-import type { OpencodeSessionClient, WeaknessPattern } from "./types.js"
+import type {
+  OpencodeSessionClient,
+  WeaknessCategory,
+  WeaknessPattern,
+} from "./types.js"
 
 export function weaknessSimilarity(a: string, b: string): number {
   const aLower = a.toLowerCase().trim()
@@ -95,8 +99,7 @@ export function findMatchingWeakness(
   for (const tw of topWeaknesses) {
     if (tw.count < minObservations) continue
     for (const uw of weaknesses) {
-      if (weaknessSimilarity(uw, tw.pattern) >= WEAKNESS_SIMILARITY_THRESHOLD)
-        return tw
+      if (weaknessesMergeable(uw, tw.pattern, undefined, tw.category)) return tw
     }
   }
   return undefined
@@ -229,4 +232,114 @@ export function deepEqual(a: unknown, b: unknown): boolean {
     return true
   }
   return false
+}
+
+export function weaknessesMergeable(
+  a: string,
+  b: string,
+  catA?: WeaknessCategory,
+  catB?: WeaknessCategory,
+): boolean {
+  if (
+    catA &&
+    catB &&
+    catA !== "unknown" &&
+    catB !== "unknown" &&
+    catA !== catB
+  ) {
+    return false
+  }
+  return weaknessSimilarity(a, b) >= WEAKNESS_SIMILARITY_THRESHOLD
+}
+
+const POISON_PATTERNS = [
+  /<instruction>/gi,
+  /<\/instruction>/gi,
+  /<system>/gi,
+  /<\/system>/gi,
+  /<prompt>/gi,
+  /<\/prompt>/gi,
+  /ignore (all )?(previous|prior|above|earlier) instructions/gi,
+  /disregard (all )?(previous|prior|above|earlier) instructions/gi,
+  /you are now/gi,
+  /new system prompt/gi,
+  /override (system|prompt|instructions)/gi,
+  /act as if/gi,
+  /pretend you are/gi,
+  /from now on you are/gi,
+  /your (new )?role is/gi,
+  /forget (everything|all) (you know|above)/gi,
+  /(never|always|must|should) (ignore|disregard) /gi,
+]
+
+const POISON_EVIDENCE: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /<instruction>/i, label: "xml_instruction_tag" },
+  { pattern: /<system>/i, label: "xml_system_tag" },
+  { pattern: /<prompt>/i, label: "xml_prompt_tag" },
+  {
+    pattern: /ignore (all )?(previous|prior|above|earlier) instructions/i,
+    label: "instruction_hijack",
+  },
+  {
+    pattern: /disregard (all )?(previous|prior|above|earlier) instructions/i,
+    label: "instruction_hijack",
+  },
+  { pattern: /you are now/i, label: "role_redefinition" },
+  { pattern: /new system prompt/i, label: "prompt_override" },
+  {
+    pattern: /override (system|prompt|instructions)/i,
+    label: "prompt_override",
+  },
+  { pattern: /pretend you are/i, label: "role_redefinition" },
+  { pattern: /from now on you are/i, label: "role_redefinition" },
+  { pattern: /your (new )?role is/i, label: "role_redefinition" },
+]
+
+export interface SanitizeResult {
+  safe: boolean
+  sanitized: string
+  rejections: string[]
+}
+
+export function sanitizeImprovementText(text: string): SanitizeResult {
+  const rejections: string[] = []
+
+  for (const { pattern, label } of POISON_EVIDENCE) {
+    if (pattern.test(text)) {
+      rejections.push(label)
+    }
+  }
+
+  if (rejections.length === 0) {
+    return { safe: true, sanitized: text, rejections: [] }
+  }
+
+  let sanitized = text
+  for (const pattern of POISON_PATTERNS) {
+    sanitized = sanitized.replace(pattern, "[removed]")
+  }
+  sanitized = sanitized.replace(/\s{2,}/g, " ").trim()
+
+  if (!sanitized || sanitized.length < 10) {
+    return { safe: false, sanitized: "", rejections }
+  }
+
+  return { safe: false, sanitized, rejections }
+}
+
+const ALLOWED_CHARS_REGEX =
+  /^[\x20-\x7E\u00A0-\u00FF\u0100-\u024F\u1E00-\u1EFF\u2010-\u205F\u2070-\u209F\u20A0-\u20CF\u2100-\u214F\u2190-\u21FF\s]*$/
+
+export function sanitizeUserContent(text: string): string {
+  return text.replace(/[^\x20-\x7E\s\u00A0-\u00FF]/g, "")
+}
+
+export function isValidGuidanceText(text: string): boolean {
+  if (!text || text.trim().length < 5) return false
+  if (!ALLOWED_CHARS_REGEX.test(text)) return false
+
+  for (const { pattern } of POISON_EVIDENCE) {
+    if (pattern.test(text)) return false
+  }
+  return true
 }

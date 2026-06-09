@@ -11,6 +11,9 @@ import type {
   WeaknessPattern,
 } from "./types.js"
 
+export const KASPER_JUDGE_VERSION = "1.1.0"
+export const KASPER_RUBRIC_VERSION = "1.0.0"
+
 export interface ScorerInput {
   sessionID: string
   messageID?: string
@@ -265,20 +268,20 @@ export class Scorer {
     } finally {
       if (scoringSessionId) {
         const delStart = Date.now()
-        sessionClient.session
-          .delete({ path: { id: scoringSessionId } })
-          .then(() => {
-            this.logger?.log("merge_session_deleted", {
-              scoringSessionId,
-              durationMs: Date.now() - delStart,
-            })
+        try {
+          await sessionClient.session.delete({
+            path: { id: scoringSessionId },
           })
-          .catch((e) => {
-            this.logger?.log("scoring_cleanup_failed", {
-              scoringSessionId,
-              error: String(e),
-            })
+          this.logger?.log("merge_session_deleted", {
+            scoringSessionId,
+            durationMs: Date.now() - delStart,
           })
+        } catch (e) {
+          this.logger?.log("merge_cleanup_failed", {
+            scoringSessionId,
+            error: String(e),
+          })
+        }
       }
     }
   }
@@ -451,27 +454,47 @@ export class Scorer {
           })
           diagSessionId = diagSession.data?.id ?? null
           if (diagSessionId) {
-            const testResult = await sessionClient.session.prompt({
-              path: { id: diagSessionId },
-              body: {
-                parts: [{ type: "text", text: '{"ok": true}' }],
-                ...(this.modelInfo
-                  ? {
-                      model: {
-                        providerID: this.modelInfo.providerID,
-                        modelID: this.modelInfo.modelID,
-                      },
-                    }
-                  : {}),
-                format: {
-                  type: "json_schema",
-                  schema: {
-                    type: "object",
-                    properties: { ok: { type: "boolean" } },
-                    required: ["ok"],
+            const diagPromptTimeoutMs = Math.min(
+              15_000,
+              this.config.scoring_timeout_ms,
+            )
+            let diagPromptTimer: ReturnType<typeof setTimeout> | undefined
+            const testResult = await Promise.race([
+              sessionClient.session.prompt({
+                path: { id: diagSessionId },
+                body: {
+                  parts: [{ type: "text", text: '{"ok": true}' }],
+                  ...(this.modelInfo
+                    ? {
+                        model: {
+                          providerID: this.modelInfo.providerID,
+                          modelID: this.modelInfo.modelID,
+                        },
+                      }
+                    : {}),
+                  format: {
+                    type: "json_schema",
+                    schema: {
+                      type: "object",
+                      properties: { ok: { type: "boolean" } },
+                      required: ["ok"],
+                    },
                   },
                 },
-              },
+              }),
+              new Promise<never>((_, reject) => {
+                diagPromptTimer = setTimeout(
+                  () =>
+                    reject(
+                      new Error(
+                        `Diagnostic prompt timed out after ${diagPromptTimeoutMs}ms`,
+                      ),
+                    ),
+                  diagPromptTimeoutMs,
+                )
+              }),
+            ]).finally(() => {
+              if (diagPromptTimer !== undefined) clearTimeout(diagPromptTimer)
             })
             const testText = this.extractResponseText(
               testResult.data?.parts,
@@ -499,14 +522,22 @@ export class Scorer {
           })
         } finally {
           if (diagSessionId) {
-            sessionClient.session
-              .delete({ path: { id: diagSessionId } })
-              .catch((e) => {
-                this.logger?.log("scoring_diag_cleanup_failed", {
-                  diagSessionId,
-                  error: String(e),
-                })
+            const diagDelStart = Date.now()
+            try {
+              await sessionClient.session.delete({
+                path: { id: diagSessionId },
               })
+              this.logger?.log("scoring_diag_deleted", {
+                diagSessionId,
+                sessionID: input.sessionID,
+                durationMs: Date.now() - diagDelStart,
+              })
+            } catch (e) {
+              this.logger?.log("scoring_diag_cleanup_failed", {
+                diagSessionId,
+                error: String(e),
+              })
+            }
           }
         }
       }
@@ -516,27 +547,45 @@ export class Scorer {
 
       const doPrompt = async () => {
         let promptTimer: ReturnType<typeof setTimeout> | undefined
+        let timeoutFired = false
         this.logger?.log("scoring_prompt_sending", {
           sessionID: input.sessionID,
           scoringSessionId: sessionId,
           promptLen: evaluationPrompt.length,
           hasFormat: !!promptBody.format,
+          promptTimeoutMs,
         })
         return Promise.race([
-          sessionClient.session.prompt({
-            path: { id: sessionId },
-            body: promptBody,
-          }),
+          sessionClient.session
+            .prompt({
+              path: { id: sessionId },
+              body: promptBody,
+            })
+            .then((res) => {
+              if (timeoutFired) {
+                this.logger?.log("scoring_prompt_late_response", {
+                  sessionID: input.sessionID,
+                  scoringSessionId: sessionId,
+                  model: this.config.model,
+                })
+              }
+              return res
+            }),
           new Promise<never>((_, reject) => {
-            promptTimer = setTimeout(
-              () =>
-                reject(
-                  new Error(
-                    `Scoring timed out after ${(promptTimeoutMs / 1000).toFixed(0)}s — is the model "${this.config.model}" available?`,
-                  ),
+            promptTimer = setTimeout(() => {
+              timeoutFired = true
+              this.logger?.log("scoring_prompt_timeout_fired", {
+                sessionID: input.sessionID,
+                scoringSessionId: sessionId,
+                promptTimeoutMs,
+                model: this.config.model,
+              })
+              reject(
+                new Error(
+                  `Scoring timed out after ${(promptTimeoutMs / 1000).toFixed(0)}s — is the model "${this.config.model}" available?`,
                 ),
-              promptTimeoutMs,
-            )
+              )
+            }, promptTimeoutMs)
           }),
         ]).finally(() => {
           if (promptTimer !== undefined) clearTimeout(promptTimer)
@@ -1079,19 +1128,31 @@ export class Scorer {
         weakness_suggestions: parsedSuggestions,
         fallback: typeof evalData.overall_score !== "number",
         scoring_prompt_hash: SCORE_PROMPT_HASH,
+        judge_version: KASPER_JUDGE_VERSION,
+        rubric_version: KASPER_RUBRIC_VERSION,
+        model_name: this.config.model,
       }
     } catch (err) {
       return this.fallbackCard(input, `Scoring failed: ${err}`)
     } finally {
       if (scoringSessionId) {
-        sessionClient.session
-          .delete({ path: { id: scoringSessionId } })
-          .catch((e) => {
-            this.logger?.log("scoring_cleanup_failed", {
-              scoringSessionId,
-              error: String(e),
-            })
+        const delStart = Date.now()
+        try {
+          await sessionClient.session.delete({
+            path: { id: scoringSessionId },
           })
+          this.logger?.log("scoring_session_deleted", {
+            scoringSessionId,
+            sessionID: input.sessionID,
+            durationMs: Date.now() - delStart,
+          })
+        } catch (e) {
+          this.logger?.log("scoring_cleanup_failed", {
+            scoringSessionId,
+            sessionID: input.sessionID,
+            error: String(e),
+          })
+        }
       }
     }
   }

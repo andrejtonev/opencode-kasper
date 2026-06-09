@@ -3,7 +3,10 @@ import { randomBytes } from "node:crypto"
 import { readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { AgentPromptManager } from "../src/agent-prompts.js"
+import {
+  AgentPromptManager,
+  appendInlineImprovement,
+} from "../src/agent-prompts.js"
 import { escapeRegex } from "../src/prompt-utils.js"
 
 function tmpDir(): string {
@@ -152,5 +155,167 @@ describe("AgentPromptManager", () => {
       await manager.enforceMaxBackups("build", 5)
       expect((await manager.listBackups("build")).length).toBe(1)
     })
+  })
+
+  describe("injectSection — inline mode", () => {
+    test("appends wrapped in kasper-injected markers when no section mode", async () => {
+      await manager.write("build", "You are a build agent.")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be thorough.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const content = await manager.read("build")
+      expect(content).toContain("You are a build agent.")
+      expect(content).toContain("<!-- kasper-injected:begin -->")
+      expect(content).toContain("Be thorough.")
+      expect(content).toContain("<!-- kasper-injected:end -->")
+      // No section header, no `<!-- kasper: ISO -->` provenance line
+      expect(content).not.toContain("## Kasper Inferred Instructions")
+      expect(content).not.toMatch(/<!-- kasper: \d{4}-/)
+    })
+
+    test("inline mode does not create frontmatter when file is empty", async () => {
+      await manager.write("build", "")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "First rule.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const content = await manager.read("build")
+      expect(content).not.toContain("---")
+      expect(content).not.toContain("mode: subagent")
+      expect(content).toContain("First rule.")
+    })
+
+    test("inline mode is idempotent on the same content", async () => {
+      await manager.write("build", "Original.\n")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be thorough.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const firstRead = await manager.read("build")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be thorough.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const secondRead = await manager.read("build")
+      expect(secondRead).toBe(firstRead)
+    })
+
+    test("inline mode dedupes whitespace-insensitively", async () => {
+      await manager.write("build", "")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be  thorough.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const before = await manager.read("build")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be thorough.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const after = await manager.read("build")
+      expect(after).toBe(before)
+    })
+
+    test("section mode (default) still creates ## header", async () => {
+      await manager.write("build", "You are a build agent.")
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Be thorough.",
+      )
+      const content = await manager.read("build")
+      expect(content).toContain("## Kasper Inferred Instructions")
+      expect(content).toContain("<!-- kasper: ")
+    })
+
+    test("inline mode preserves all pre-existing content", async () => {
+      const original = [
+        "---",
+        "description: My agent",
+        "mode: subagent",
+        "---",
+        "",
+        "# My Agent",
+        "",
+        "Follow these rules:",
+        "  1. Be polite",
+        "  2. Be thorough",
+        "",
+      ].join("\n")
+      await manager.write("build", original)
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "Add documentation.",
+        true,
+        20,
+        "subagent",
+        "inline",
+      )
+      const content = await manager.read("build")
+      // Frontmatter untouched
+      expect(content).toContain("---")
+      expect(content).toContain("description: My agent")
+      // Existing content preserved
+      expect(content).toContain("Follow these rules:")
+      expect(content).toContain("Be polite")
+      // New content appended
+      expect(content).toContain("Add documentation.")
+    })
+  })
+})
+
+describe("appendInlineImprovement (pure helper)", () => {
+  test("returns existing unchanged when empty content", () => {
+    expect(appendInlineImprovement("abc", "   \n  ")).toBe("abc")
+  })
+
+  test("returns existing unchanged when text is already present", () => {
+    const existing =
+      "intro\n\n<!-- kasper-injected:begin -->\nbe fast\n<!-- kasper-injected:end -->\n"
+    expect(appendInlineImprovement(existing, "be fast")).toBe(existing)
+    expect(appendInlineImprovement(existing, "  BE  FAST  ")).toBe(existing)
+  })
+
+  test("appends wrapped markers with blank-line separator", () => {
+    const out = appendInlineImprovement("hello", "new rule")
+    expect(out).toBe(
+      "hello\n\n<!-- kasper-injected:begin -->\nnew rule\n<!-- kasper-injected:end -->\n",
+    )
+  })
+
+  test("appends to empty string without leading blank line", () => {
+    const out = appendInlineImprovement("", "rule")
+    expect(out.startsWith("<!-- kasper-injected:begin -->")).toBe(true)
   })
 })

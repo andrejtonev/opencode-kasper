@@ -34,7 +34,6 @@ const KasperConfigSchema = z.object({
   weakness_decay_days: intField(0, 365),
   detail_level: z.enum(["minimal", "standard", "thorough"]).default("standard"),
   quiet: boolLike(),
-  evaluate_subagents: boolLike(),
   min_session_messages: intField(1, 50),
   debug: boolLike(),
   state_dir: z.string().transform((s) => s.trim()),
@@ -42,6 +41,12 @@ const KasperConfigSchema = z.object({
   scoring_retries: intField(0, 10),
   scoring_timeout_ms: intField(10000, 600000),
   max_score_input_chars: intField(1000, 50000),
+  max_agent_guidance_chars: intField(200, 5000),
+  improvement_expiry_days: intField(0, 365),
+  min_observations_for_update: intField(1, 10),
+  strict_sanitize: boolLike(),
+  agent_prompt_inject_mode: z.enum(["section", "inline"]).default("section"),
+  config_version: intField(0, 9999).optional(),
 })
 
 const fieldValidators = KasperConfigSchema.shape
@@ -235,7 +240,22 @@ export async function ensureDefaultKasperConfigFile(
   "scoring_timeout_ms": 120000,
 
   // Maximum input characters sent to the scoring model per session
-  "max_score_input_chars": 10000
+  "max_score_input_chars": 10000,
+
+  // Maximum characters of generated guidance per target (AGENTS.md or agent prompt)
+  "max_agent_guidance_chars": 1200,
+
+  // Days after which inactive improvements expire and are removed (0 = never)
+  "improvement_expiry_days": 60,
+
+  // Reject generated improvements containing URLs, code blocks, or instruction-injection markers
+  "strict_sanitize": true,
+
+  // How kasper applies improvements to an agent prompt file.
+  //   "section" (default): add a visible ## Kasper Inferred Instructions block at the end
+  //   "inline":            append the guidance directly with no section header; wrapped in
+  //                        kasper-injected begin/end HTML comments for rollback only
+  "agent_prompt_inject_mode": "section"
 }
 `
 

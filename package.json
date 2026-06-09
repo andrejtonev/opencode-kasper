@@ -1,6 +1,6 @@
 {
   "name": "@atonev/opencode-kasper",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "OpenCode plugin that monitors agent sessions, scores adherence to user instructions via LLM-as-judge, and injects corrective instructions into AGENTS.md and per-agent prompt files.",
   "author": "andrejtonev <29177572+andrejtonev@users.noreply.github.com>",
@@ -47,6 +47,7 @@
     "format": "biome format --write src/ tests/ scripts/",
     "test": "bun test",
     "test:watch": "bun test --watch",
+    "test:e2e": "OPENCODE_E2E=1 bun test --timeout 300000 tests/e2e/",
     "prepublishOnly": "npm run build",
     "install-plugin": "node scripts/symlink-plugin.mjs"
   },

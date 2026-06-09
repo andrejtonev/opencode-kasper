@@ -3,7 +3,8 @@ import { randomBytes } from "node:crypto"
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import KasperPlugin, { flushKasperState } from "../src/index.js"
+import KasperPlugin from "../src/index.js"
+import { flushKasperState } from "../src/registry.js"
 
 function tmpDir(): string {
   return join(tmpdir(), `kasper-au-${randomBytes(6).toString("hex")}`)
@@ -120,6 +121,11 @@ async function setupTestDir(opts?: {
     auto_update: autoUpdate,
     scoring_threshold: threshold,
     min_session_messages: 1,
+    min_observations_for_update: 2,
+    // Pin inject mode to "section" so the assertions against
+    // `## Kasper Inferred Instructions` are not overridden by a
+    // developer's global kasper.jsonc that sets "inline".
+    agent_prompt_inject_mode: "section",
   }
   await writeFile(
     join(dir, "opencode.json"),
@@ -246,13 +252,29 @@ describe("auto-update integration", () => {
       directory: dir,
     })
 
-    await fullSession(dir, hooks, "au-test-2a", "build", "build this project")
-    await fullSession(dir, hooks, "au-test-2b", "build", "build this project 2")
+    // Use a unique agent name so the test does not collide with any agent
+    // defined in the developer's global opencode.json (the resolver now
+    // honours {file:...} directives in global config).
+    const buildAgent = `build-${randomBytes(4).toString("hex")}`
+    await fullSession(
+      dir,
+      hooks,
+      "au-test-2a",
+      buildAgent,
+      "build this project",
+    )
+    await fullSession(
+      dir,
+      hooks,
+      "au-test-2b",
+      buildAgent,
+      "build this project 2",
+    )
 
     await hooks.close()
 
     // Verify agent prompt was modified, not AGENTS.md
-    const promptPath = join(dir, ".opencode", "agents", "build.md")
+    const promptPath = join(dir, ".opencode", "agents", `${buildAgent}.md`)
     const promptContent = await readFile(promptPath, "utf-8")
     expect(promptContent).toContain("## Kasper Inferred Instructions")
     expect(promptContent).toContain(
@@ -275,7 +297,7 @@ describe("auto-update integration", () => {
     const state = JSON.parse(await readFile(statePath, "utf-8"))
     expect(state.improvements_applied.length).toBeGreaterThanOrEqual(1)
     expect(state.improvements_applied[0].target).toBe("agent_prompt")
-    expect(state.improvements_applied[0].agent_name).toBe("build")
+    expect(state.improvements_applied[0].agent_name).toBe(buildAgent)
 
     await rm(dir, { recursive: true, force: true })
   })
@@ -387,12 +409,28 @@ describe("auto-update integration", () => {
       directory: dir,
     })
 
-    await fullSession(dir, hooks, "au-test-5a", "build", "build this project")
-    await fullSession(dir, hooks, "au-test-5b", "build", "build this project 2")
+    // Use a unique agent name so the test does not collide with any agent
+    // defined in the developer's global opencode.json (the resolver now
+    // honours {file:...} directives in global config).
+    const newBuildAgent = `build-${randomBytes(4).toString("hex")}`
+    await fullSession(
+      dir,
+      hooks,
+      "au-test-5a",
+      newBuildAgent,
+      "build this project",
+    )
+    await fullSession(
+      dir,
+      hooks,
+      "au-test-5b",
+      newBuildAgent,
+      "build this project 2",
+    )
     await hooks.close()
 
     // New agent prompt should be created with frontmatter
-    const promptPath = join(dir, ".opencode", "agents", "build.md")
+    const promptPath = join(dir, ".opencode", "agents", `${newBuildAgent}.md`)
     const promptContent = await readFile(promptPath, "utf-8")
     expect(promptContent).toContain("---")
     expect(promptContent).toContain("mode: subagent")
@@ -462,9 +500,13 @@ describe("auto-update integration", () => {
 
   test("auto-update respects subagent agentType and updates parent agent prompt", async () => {
     const dir = await setupTestDir({ autoUpdate: true, scoringThreshold: 0.6 })
+    // Use a unique agent name so the test does not collide with any agent
+    // defined in the developer's global opencode.json (the resolver now
+    // honours {file:...} directives in global config).
+    const agentName = `code-quality-${randomBytes(4).toString("hex")}`
     await mkdir(join(dir, ".opencode", "agents"), { recursive: true })
     await writeFile(
-      join(dir, ".opencode", "agents", "code-quality.md"),
+      join(dir, ".opencode", "agents", `${agentName}.md`),
       "# Code Quality Agent\nYou review code.\n",
     )
 
@@ -484,7 +526,7 @@ describe("auto-update integration", () => {
         event: {
           properties: {
             info: {
-              agent: "code-quality",
+              agent: agentName,
               agentType: "subagent",
               parentSessionID: "parent-1",
             },
@@ -527,7 +569,7 @@ describe("auto-update integration", () => {
     await hooks.close()
 
     // Agent prompt should be updated
-    const promptPath = join(dir, ".opencode", "agents", "code-quality.md")
+    const promptPath = join(dir, ".opencode", "agents", `${agentName}.md`)
     const promptContent = await readFile(promptPath, "utf-8")
     expect(promptContent).toContain("## Kasper Inferred Instructions")
     expect(promptContent).toContain("Flag all security issues.")
@@ -567,6 +609,205 @@ More content.
     // New section should be added
     expect(agentsMd).toContain("## Kasper Inferred Instructions")
     expect(agentsMd).toContain("Always validate inputs.")
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test("auto-update reroutes built-in 'build' agent prompt to AGENTS.md (no dead .opencode/agents/build.md)", async () => {
+    // Regression: the default opencode 'build' agent has a hard-coded
+    // prompt shipped with opencode. A bare markdown file at
+    // `.opencode/agents/build.md` is NOT consulted by opencode — the file
+    // is only loaded when `agent.build.prompt` in `opencode.json` is set
+    // to `{file:...}` or an inline string. If kasper blindly writes a
+    // file at the conventional path, the improvement is silently
+    // ignored. The fix reroutes to AGENTS.md (the rules file the
+    // built-in agents actually read).
+    const dir = await setupTestDir({ autoUpdate: true, scoringThreshold: 0.6 })
+    await writeFile(join(dir, "AGENTS.md"), "# Project Rules\nBe helpful.\n")
+    // No `.opencode/agents/build.md` and no `agent.build` in opencode.json.
+
+    const client = makeClient()
+    client.session.prompt = mock(() => {
+      const output = {
+        overall_score: 0.4,
+        categories: {
+          instruction_following: 0.5,
+          completeness: 0.4,
+          proactiveness: 0.3,
+          code_quality: 0.4,
+          communication: 0.4,
+        },
+        strengths: ["clear code"],
+        weaknesses: ["does not write tests"],
+        weakness_suggestions: [
+          {
+            weakness: "does not write tests",
+            suggested_fix:
+              "Always run the test suite before reporting completion.",
+            target: "agent_prompt",
+          },
+        ],
+      }
+      return Promise.resolve({
+        data: {
+          parts: [{ type: "text", text: JSON.stringify(output) }],
+        },
+      })
+    })
+
+    const hooks = await KasperPlugin({
+      client: client as any,
+      directory: dir,
+    })
+
+    // Two sessions on the literal built-in "build" agent — no mocked
+    // global config, no `agent.build` entry in opencode.json.
+    await fullSession(dir, hooks, "builtin-1a", "build", "build this project")
+    await fullSession(dir, hooks, "builtin-1b", "build", "build this project 2")
+    await hooks.close()
+
+    // AGENTS.md should contain the improvement.
+    const agentsMd = await readFile(join(dir, "AGENTS.md"), "utf-8")
+    expect(agentsMd).toContain("## Kasper Inferred Instructions")
+    expect(agentsMd).toContain(
+      "Always run the test suite before reporting completion.",
+    )
+
+    // The dead agent prompt file MUST NOT be created — opencode would
+    // not load it and the user would think the improvement was lost.
+    const deadPath = join(dir, ".opencode", "agents", "build.md")
+    let deadExists = true
+    try {
+      await stat(deadPath)
+    } catch {
+      deadExists = false
+    }
+    expect(deadExists).toBe(false)
+
+    // The improvement record should be rewritten to target="agents_md"
+    // so state, history, and rollback all reflect the actual outcome.
+    const statePath = join(dir, ".opencode", "kasper", "state.json")
+    const state = JSON.parse(await readFile(statePath, "utf-8"))
+    const applied = state.improvements_applied ?? []
+    expect(applied.length).toBeGreaterThanOrEqual(1)
+    const rerouted = applied.find(
+      (r: { target: string; reason: string }) =>
+        r.target === "agents_md" &&
+        r.reason.includes(
+          "Always run the test suite before reporting completion.",
+        ),
+    )
+    expect(rerouted).toBeDefined()
+
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test("auto-update honors custom agent build override (opencode.json agent.build.prompt = {file:...})", async () => {
+    // When the user explicitly defines `agent.build.prompt` in
+    // opencode.json (e.g. to override the built-in prompt), kasper must
+    // respect that file instead of rerouting to AGENTS.md. The reroute
+    // is only for the *default* built-in prompt, not for user overrides.
+    const dir = await setupTestDir({ autoUpdate: true, scoringThreshold: 0.6 })
+    await writeFile(join(dir, "AGENTS.md"), "# Project Rules\nBe helpful.\n")
+
+    // User-defined override prompt for the built-in "build" agent.
+    const overridePromptPath = join(dir, ".opencode", "prompts", "build.md")
+    await mkdir(join(dir, ".opencode", "prompts"), { recursive: true })
+    await writeFile(
+      overridePromptPath,
+      "# Build Agent (override)\nCustom build instructions.\n",
+      "utf-8",
+    )
+
+    // Wire up opencode.json with `agent.build.prompt = {file:...}`
+    const opencodeJson = {
+      $schema: "https://opencode.ai/config.json",
+      agent: {
+        build: {
+          prompt: `{file:${overridePromptPath}}`,
+        },
+      },
+      kasper: {
+        enabled: true,
+        auto_update: true,
+        scoring_threshold: 0.6,
+        min_session_messages: 1,
+        min_observations_for_update: 2,
+        agent_prompt_inject_mode: "section",
+      },
+    }
+    await writeFile(
+      join(dir, "opencode.json"),
+      JSON.stringify(opencodeJson),
+      "utf-8",
+    )
+
+    const client = makeClient()
+    client.session.prompt = mock(() => {
+      const output = {
+        overall_score: 0.4,
+        categories: {
+          instruction_following: 0.5,
+          completeness: 0.4,
+          proactiveness: 0.3,
+          code_quality: 0.4,
+          communication: 0.4,
+        },
+        strengths: ["clear code"],
+        weaknesses: ["does not write tests"],
+        weakness_suggestions: [
+          {
+            weakness: "does not write tests",
+            suggested_fix:
+              "Always run the test suite before reporting completion.",
+            target: "agent_prompt",
+          },
+        ],
+      }
+      return Promise.resolve({
+        data: {
+          parts: [{ type: "text", text: JSON.stringify(output) }],
+        },
+      })
+    })
+
+    const hooks = await KasperPlugin({
+      client: client as any,
+      directory: dir,
+    })
+
+    await fullSession(dir, hooks, "override-1a", "build", "build this project")
+    await fullSession(
+      dir,
+      hooks,
+      "override-1b",
+      "build",
+      "build this project 2",
+    )
+    await hooks.close()
+
+    // The override file should be updated, NOT AGENTS.md.
+    const overrideContent = await readFile(overridePromptPath, "utf-8")
+    expect(overrideContent).toContain("## Kasper Inferred Instructions")
+    expect(overrideContent).toContain(
+      "Always run the test suite before reporting completion.",
+    )
+
+    const agentsMd = await readFile(join(dir, "AGENTS.md"), "utf-8")
+    expect(agentsMd).not.toContain("## Kasper Inferred Instructions")
+    expect(agentsMd).not.toContain(
+      "Always run the test suite before reporting completion.",
+    )
+
+    const statePath = join(dir, ".opencode", "kasper", "state.json")
+    const state = JSON.parse(await readFile(statePath, "utf-8"))
+    const applied = state.improvements_applied ?? []
+    expect(applied.length).toBeGreaterThanOrEqual(1)
+    const asAgentPrompt = applied.find(
+      (r: { target: string; agent_name?: string }) =>
+        r.target === "agent_prompt" && r.agent_name === "build",
+    )
+    expect(asAgentPrompt).toBeDefined()
 
     await rm(dir, { recursive: true, force: true })
   })

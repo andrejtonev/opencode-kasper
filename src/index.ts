@@ -1,4 +1,4 @@
-import { mkdir, readdir, rm } from "node:fs/promises"
+import { mkdir, readdir, rm, stat } from "node:fs/promises"
 import { isAbsolute, join } from "node:path"
 import type { Config, Plugin } from "@opencode-ai/plugin"
 import type { Event, Part, UserMessage } from "@opencode-ai/sdk"
@@ -21,21 +21,24 @@ import {
   SDK_TIMEOUT_MS,
   SESSION_DEBOUNCE_MS,
 } from "./constants.js"
-import { buildEvalFromMessages, runEvaluation } from "./evaluate.js"
+import {
+  buildEvalFromMessages,
+  evaluateChildSessions,
+  runEvaluation,
+} from "./evaluate.js"
 import { dispatchKasperCommand } from "./handlers.js"
 import { KasperLogger } from "./logging.js"
 import { AsyncMutex } from "./mutex.js"
 import { clearWriteLocks } from "./prompt-utils.js"
+import { _stateStoreRegistry } from "./registry.js"
 import { Scorer } from "./scorer.js"
 import { KasperStateStore } from "./state.js"
 import { createKasperTools } from "./tools.js"
 
-// Internal registry for test-only state store access. Not part of the public plugin API.
-const _stateStoreRegistry = new Map<string, KasperStateStore>()
-
 import type {
   AgentSessionInfo,
   ImprovementRecord,
+  KasperConfig,
   KasperContext,
 } from "./types.js"
 import {
@@ -85,6 +88,93 @@ async function cleanupStaleTempFiles(stateDir: string): Promise<void> {
   }
 }
 
+interface HealthReport {
+  ok: boolean
+  checks: Array<{ name: string; ok: boolean; detail: string }>
+}
+
+async function runHealthCheck(
+  stateDir: string,
+  cwd: string,
+  config: KasperConfig,
+  logger: KasperLogger,
+): Promise<HealthReport> {
+  const checks: HealthReport["checks"] = []
+
+  try {
+    await stat(stateDir)
+    checks.push({ name: "state_dir", ok: true, detail: stateDir })
+  } catch {
+    checks.push({
+      name: "state_dir",
+      ok: false,
+      detail: `${stateDir} missing - will be created`,
+    })
+  }
+
+  try {
+    await stat(join(stateDir, "state.json"))
+    checks.push({ name: "state_file", ok: true, detail: "exists" })
+  } catch {
+    checks.push({ name: "state_file", ok: false, detail: "not yet created" })
+  }
+
+  try {
+    const agentsMdPath = join(cwd, "AGENTS.md")
+    await stat(agentsMdPath)
+    checks.push({ name: "agents_md", ok: true, detail: agentsMdPath })
+  } catch {
+    checks.push({
+      name: "agents_md",
+      ok: false,
+      detail: "no AGENTS.md found in project root",
+    })
+  }
+
+  const backupDir = join(stateDir, "backups")
+  try {
+    await stat(backupDir)
+    checks.push({ name: "backup_dir", ok: true, detail: backupDir })
+  } catch {
+    checks.push({
+      name: "backup_dir",
+      ok: false,
+      detail: "will be created on first backup",
+    })
+  }
+
+  try {
+    const lockPath = join(stateDir, "state.json.lock")
+    await stat(lockPath)
+    checks.push({
+      name: "lock_file",
+      ok: false,
+      detail: "stale lock file detected (will auto-clear)",
+    })
+  } catch {
+    checks.push({ name: "lock_file", ok: true, detail: "no stale lock" })
+  }
+
+  const hasModel = !!config.model?.includes("/")
+  checks.push({
+    name: "model",
+    ok: hasModel,
+    detail: hasModel ? config.model : `invalid model format: ${config.model}`,
+  })
+
+  await logger.log("health_check", {
+    checks,
+    config_model: config.model,
+    config_auto_update: config.auto_update,
+    config_threshold: config.scoring_threshold,
+  })
+
+  return {
+    ok: checks.every((c) => c.ok),
+    checks,
+  }
+}
+
 function extractAgentInfo(input: unknown): {
   parentID?: string
   agentName?: string
@@ -105,8 +195,8 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
 
   if (!config.enabled) return {}
 
-  const globalOpencodeDir = resolveGlobalOpencodeDir()
-  await ensureDefaultKasperConfigFile(globalOpencodeDir)
+  const globalDir = resolveGlobalOpencodeDir()
+  await ensureDefaultKasperConfigFile(globalDir)
 
   const stateDir = config.state_dir
     ? isAbsolute(config.state_dir)
@@ -124,6 +214,14 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     autoUpdate: config.auto_update,
     threshold: config.scoring_threshold,
   })
+
+  const health = await runHealthCheck(stateDir, cwd, config, logger)
+  if (!health.ok) {
+    const failChecks = health.checks.filter((c) => !c.ok)
+    for (const c of failChecks) {
+      await logger.log("health_check_warn", { name: c.name, detail: c.detail })
+    }
+  }
 
   const stateStore = new KasperStateStore(
     join(stateDir, "state.json"),
@@ -147,7 +245,7 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   const agentsMd = new AgentsMdManager(cwd, stateDir, BACKUP_MAX_VERSIONS)
   await agentsMd.init()
 
-  const agentPrompts = new AgentPromptManager(cwd, stateDir, globalOpencodeDir)
+  const agentPrompts = new AgentPromptManager(cwd, stateDir, globalDir)
   await agentPrompts.init()
 
   const scorer = new Scorer(config, logger)
@@ -229,6 +327,45 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   }, CONFIG_POLL_INTERVAL_MS)
   ctx.configReloadTimer = configReloadTimer
 
+  if (client.session.list && client.session.delete) {
+    const cleanupStart = Date.now()
+    try {
+      const allSessions = await withTimeout(
+        client.session.list(),
+        SDK_TIMEOUT_MS,
+        "stale.session.list",
+      )
+      const sessions = allSessions.data ?? []
+      const stale = sessions.filter(
+        (s) => isKasperSession(s.title) && !ctx.kasperSessionIDs.has(s.id),
+      )
+      if (stale.length > 0) {
+        await logger.log("stale_kasper_cleanup_start", {
+          count: stale.length,
+          sessionIDs: stale.map((s) => s.id),
+        })
+        for (const s of stale) {
+          try {
+            await client.session.delete({ path: { id: s.id } })
+            ctx.kasperSessionIDs.add(s.id)
+            await logger.log("stale_kasper_deleted", { sessionID: s.id })
+          } catch (e) {
+            await logger.log("stale_kasper_delete_failed", {
+              sessionID: s.id,
+              error: String(e),
+            })
+          }
+        }
+        await logger.log("stale_kasper_cleanup_done", {
+          total: stale.length,
+          durationMs: Date.now() - cleanupStart,
+        })
+      }
+    } catch (e) {
+      await logger.log("stale_kasper_cleanup_error", { error: String(e) })
+    }
+  }
+
   const evaluationPollTimer = setInterval(async () => {
     if (ctx.kasperPaused) return
 
@@ -273,11 +410,12 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
 
   return {
     config: async (opencodeConfig: Config) => {
-      opencodeConfig.command ??= {}
-      const commandConfig = opencodeConfig.command as Record<string, unknown>
-      if (!commandConfig.kasper) {
-        commandConfig.kasper = {
-          template: `/kasper $ARGUMENTS
+      try {
+        opencodeConfig.command ??= {}
+        const commandConfig = opencodeConfig.command as Record<string, unknown>
+        if (!commandConfig.kasper) {
+          commandConfig.kasper = {
+            template: `/kasper $ARGUMENTS
 
 Call the matching kasper_* tool:
 - status → kasper_status (agent param for per-agent detail)
@@ -288,15 +426,21 @@ Call the matching kasper_* tool:
 - reset → kasper_reset
 - config → (handled by slash command)
 - help → (handled by slash command)`,
-          description:
-            "Inspect or control the Kasper plugin (status|score|improve|apply|history|config|reset|help)",
-          suggested: true,
+            description:
+              "Inspect or control the Kasper plugin (status|score|improve|apply|history|config|reset|help)",
+            suggested: true,
+          }
         }
-      }
 
-      ctx.registeredCommands.clear()
-      for (const key of Object.keys(commandConfig)) {
-        ctx.registeredCommands.add(key.toLowerCase())
+        ctx.registeredCommands.clear()
+        for (const key of Object.keys(commandConfig)) {
+          ctx.registeredCommands.add(key.toLowerCase())
+        }
+      } catch (err) {
+        process.stderr.write(
+          `[kasper] Config hook error: ${err instanceof Error ? err.stack : String(err)}\n`,
+        )
+        throw err
       }
     },
 
@@ -594,14 +738,6 @@ Call the matching kasper_* tool:
   }
 }
 
-/** @internal Test-only helper — not part of the public plugin API. */
-export async function flushKasperState(directory: string): Promise<void> {
-  const store = _stateStoreRegistry.get(directory)
-  if (store) {
-    await store.flush()
-  }
-}
-
 async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
   if (!ctx.client.session.list || !ctx.client.session.messages) return
 
@@ -613,7 +749,8 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
       SDK_TIMEOUT_MS,
       "session.list",
     )
-    const sessions = (result.data ?? []).filter((s) => {
+    const allSessions = result.data ?? []
+    const sessions = allSessions.filter((s) => {
       if (!s.id) return false
       if (s.time.created < installedAt) return false
       if (ctx.deletedSessions.has(s.id)) return false
@@ -625,6 +762,13 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
       if (Date.now() - s.time.updated < SESSION_DEBOUNCE_MS * 3) return false
       return true
     })
+    if (allSessions.length > 0 && sessions.length === 0) {
+      await ctx.logger.log("poll_filter_all", {
+        totalSessions: allSessions.length,
+        filteredOut: allSessions.length,
+        installedAt,
+      })
+    }
 
     for (const s of sessions) {
       const sid = s.id
@@ -657,11 +801,13 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
       }
 
       const isIdle = ctx.idleSessions.has(sid)
+      const isSubagent = agentInfo?.agentType === "subagent" || s.parentID
+      const minUserMsgs = isSubagent ? 1 : ctx.config.min_session_messages
       const pending = buildEvalFromMessages(
         msgs,
         sid,
         agentName,
-        ctx.config.min_session_messages,
+        minUserMsgs,
         ctx.registeredCommands,
         lastMsgId,
         isIdle,
@@ -669,7 +815,17 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
       if (isIdle) {
         ctx.idleSessions.delete(sid)
       }
-      if (!pending) continue
+      if (!pending) {
+        await ctx.logger.log("poll_skip", {
+          sessionID: sid,
+          agentName,
+          msgCount: msgs.length,
+          minUserMsgs,
+          isIdle,
+          reason: "buildEvalFromMessages returned null",
+        })
+        continue
+      }
 
       const storedSession = ctx.stateStore.getSession(sid)
       if (storedSession?.agents_md_hash) {
@@ -684,6 +840,18 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
         })
       }
 
+      // Ensure agentType and parentSessionID are set on pending before evaluation
+      const registryInfo = ctx.agentRegistry.get(sid)
+      if (registryInfo) {
+        pending.agentType = registryInfo.agentType
+        pending.parentSessionID = registryInfo.parentSessionID
+      } else if (s.parentID) {
+        pending.agentType = "subagent"
+        pending.parentSessionID = s.parentID
+      } else {
+        pending.agentType = "primary"
+      }
+
       try {
         await runEvaluation(pending, ctx)
       } catch (err) {
@@ -692,6 +860,29 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
           agentName,
           error: String(err),
         })
+      }
+
+      // Also evaluate subagent children for primary sessions
+      if (pending.agentType === "primary" || !pending.agentType) {
+        try {
+          const childResults = await evaluateChildSessions(
+            pending.sessionID,
+            ctx,
+            0,
+          )
+          if (childResults.length > 0) {
+            await ctx.logger.log("poll_child_eval", {
+              sessionID: sid,
+              childCount: childResults.length,
+              childIDs: childResults.map((c) => c.id),
+            })
+          }
+        } catch (err) {
+          await ctx.logger.log("poll_child_eval_error", {
+            sessionID: sid,
+            error: String(err),
+          })
+        }
       }
     }
   } catch (err) {

@@ -19,10 +19,6 @@ describe("normalizeKasperConfig", () => {
       "auto_update",
       false,
     )
-    expect(normalizeKasperConfig({ evaluate_subagents: true })).toHaveProperty(
-      "evaluate_subagents",
-      true,
-    )
   })
 
   test("normalizes boolean fields from string values", () => {

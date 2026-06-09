@@ -77,6 +77,7 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
     } as unknown as KasperContext["agentsMd"],
     agentPrompts: {
       read: async (_agentName: string) => "",
+      resolve: async (_agentName: string) => ({ kind: "missing" as const }),
     } as unknown as KasperContext["agentPrompts"],
     scorer: {
       evaluate: async (_input: any) => makeScoreCard(),
@@ -474,6 +475,9 @@ describe("considerImprovement", () => {
   })
 
   test("queues agent prompt improvement when auto-update is off and agentName is set", async () => {
+    // Built-in 'build' agent has no defined prompt (resolve returns
+    // 'missing' in mockCtx). The dispatcher must reroute the per-agent
+    // improvement to AGENTS.md so the guidance actually takes effect.
     const ctx = mockCtx({
       autoUpdateEnabled: false,
       stateStore: {
@@ -504,7 +508,7 @@ describe("considerImprovement", () => {
       makePendingEval({ agentName: "build" }),
     )
     expect(ctx.improvementsPending.length).toBe(1)
-    expect(ctx.improvementsPending[0].target).toBe("agent_prompt")
+    expect(ctx.improvementsPending[0].target).toBe("agents_md")
     expect(ctx.improvementsPending[0].agent_name).toBe("build")
     expect(ctx.improvementsPending[0].reason).toBe(
       "Instructions specific to build agent",
@@ -512,7 +516,11 @@ describe("considerImprovement", () => {
   })
 
   test("auto-applies improvement to agent prompt when auto-update is on and agentName is set", async () => {
-    let injected = false
+    // Built-in 'build' agent with no defined prompt: the per-agent
+    // improvement is rerouted to AGENTS.md (the rules file the built-in
+    // agents actually read). The dead .opencode/agents/build.md file is
+    // NOT created.
+    let agentsMdWritten = false
     const ctx = mockCtx({
       stateStore: {
         getAggregate: () => ({
@@ -530,9 +538,23 @@ describe("considerImprovement", () => {
       } as any,
       agentPrompts: {
         read: async () => "",
+        resolve: async () => ({ kind: "missing" as const }),
         injectSection: async () => {
-          injected = true
-          return "/backup/agent"
+          throw new Error(
+            "agent_prompt must NOT be written for a built-in agent with no defined prompt",
+          )
+        },
+      } as any,
+      agentsMd: {
+        read: async () => "",
+        backup: async () => "/backup/AGENTS.md",
+        injectSection: (existing: string) => {
+          agentsMdWritten = true
+          return `${existing}\n## rerouted\n`
+        },
+        lockedUpdate: async (updater: any) => {
+          agentsMdWritten = true
+          await updater("# AGENTS.md\n")
         },
       } as any,
     })
@@ -551,7 +573,7 @@ describe("considerImprovement", () => {
       config,
       makePendingEval({ agentName: "build" }),
     )
-    expect(injected).toBe(true)
+    expect(agentsMdWritten).toBe(true)
   })
 })
 
@@ -676,6 +698,7 @@ describe("manualEvaluateSession with subagents", () => {
     const scoredIDs: string[] = []
 
     const ctx = mockCtx({
+      config: { ...DEFAULT_CONFIG, min_session_messages: 1 },
       scorer: {
         evaluate: async (input: any) => {
           scoredIDs.push(input.sessionID || "unknown")

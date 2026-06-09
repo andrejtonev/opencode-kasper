@@ -1,4 +1,8 @@
-import { BACKUP_ENABLED, BACKUP_MAX_VERSIONS } from "./constants.js"
+import {
+  BACKUP_ENABLED,
+  BACKUP_MAX_VERSIONS,
+  isBuiltinAgentName,
+} from "./constants.js"
 import type { ImprovementRecord, KasperContext } from "./types.js"
 import { showToast } from "./utils.js"
 
@@ -13,6 +17,25 @@ export async function applyImprovement(
   const patterns = pending.weaknesses ?? [pending.reason]
 
   if (pending.target === "agent_prompt" && pending.agent_name) {
+    // Built-in opencode agents (build, plan, general, ...) have hard-coded
+    // prompts shipped with opencode. `.opencode/agents/<name>.md` is only
+    // consulted when `agent.<name>.prompt` in `opencode.json` is set to a
+    // `{file:...}` directive or inline string. If a built-in agent has no
+    // defined prompt, creating a markdown file at the conventional path
+    // produces a dead file that opencode never reads. Reroute the
+    // improvement to AGENTS.md in that case — built-in agents always
+    // honour the project rules file.
+    const source = await ctx.agentPrompts.resolve(pending.agent_name)
+    if (source.kind === "missing" && isBuiltinAgentName(pending.agent_name)) {
+      const rerouted: ImprovementRecord = {
+        ...pending,
+        target: "agents_md",
+      }
+      return applyAgentsMdImprovement(rerouted, patterns, ctx, {
+        rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
+      })
+    }
+
     const promptExisted = await ctx.agentPrompts.exists(pending.agent_name)
 
     let agentMode = "subagent"
@@ -30,6 +53,7 @@ export async function applyImprovement(
       BACKUP_ENABLED,
       BACKUP_MAX_VERSIONS,
       agentMode,
+      ctx.config.agent_prompt_inject_mode,
     )
     ctx.stateStore.recordImprovement({
       ...pending,
@@ -54,6 +78,15 @@ export async function applyImprovement(
     return `${pending.agent_name} agent prompt updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${restartNote}`
   }
 
+  return applyAgentsMdImprovement(pending, patterns, ctx)
+}
+
+async function applyAgentsMdImprovement(
+  pending: ImprovementRecord,
+  patterns: string[],
+  ctx: KasperContext,
+  opts: { rerouteNote?: string } = {},
+): Promise<string> {
   let backupPath = ""
   await ctx.agentsMd.lockedUpdate(async (existing) => {
     if (BACKUP_ENABLED) {
@@ -78,5 +111,6 @@ export async function applyImprovement(
     remaining > 0
       ? `\n\nUse /kasper apply <n> to apply remaining (${remaining} pending).`
       : ""
-  return `AGENTS.md updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}`
+  const reroute = opts.rerouteNote ? `\n\n${opts.rerouteNote}` : ""
+  return `AGENTS.md updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${reroute}`
 }
