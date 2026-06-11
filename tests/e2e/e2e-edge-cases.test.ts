@@ -6,9 +6,11 @@ import {
   cleanupE2EProject,
   fetchAPI,
   getScoredSessions,
+  getToolCalls,
   hasKasperSection,
   hasToolCalls,
   isServeRunning,
+  readAgentsMd,
   readKasperState,
   runAttach,
   runContinueAttach,
@@ -16,6 +18,7 @@ import {
   shouldRunE2E,
   startServeWithConfig,
   stopServe,
+  waitForScoredSessions,
 } from "./harness.js"
 
 const ENABLED = shouldRunE2E()

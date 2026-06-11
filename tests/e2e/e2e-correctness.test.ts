@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { execSync, spawnSync } from "node:child_process"
+import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import {
   cleanupE2EProject,
@@ -20,6 +21,7 @@ import {
   shouldRunE2E,
   startServeWithConfig,
   stopServe,
+  waitForScoredSessions,
 } from "./harness.js"
 
 const ENABLED = shouldRunE2E()

@@ -256,6 +256,172 @@ describe("KasperStateStore", () => {
     expect(store2.getTotalSessions()).toBe(1)
   })
 
+  describe("state integrity", () => {
+    test("init does not warn when on-disk hash matches a fresh flush", async () => {
+      const logs: Array<{ event: string; data: unknown }> = []
+      const logger = {
+        log: async (event: string, data: unknown) => {
+          logs.push({ event, data })
+        },
+      }
+      const store1 = new KasperStateStore(
+        statePath,
+        backupDir,
+        undefined,
+        logger as never,
+      )
+      await store1.init()
+      store1.recordSession(
+        "s1",
+        "test",
+        makeScoreCard({ overall_score: 0.9, weaknesses: ["missed detail"] }),
+      )
+      await store1.flush()
+
+      // Drop the warn entry, re-init.
+      logs.length = 0
+      const store2 = new KasperStateStore(
+        statePath,
+        backupDir,
+        undefined,
+        logger as never,
+      )
+      await store2.init()
+
+      const integrityWarnings = logs.filter(
+        (l) => l.event === "state_integrity_warn",
+      )
+      expect(integrityWarnings).toHaveLength(0)
+    })
+
+    test("init warns when on-disk state has been edited outside Kasper", async () => {
+      const logs: Array<{ event: string; data: unknown }> = []
+      const logger = {
+        log: async (event: string, data: unknown) => {
+          logs.push({ event, data })
+        },
+      }
+      const store = new KasperStateStore(
+        statePath,
+        backupDir,
+        undefined,
+        logger as never,
+      )
+      await store.init()
+      await store.flush()
+      // Tamper with the on-disk file.
+      const raw = await readFile(statePath, "utf-8")
+      const parsed = JSON.parse(raw)
+      parsed.sessions = {
+        ...parsed.sessions,
+        forged: {
+          score: 1.0,
+          weaknesses: [],
+          score_card: {},
+          timestamp: Date.now(),
+        },
+      }
+      // Keep the stored hash stale so the integrity check trips.
+      const { writeFile } = await import("node:fs/promises")
+      await writeFile(statePath, JSON.stringify(parsed, null, 2), "utf-8")
+
+      logs.length = 0
+      const store2 = new KasperStateStore(
+        statePath,
+        backupDir,
+        undefined,
+        logger as never,
+      )
+      await store2.init()
+
+      const integrityWarnings = logs.filter(
+        (l) => l.event === "state_integrity_warn",
+      )
+      expect(integrityWarnings).toHaveLength(1)
+    })
+
+    test("computeIntegrityHash is stable for identical state", async () => {
+      const { KasperStateStore } = await import("../src/state.js")
+      const computeIntegrityHash = KasperStateStore.computeIntegrityHash
+      const state = {
+        version: 1,
+        sessions: {
+          s1: {
+            score: 0.8,
+            weaknesses: [],
+            score_card: {} as never,
+            timestamp: 1,
+          },
+        },
+        evaluated_sessions: ["s1"],
+        aggregate: {
+          total_sessions: 1,
+          avg_score: 0.8,
+          top_weaknesses: [],
+          top_strengths: [],
+          by_agent: {},
+        },
+        improvements_applied: [],
+        config: { enabled: true } as never,
+        rejected_patterns: [],
+        installed_at: 1,
+        _running: {
+          weakness_freq: { a: 1 },
+          strength_freq: {},
+          running_count: 1,
+          running_sum: 0.8,
+          by_agent: {},
+        },
+        _integrity: "stale-hash-value",
+      }
+      const h1 = computeIntegrityHash(state)
+      const h2 = computeIntegrityHash(state)
+      expect(h1).toBe(h2)
+      // The stored hash MUST NOT appear in the digest, otherwise the
+      // self-referential fix would be a no-op.
+      expect(h1).not.toBe("stale-hash-value")
+    })
+
+    test("computeIntegrityHash excludes only _integrity, not _running", async () => {
+      const { KasperStateStore } = await import("../src/state.js")
+      const computeIntegrityHash = KasperStateStore.computeIntegrityHash
+      const base = {
+        version: 1,
+        sessions: {} as Record<string, never>,
+        evaluated_sessions: [] as string[],
+        aggregate: {
+          total_sessions: 0,
+          avg_score: 0,
+          top_weaknesses: [] as never[],
+          top_strengths: [] as string[],
+          by_agent: {},
+        },
+        improvements_applied: [] as never[],
+        config: { enabled: true } as never,
+        rejected_patterns: [] as string[],
+        installed_at: 1,
+        _running: {
+          weakness_freq: {},
+          strength_freq: {},
+          running_count: 0,
+          running_sum: 0,
+          by_agent: {},
+        },
+        _integrity: "ignored",
+      }
+      const tampered = {
+        ...base,
+        _running: {
+          ...base._running,
+          running_count: 999, // tampering with cache must change the hash
+        },
+      }
+      expect(computeIntegrityHash(base)).not.toBe(
+        computeIntegrityHash(tampered),
+      )
+    })
+  })
+
   test("recordSession adds session and updates aggregate", () => {
     const store = createStore()
     const card = makeScoreCard({

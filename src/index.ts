@@ -88,9 +88,100 @@ async function cleanupStaleTempFiles(stateDir: string): Promise<void> {
   }
 }
 
+/**
+ * Delete kasper-prefixed sessions that are not tracked by the current plugin
+ * instance. This is purely a hygiene step - the polling loop already skips
+ * kasper sessions, so leaving them in the server has no functional impact.
+ * We use a short, bounded timeout here (SDK_TIMEOUT_MS / 2) because this is
+ * a background task and we don't want a slow server to make it pile up.
+ */
+async function cleanupStaleKasperSessions(
+  ctx: KasperContext,
+  logger: KasperLogger,
+): Promise<void> {
+  if (!ctx.client.session.list || !ctx.client.session.delete) return
+  const cleanupStart = Date.now()
+  try {
+    const allSessions = await withTimeout(
+      ctx.client.session.list(),
+      Math.max(1000, Math.floor(SDK_TIMEOUT_MS / 2)),
+      "stale.session.list",
+    )
+    const sessions = allSessions.data ?? []
+    const stale = sessions.filter(
+      (s) => isKasperSession(s.title) && !ctx.kasperSessionIDs.has(s.id),
+    )
+    if (stale.length === 0) return
+
+    await logger.log("stale_kasper_cleanup_start", {
+      count: stale.length,
+      sessionIDs: stale.map((s) => s.id),
+    })
+    for (const s of stale) {
+      try {
+        await ctx.client.session.delete({ path: { id: s.id } })
+        ctx.kasperSessionIDs.add(s.id)
+        await logger.log("stale_kasper_deleted", { sessionID: s.id })
+      } catch (e) {
+        await logger.log("stale_kasper_delete_failed", {
+          sessionID: s.id,
+          error: String(e),
+        })
+      }
+    }
+    await logger.log("stale_kasper_cleanup_done", {
+      total: stale.length,
+      durationMs: Date.now() - cleanupStart,
+    })
+  } catch (e) {
+    await logger.log("stale_kasper_cleanup_error", { error: String(e) })
+  }
+}
+
 interface HealthReport {
   ok: boolean
   checks: Array<{ name: string; ok: boolean; detail: string }>
+}
+
+interface HealthProbe {
+  name: string
+  path: string
+  // Detail to use when the path exists and the check is ok (presence check).
+  presentDetail: string
+  // Detail to use when the path is missing and the check is failing.
+  absentDetail?: string
+  // If set, the check INVERTS: a present path is failing (a "stale" check,
+  // e.g. leftover lock file) and a missing path is ok.
+  failingWhenPresentDetail?: string
+}
+
+async function probePaths(
+  probes: HealthProbe[],
+): Promise<HealthReport["checks"]> {
+  // Run all stat() calls concurrently - each is a single syscall, and
+  // they are independent. Sequential awaiting was adding ~5 stat-roundtrips
+  // to startup time on cold cache.
+  const results = await Promise.all(
+    probes.map(async (p) => {
+      try {
+        await stat(p.path)
+        if (p.failingWhenPresentDetail) {
+          return {
+            name: p.name,
+            ok: false,
+            detail: p.failingWhenPresentDetail,
+          }
+        }
+        return { name: p.name, ok: true, detail: p.presentDetail }
+      } catch {
+        if (p.failingWhenPresentDetail) {
+          return { name: p.name, ok: true, detail: p.presentDetail }
+        }
+        return { name: p.name, ok: false, detail: p.absentDetail ?? "" }
+      }
+    }),
+  )
+  return results
 }
 
 async function runHealthCheck(
@@ -99,61 +190,43 @@ async function runHealthCheck(
   config: KasperConfig,
   logger: KasperLogger,
 ): Promise<HealthReport> {
-  const checks: HealthReport["checks"] = []
-
-  try {
-    await stat(stateDir)
-    checks.push({ name: "state_dir", ok: true, detail: stateDir })
-  } catch {
-    checks.push({
-      name: "state_dir",
-      ok: false,
-      detail: `${stateDir} missing - will be created`,
-    })
-  }
-
-  try {
-    await stat(join(stateDir, "state.json"))
-    checks.push({ name: "state_file", ok: true, detail: "exists" })
-  } catch {
-    checks.push({ name: "state_file", ok: false, detail: "not yet created" })
-  }
-
-  try {
-    const agentsMdPath = join(cwd, "AGENTS.md")
-    await stat(agentsMdPath)
-    checks.push({ name: "agents_md", ok: true, detail: agentsMdPath })
-  } catch {
-    checks.push({
-      name: "agents_md",
-      ok: false,
-      detail: "no AGENTS.md found in project root",
-    })
-  }
-
   const backupDir = join(stateDir, "backups")
-  try {
-    await stat(backupDir)
-    checks.push({ name: "backup_dir", ok: true, detail: backupDir })
-  } catch {
-    checks.push({
-      name: "backup_dir",
-      ok: false,
-      detail: "will be created on first backup",
-    })
-  }
+  const lockPath = join(stateDir, "state.json.lock")
+  const agentsMdPath = join(cwd, "AGENTS.md")
+  const stateFilePath = join(stateDir, "state.json")
 
-  try {
-    const lockPath = join(stateDir, "state.json.lock")
-    await stat(lockPath)
-    checks.push({
+  const checks = await probePaths([
+    {
+      name: "state_dir",
+      path: stateDir,
+      presentDetail: stateDir,
+      absentDetail: `${stateDir} missing - will be created`,
+    },
+    {
+      name: "state_file",
+      path: stateFilePath,
+      presentDetail: "exists",
+      absentDetail: "not yet created",
+    },
+    {
+      name: "agents_md",
+      path: agentsMdPath,
+      presentDetail: agentsMdPath,
+      absentDetail: "no AGENTS.md found in project root",
+    },
+    {
+      name: "backup_dir",
+      path: backupDir,
+      presentDetail: backupDir,
+      absentDetail: "will be created on first backup",
+    },
+    {
       name: "lock_file",
-      ok: false,
-      detail: "stale lock file detected (will auto-clear)",
-    })
-  } catch {
-    checks.push({ name: "lock_file", ok: true, detail: "no stale lock" })
-  }
+      path: lockPath,
+      presentDetail: "no stale lock",
+      failingWhenPresentDetail: "stale lock file detected (will auto-clear)",
+    },
+  ])
 
   const hasModel = !!config.model?.includes("/")
   checks.push({
@@ -327,43 +400,22 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   }, CONFIG_POLL_INTERVAL_MS)
   ctx.configReloadTimer = configReloadTimer
 
-  if (client.session.list && client.session.delete) {
-    const cleanupStart = Date.now()
-    try {
-      const allSessions = await withTimeout(
-        client.session.list(),
-        SDK_TIMEOUT_MS,
-        "stale.session.list",
-      )
-      const sessions = allSessions.data ?? []
-      const stale = sessions.filter(
-        (s) => isKasperSession(s.title) && !ctx.kasperSessionIDs.has(s.id),
-      )
-      if (stale.length > 0) {
-        await logger.log("stale_kasper_cleanup_start", {
-          count: stale.length,
-          sessionIDs: stale.map((s) => s.id),
-        })
-        for (const s of stale) {
-          try {
-            await client.session.delete({ path: { id: s.id } })
-            ctx.kasperSessionIDs.add(s.id)
-            await logger.log("stale_kasper_deleted", { sessionID: s.id })
-          } catch (e) {
-            await logger.log("stale_kasper_delete_failed", {
-              sessionID: s.id,
-              error: String(e),
-            })
-          }
-        }
-        await logger.log("stale_kasper_cleanup_done", {
-          total: stale.length,
-          durationMs: Date.now() - cleanupStart,
-        })
-      }
-    } catch (e) {
-      await logger.log("stale_kasper_cleanup_error", { error: String(e) })
-    }
+  // Stale kasper-session cleanup is hygiene, not correctness: pollAndEvaluate
+  // (line 757) already filters kasper sessions out of the polling set, so the
+  // user-facing prompt is unaffected by leaving them in the server. We used
+  // to await client.session.list() synchronously here, but the opencode
+  // server's HTTP listener may not be bound yet at plugin-init time, and the
+  // call then waited the full SDK_TIMEOUT_MS (30s) before timing out. That
+  // blocked opencode startup. Defer the work to the next event-loop tick
+  // (and a short retry) so init returns immediately. The helper guards on
+  // client.session.list / .delete being present at runtime.
+  const cleanupAttempts = [0, 500]
+  for (const delayMs of cleanupAttempts) {
+    setTimeout(() => {
+      cleanupStaleKasperSessions(ctx, logger).catch(() => {
+        /* errors are logged inside the helper */
+      })
+    }, delayMs)
   }
 
   const evaluationPollTimer = setInterval(async () => {

@@ -136,6 +136,26 @@ export class KasperStateStore {
     this.state = defaultState(this.configDefaults)
   }
 
+  /**
+   * Compute a stable SHA-256 fingerprint of a state object, used to detect
+   * edits made outside of Kasper. The hash covers every field except
+   * `_integrity` itself (so the hash of state-without-hash equals the
+   * stored hash). Including `_running` is intentional: any tamper of the
+   * cached running aggregates is caught, and the data is recomputed on
+   * the next flush anyway.
+   *
+   * Both write and read paths MUST use this helper - any asymmetry will
+   * produce spurious "integrity failed" warnings on every startup.
+   */
+  static computeIntegrityHash(state: KasperState): string {
+    const { _integrity: _ignored, ...rest } = state
+    void _ignored
+    return createHash("sha256")
+      .update(JSON.stringify(rest, null, 2))
+      .digest("hex")
+      .slice(0, 32)
+  }
+
   async init(): Promise<void> {
     await mkdir(this.backupDir, { recursive: true })
     try {
@@ -144,18 +164,12 @@ export class KasperStateStore {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         if (parsed._integrity) {
           const storedHash = parsed._integrity as string
-          const verifyJson = JSON.stringify(parsed, null, 2)
-          const computedHash = createHash("sha256")
-            .update(
-              verifyJson.replace(/"(_integrity|_running)":\s*"[^"]*"/g, ""),
-            )
-            .digest("hex")
-            .slice(0, 32)
+          const computedHash = KasperStateStore.computeIntegrityHash(parsed)
           if (storedHash !== computedHash) {
             this.logger?.log("state_integrity_warn", {
               stored: storedHash,
               computed: computedHash,
-              note: "State file integrity check failed — data may be corrupted. Continuing with parsed state.",
+              note: "State file integrity check failed — data may have been edited outside Kasper. Continuing with the on-disk state; a fresh hash will be written on the next save.",
             })
           }
         }
@@ -1041,11 +1055,7 @@ export class KasperStateStore {
       running_sum: this.runningSum,
       by_agent: byAgent,
     }
-    const json = JSON.stringify(this.state, null, 2)
-    this.state._integrity = createHash("sha256")
-      .update(json.replace(/"(_integrity|_running)":\s*"[^"]*"/g, ""))
-      .digest("hex")
-      .slice(0, 32)
+    this.state._integrity = KasperStateStore.computeIntegrityHash(this.state)
     await writeTextAtomic(this.statePath, JSON.stringify(this.state, null, 2))
   }
 }
