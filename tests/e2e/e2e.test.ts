@@ -12,6 +12,7 @@ import {
   startServe,
   stopServe,
   waitForScoredSessions,
+  writeKasperConfig,
 } from "./harness.js"
 
 const ENABLED = shouldRunE2E()

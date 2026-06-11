@@ -18,6 +18,7 @@ import {
   startServeWithConfig,
   stopServe,
   waitForChildSessions,
+  waitForScoredSessions,
 } from "./harness.js"
 
 const ENABLED = shouldRunE2E()

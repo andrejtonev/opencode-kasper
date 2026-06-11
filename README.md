@@ -22,7 +22,7 @@ Kasper is a plugin for [opencode](https://opencode.ai) that monitors agent sessi
 npm install @atonev/opencode-kasper
 ```
 
-Add to your opencode config:
+Register the plugin in your `opencode.json` (or in your global `~/.config/opencode/opencode.json`):
 
 ```json
 {
@@ -30,15 +30,7 @@ Add to your opencode config:
 }
 ```
 
-With options:
-
-```json
-{
-  "plugin": [
-    ["@atonev/opencode-kasper", { "auto_update": true }]
-  ]
-}
-```
+That's the entire plugin registration — there are no plugin-level options to pass on the `plugin` line. All kasper configuration (auto-update, model, thresholds, etc.) lives in a separate file, described in [Configuration](#configuration) below.
 
 **Verify:** Start a session and run `/kasper status`.
 
@@ -117,6 +109,8 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
 
 ### Example
 
+`~/.config/opencode/kasper.jsonc` (recommended — full JSONC support including comments):
+
 ```jsonc
 {
   "enabled": true,
@@ -128,6 +122,21 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
   "state_dir": "/var/lib/kasper"
 }
 ```
+
+…or as a nested `kasper` key in `opencode.json`:
+
+```json
+{
+  "plugin": ["@atonev/opencode-kasper"],
+  "kasper": {
+    "auto_update": true,
+    "scoring_threshold": 0.65,
+    "model": "opencode/minimax-m2.5-free"
+  }
+}
+```
+
+The `kasper.jsonc` file always wins over the `kasper` key in `opencode.json` if both exist. Project-local config overrides global config; the global config file lives at `~/.config/opencode/kasper.jsonc` (or wherever `XDG_CONFIG_HOME` points).
 
 ## Agent Prompt Resolution
 

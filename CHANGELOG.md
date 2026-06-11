@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1] - 2026-06-11
+
+A patch release. Fixes a false-positive on every startup, removes a startup-time hang in the worst case, and corrects a misleading example in the README.
+
+### Fixed
+
+- **`state_integrity_warn` firing on every startup** — the integrity-hash strip regex only matched string-valued fields, but `_running` is an object. Read-time and write-time hash inputs were never equal, so the stored hash never matched a recomputation. Replaced the strip-and-stringify approach with a static `KasperStateStore.computeIntegrityHash(state)` helper that destructures `_integrity` out of the state and hashes the rest with `JSON.stringify(..., null, 2)`. Both `init()` and `doFlush()` use the same helper, so the canonicalization is symmetric by construction. The user-facing message has also been softened from "data may be corrupted" to "data may have been edited outside Kasper. A fresh hash will be written on the next save." — it still fires on real corruption, but is no longer alarming on out-of-band edits. Regression tests cover both directions.
+- **Latent: `_integrity` was never persisted** — `doFlush` was hashing the in-memory state, then writing the **pre-hash** JSON to disk (a leftover local variable). After the fix, the freshly-computed hash is set on the state and the post-hash state is what gets written, so the on-disk file always carries a valid hash. A new test asserts `state.json` contains an `_integrity` field after a flush.
+
+### Performance
+
+- **Defer stale-session cleanup to `setTimeout(0)`** — `KasperPlugin` was awaiting `client.session.list()` synchronously during init. If the opencode server's HTTP listener wasn't yet bound at that point, the call waited the full `SDK_TIMEOUT_MS` (30s) before timing out, blocking opencode startup. The cleanup is purely cosmetic (the polling loop already filters kasper sessions out of its polling set), so it now runs on the next event-loop tick, with a short retry. Init returns in ~10 ms in the typical case.
+- **Parallelize the 5 health-check `stat()` calls** with `Promise.all` over a new `probePaths` helper. Each check is a single syscall; sequential awaiting was adding ~5 stat-roundtrips to startup on a cold cache.
+
+### Documentation
+
+- **README Installation section rewritten** — the previous "With options" example showed a plugin tuple like `["@atonev/opencode-kasper", { "auto_update": true }]`, implying that the second element was how to configure kasper. It is not: opencode's plugin tuple second element is a generic plugin-arg convention, and kasper only reads its config from `kasper.jsonc` / the `kasper` key in `opencode.json` (see `src/config.ts`). The misleading example is gone; the Configuration section now shows both a standalone `kasper.jsonc` and a `kasper` key in `opencode.json`, with a clear precedence note.
+
 ## [1.1.0] - 2026-06-09
 
 A consolidation release. Brings the plugin to feature parity with opencode's agent-resolution model, fixes a long-standing silent-failure path on built-in agents, expands the safety and audit story, and adds end-to-end test coverage for the production auto-update loop.
