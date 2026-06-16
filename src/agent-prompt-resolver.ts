@@ -1,7 +1,13 @@
-import { readdir, readFile, stat } from "node:fs/promises"
+import { readdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative } from "node:path"
 import { applyEdits, type ModificationOptions, modify } from "jsonc-parser"
+import {
+  candidateGlobalOpencodeDirs,
+  dirExists,
+  expandTilde,
+  fileExists,
+} from "./path-utils.js"
 import { writeTextAtomic } from "./prompt-utils.js"
 
 /**
@@ -95,42 +101,11 @@ export type AgentPromptSource =
 const FILE_DIRECTIVE = /^\s*\{\s*file\s*:\s*([^}]+)\s*\}\s*$/
 const PATH_DIRECTIVE = /^\s*\{\s*path\s*:\s*([^}]+)\s*\}\s*$/
 
-function expandTilde(p: string): string {
-  if (p === "~") return homedir()
-  if (p.startsWith("~/")) return join(homedir(), p.slice(2))
-  return p
-}
-
 function resolveDirectivePath(raw: string, baseDir: string): string {
   const expanded = expandTilde(raw.trim())
   if (isAbsolute(expanded)) return expanded
   return join(baseDir, expanded)
 }
-
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    const info = await stat(p)
-    return info.isFile()
-  } catch {
-    return false
-  }
-}
-
-async function dirExists(p: string): Promise<boolean> {
-  try {
-    const info = await stat(p)
-    return info.isDirectory()
-  } catch {
-    return false
-  }
-}
-
-/**
- * Exported so the AGENTS.md resolver can reuse the same `stat`-backed
- * checks.
- */
-export const _fileExists = fileExists
-export const _dirExists = dirExists
 
 async function loadJsoncIfExists(
   path: string,
@@ -167,26 +142,6 @@ function getAgentEntry(
     return undefined
   return entry as Record<string, unknown>
 }
-
-function candidateGlobalOpencodeDirs(): string[] {
-  const dirs: string[] = []
-  if (process.env.XDG_CONFIG_HOME) {
-    dirs.push(join(process.env.XDG_CONFIG_HOME, "opencode"))
-  } else {
-    dirs.push(join(homedir(), ".config", "opencode"))
-  }
-  if (process.platform === "win32" && process.env.APPDATA) {
-    dirs.push(join(process.env.APPDATA, "opencode"))
-  }
-  dirs.push(join(homedir(), ".opencode"))
-  return [...new Set(dirs)]
-}
-
-/**
- * Exported so the AGENTS.md resolver can reuse the same global-directory
- * candidate list (XDG_CONFIG_HOME, APPDATA on win32, ~/.opencode fallback).
- */
-export const _candidateGlobalOpencodeDirs = candidateGlobalOpencodeDirs
 
 interface LoadedConfig {
   path: string

@@ -43,9 +43,10 @@
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import {
-  _candidateGlobalOpencodeDirs,
-  _fileExists,
-} from "./agent-prompt-resolver.js"
+  candidateGlobalOpencodeDirs,
+  expandTilde,
+  fileExists,
+} from "./path-utils.js"
 
 const MAX_WALKUP_DEPTH = 32
 
@@ -103,12 +104,6 @@ export interface ResolveAgentsMdOptions {
   maxWalkupDepth?: number
 }
 
-function expandTilde(p: string, home: string): string {
-  if (p === "~") return home
-  if (p.startsWith("~/")) return join(home, p.slice(2))
-  return p
-}
-
 function expandAgentsMdPath(
   raw: string,
   projectRoot: string,
@@ -122,7 +117,7 @@ async function firstExisting(
   ...candidates: string[]
 ): Promise<string | undefined> {
   for (const c of candidates) {
-    if (await _fileExists(c)) return c
+    if (await fileExists(c)) return c
   }
   return undefined
 }
@@ -217,11 +212,11 @@ export async function resolveAgentsMdSource(
   const globalDirs = options.globalOpencodeDir
     ? [
         options.globalOpencodeDir,
-        ..._candidateGlobalOpencodeDirs().filter(
+        ...candidateGlobalOpencodeDirs().filter(
           (d) => d !== options.globalOpencodeDir,
         ),
       ]
-    : _candidateGlobalOpencodeDirs()
+    : candidateGlobalOpencodeDirs()
   for (const dir of globalDirs) {
     const agents = join(dir, "AGENTS.md")
     const claude = join(dir, "CLAUDE.md")
@@ -242,7 +237,7 @@ export async function resolveAgentsMdSource(
   ) {
     const claudeGlobal = join(home, ".claude", "CLAUDE.md")
     candidates.push(claudeGlobal)
-    if (await _fileExists(claudeGlobal)) {
+    if (await fileExists(claudeGlobal)) {
       return {
         primary: claudeGlobal,
         candidates,
