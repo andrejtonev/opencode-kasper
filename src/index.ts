@@ -318,7 +318,12 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   const agentsMd = new AgentsMdManager(cwd, stateDir, BACKUP_MAX_VERSIONS)
   await agentsMd.init()
 
-  const agentPrompts = new AgentPromptManager(cwd, stateDir, globalDir)
+  const agentPrompts = new AgentPromptManager(
+    cwd,
+    stateDir,
+    globalDir,
+    config.prompt_paths,
+  )
   await agentPrompts.init()
 
   const scorer = new Scorer(config, logger)

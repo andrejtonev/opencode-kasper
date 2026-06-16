@@ -25,6 +25,14 @@ export interface KasperConfig {
   min_observations_for_update: number
   strict_sanitize: boolean
   agent_prompt_inject_mode: "section" | "inline"
+  /**
+   * Additional directories kasper will scan for agent prompt markdown
+   * files. Each entry may be an absolute path, a path relative to the
+   * project root, or a `~/...` path. For each directory, kasper looks
+   * for `<dir>/agent/<name>.md` (singular, backcompat) and
+   * `<dir>/agents/<name>.md` (plural, canonical). Default: `[]`.
+   */
+  prompt_paths?: string[]
   config_version?: number
 }
 

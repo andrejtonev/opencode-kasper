@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
-import { readFile, rm } from "node:fs/promises"
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { resolveAgentPromptSource } from "../src/agent-prompt-resolver.js"
 import {
   AgentPromptManager,
   appendInlineImprovement,
+  InlinePromptError,
 } from "../src/agent-prompts.js"
 import { escapeRegex } from "../src/prompt-utils.js"
 
@@ -575,5 +577,237 @@ describe("appendInlineImprovement (pure helper)", () => {
   test("appends to empty string without leading blank line", () => {
     const out = appendInlineImprovement("", "rule")
     expect(out.startsWith("<!-- kasper-injected:begin -->")).toBe(true)
+  })
+})
+
+describe("AgentPromptManager — plugin_override (oh-my-opencode-style layouts)", () => {
+  let projectRoot: string
+  let kasperState: string
+  let globalDir: string
+  let manager: AgentPromptManager
+
+  beforeEach(async () => {
+    projectRoot = tmpDir()
+    kasperState = join(projectRoot, "kasper-state")
+    globalDir = join(projectRoot, "global-opencode")
+    await mkdir(globalDir, { recursive: true })
+    await mkdir(join(projectRoot, ".opencode"), { recursive: true })
+    await mkdir(kasperState, { recursive: true })
+    manager = new AgentPromptManager(projectRoot, kasperState, globalDir)
+    await manager.init()
+  })
+
+  afterEach(async () => {
+    await rm(projectRoot, { recursive: true, force: true })
+  })
+
+  async function writeJsonc(path: string, content: string): Promise<void> {
+    await writeFile(path, content, "utf-8")
+  }
+
+  test("read() returns the prompt_append value verbatim for a config target", async () => {
+    const promptAppend = "You are a built-in agent. Do X."
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({ agent: { sisyphus: { prompt_append: promptAppend } } }),
+    )
+    const content = await manager.read("sisyphus")
+    expect(content).toBe(promptAppend)
+  })
+
+  test("read() returns the file body for a file target", async () => {
+    const target = join(projectRoot, "prompts", "sisyphus.md")
+    await mkdir(join(projectRoot, "prompts"), { recursive: true })
+    await writeFile(target, "Base sisyphus prompt.", "utf-8")
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { sisyphus: { prompt: `{file:${target}}` } },
+      }),
+    )
+    const content = await manager.read("sisyphus")
+    expect(content).toBe("Base sisyphus prompt.")
+  })
+
+  test("write() to a prompt_append config target appends to the override value", async () => {
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    const initial = "Built-in prompt. "
+    await writeJsonc(
+      configPath,
+      JSON.stringify({ agent: { sisyphus: { prompt_append: initial } } }),
+    )
+    await manager.write("sisyphus", "New kasper rule.")
+
+    const after = JSON.parse(await readFile(configPath, "utf-8"))
+    expect(after.agent.sisyphus.prompt_append).toContain("Built-in prompt.")
+    expect(after.agent.sisyphus.prompt_append).toContain("New kasper rule.")
+  })
+
+  test("write() is idempotent for an identical block on a config target", async () => {
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({ agent: { sisyphus: { prompt_append: "Initial" } } }),
+    )
+    await manager.write("sisyphus", "Add documentation.")
+    await manager.write("sisyphus", "Add documentation.")
+    const after = JSON.parse(await readFile(configPath, "utf-8"))
+    const occurrences =
+      after.agent.sisyphus.prompt_append.match(/Add documentation\./g)
+    expect(occurrences?.length).toBe(1)
+  })
+
+  test("write() to a {file:...} plugin_override target writes the referenced file", async () => {
+    const target = join(projectRoot, "prompts", "sisyphus.md")
+    await mkdir(join(projectRoot, "prompts"), { recursive: true })
+    await writeFile(target, "Old content.", "utf-8")
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { sisyphus: { prompt: `{file:${target}}` } },
+      }),
+    )
+    await manager.write("sisyphus", "New content from kasper.")
+    const after = await readFile(target, "utf-8")
+    expect(after).toBe("New content from kasper.")
+  })
+
+  test("write() to a prompt (non-append) plugin_override target throws InlinePromptError", async () => {
+    // `agent.<name>.prompt: "raw string"` fully replaces the upstream prompt
+    // and should be treated like inline: refuse to mutate directly.
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { atlas: { prompt: "Raw text override." } },
+      }),
+    )
+    expect(manager.write("atlas", "Should not write")).rejects.toBeInstanceOf(
+      InlinePromptError,
+    )
+  })
+
+  test("injectSection with section mode on a {file:...} target writes a real section", async () => {
+    const target = join(projectRoot, "prompts", "sisyphus.md")
+    await mkdir(join(projectRoot, "prompts"), { recursive: true })
+    await writeFile(target, "# Base\n", "utf-8")
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { sisyphus: { prompt: `{file:${target}}` } },
+      }),
+    )
+    await manager.injectSection("sisyphus", "Kasper Rules", "Be thorough.")
+    const after = await readFile(target, "utf-8")
+    expect(after).toContain("## Kasper Rules")
+    expect(after).toContain("Be thorough.")
+  })
+
+  test("injectSection with a prompt_append config target appends to the value", async () => {
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    const initial = "Built-in prompt."
+    await writeJsonc(
+      configPath,
+      JSON.stringify({ agent: { sisyphus: { prompt_append: initial } } }),
+    )
+    await manager.injectSection(
+      "sisyphus",
+      "Kasper Rules",
+      "Always cite file paths.",
+    )
+    const after = JSON.parse(await readFile(configPath, "utf-8"))
+    expect(after.agent.sisyphus.prompt_append).toContain("Built-in prompt.")
+    expect(after.agent.sisyphus.prompt_append).toContain("## Kasper Rules")
+    expect(after.agent.sisyphus.prompt_append).toContain(
+      "Always cite file paths.",
+    )
+  })
+
+  test("injectSection with a prompt (non-append) plugin_override target throws InlinePromptError", async () => {
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { atlas: { prompt: "Raw text override." } },
+      }),
+    )
+    expect(
+      manager.injectSection("atlas", "Kasper Rules", "rule"),
+    ).rejects.toBeInstanceOf(InlinePromptError)
+  })
+
+  test("plugin_override config target shows up as non-missing for a built-in agent", async () => {
+    // The whole point: `shouldRerouteBuiltinAgentPrompt` in evaluate.ts/handlers.ts
+    // checks `source.kind === "missing"`. A plugin override must prevent the
+    // built-in rerouting, which would otherwise throw the improvement away
+    // (for subagents) or push it to AGENTS.md (for primary agents).
+    const before = await resolveAgentPromptSource(
+      "sisyphus",
+      projectRoot,
+      globalDir,
+    )
+    expect(before.kind).toBe("missing")
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({ agent: { sisyphus: { prompt_append: "Hello" } } }),
+    )
+    const after = await resolveAgentPromptSource(
+      "sisyphus",
+      projectRoot,
+      globalDir,
+    )
+    expect(after.kind).toBe("plugin_override")
+  })
+})
+
+describe("AgentPromptManager — custom prompt_paths", () => {
+  let projectRoot: string
+  let kasperState: string
+  let globalDir: string
+  let customDir: string
+  let manager: AgentPromptManager
+
+  beforeEach(async () => {
+    projectRoot = tmpDir()
+    kasperState = join(projectRoot, "kasper-state")
+    globalDir = join(projectRoot, "global-opencode")
+    customDir = join(projectRoot, "team-prompts")
+    await mkdir(globalDir, { recursive: true })
+    await mkdir(join(projectRoot, ".opencode"), { recursive: true })
+    await mkdir(kasperState, { recursive: true })
+    await mkdir(join(customDir, "agents"), { recursive: true })
+    manager = new AgentPromptManager(projectRoot, kasperState, globalDir, [
+      customDir,
+    ])
+    await manager.init()
+  })
+
+  afterEach(async () => {
+    await rm(projectRoot, { recursive: true, force: true })
+  })
+
+  test("read() returns the file from the custom path", async () => {
+    await writeFile(
+      join(customDir, "agents", "team-review.md"),
+      "Review things carefully.",
+      "utf-8",
+    )
+    const content = await manager.read("team-review")
+    expect(content).toBe("Review things carefully.")
+  })
+
+  test("write() updates the file in the custom path", async () => {
+    const target = join(customDir, "agents", "team-review.md")
+    await writeFile(target, "Old prompt.", "utf-8")
+    await manager.write("team-review", "New prompt from kasper.")
+    const after = await readFile(target, "utf-8")
+    expect(after).toBe("New prompt from kasper.")
+  })
+
+  test("injectSection() injects into the file in the custom path", async () => {
+    const target = join(customDir, "agents", "team-review.md")
+    await writeFile(target, "# Base prompt\n", "utf-8")
+    await manager.injectSection("team-review", "Kasper Rules", "Be polite.")
+    const after = await readFile(target, "utf-8")
+    expect(after).toContain("## Kasper Rules")
+    expect(after).toContain("Be polite.")
   })
 })

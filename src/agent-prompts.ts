@@ -2,6 +2,7 @@ import { copyFile, mkdir, readdir, readFile, unlink } from "node:fs/promises"
 import { basename, join } from "node:path"
 import {
   type AgentPromptSource,
+  appendToPluginOverridePrompt,
   defaultAgentFilePath,
   resolveAgentPromptSource,
 } from "./agent-prompt-resolver.js"
@@ -85,6 +86,7 @@ export class AgentPromptManager {
     private readonly projectRoot: string,
     readonly kasperStateDir: string,
     private readonly globalOpencodeDir?: string,
+    private readonly customPromptPaths?: readonly string[],
   ) {
     this.backupsDir = join(kasperStateDir, "backups", "agents")
   }
@@ -109,6 +111,7 @@ export class AgentPromptManager {
       agentName,
       this.projectRoot,
       this.globalOpencodeDir,
+      this.customPromptPaths,
     )
     this.sourceCache.set(agentName, { source, ts: Date.now() })
     return source
@@ -122,6 +125,9 @@ export class AgentPromptManager {
   /**
    * The file path kasper will read from and write to for this agent.
    * - external_file / project_file / global_file: the actual file
+   * - plugin_override with file/file_uri target: the referenced file
+   * - plugin_override with config target: the file the value would be
+   *   redirected to (or the conventional default if not yet redirected)
    * - inline: not applicable (callers should check `resolve` first)
    * - missing: the conventional default where a new file would be created
    */
@@ -130,6 +136,10 @@ export class AgentPromptManager {
     if (source.kind === "external_file") return source.path
     if (source.kind === "project_file") return source.path
     if (source.kind === "global_file") return source.path
+    if (source.kind === "plugin_override") {
+      if (source.path) return source.path
+      return defaultAgentFilePath(this.projectRoot, agentName)
+    }
     if (source.kind === "inline") {
       // Reading/writing an inline prompt is not supported; return the path
       // where it WOULD be if materialized, for diagnostic display.
@@ -150,12 +160,25 @@ export class AgentPromptManager {
   /**
    * Read the current prompt content. Returns the inline string verbatim if
    * the source is inline; returns the file body if the source is a file;
+   * returns the override value for a `plugin_override` with config target;
    * returns "" if no source can be found.
    */
   async read(agentName: string): Promise<string> {
     const source = await this.resolve(agentName)
     if (source.kind === "missing") return ""
     if (source.kind === "inline") return source.prompt
+    if (source.kind === "plugin_override") {
+      if (source.target === "config") return source.value ?? ""
+      // file or file_uri: read the referenced file
+      if (source.path) {
+        try {
+          return await readFile(source.path, "utf-8")
+        } catch {
+          return ""
+        }
+      }
+      return ""
+    }
     try {
       return await readFile(source.path, "utf-8")
     } catch {
@@ -165,14 +188,31 @@ export class AgentPromptManager {
 
   /**
    * Write the entire prompt body, replacing the previous content. Throws
-   * InlinePromptError for inline sources — use /kasper migrate first.
+   * InlinePromptError for inline sources and for `plugin_override` sources
+   * that fully replace the upstream prompt — use /kasper migrate first.
+   *
+   * For `plugin_override` sources with a `prompt_append` field, this appends
+   * the new content to the `prompt_append` value in the source config file
+   * (the canonical "extend the existing override" operation for plugin-shipped
+   * agents). For `plugin_override` sources targeting a real file
+   * (`{file:...}` or `file://...`), the file is overwritten verbatim.
    */
   async write(agentName: string, content: string): Promise<void> {
-    const filePath = await this.getAgentPath(agentName)
     const source = await this.resolve(agentName)
     if (source.kind === "inline") {
       throw new InlinePromptError(agentName)
     }
+    if (source.kind === "plugin_override" && source.target === "config") {
+      if (!source.isAppend) {
+        // `prompt` (not `prompt_append`) fully replaces the upstream prompt.
+        // Treat it like inline: refuse to overwrite directly.
+        throw new InlinePromptError(agentName)
+      }
+      await appendToPluginOverridePrompt(source, content)
+      this.invalidateSourceCache(agentName)
+      return
+    }
+    const filePath = await this.getAgentPath(agentName)
     const lockPath = `${filePath}.lock`
     const unlock = await acquireLock(lockPath)
     try {
@@ -189,7 +229,9 @@ export class AgentPromptManager {
 
   /**
    * Snapshot the current prompt to a timestamped backup file. No-op for
-   * inline sources (we have nothing on disk to back up).
+   * inline sources, `plugin_override` config targets, and missing sources
+   * (we have nothing on disk to back up — config targets are backed up via
+   * a separate kasper state file outside the scope of this method).
    */
   async backup(
     agentName: string,
@@ -198,6 +240,20 @@ export class AgentPromptManager {
   ): Promise<string | undefined> {
     const source = await this.resolve(agentName)
     if (source.kind === "missing" || source.kind === "inline") {
+      return undefined
+    }
+    if (source.kind === "plugin_override") {
+      if (source.target !== "config" && source.path) {
+        const agentBackupDir = this.agentDir(agentName)
+        await mkdir(agentBackupDir, { recursive: true })
+        const name = timestampFilename(label)
+        const dest = join(agentBackupDir, name)
+        if (await exists(source.path)) {
+          await copyFile(source.path, dest)
+        }
+        await this.enforceMaxBackups(agentName, maxBackups)
+        return dest
+      }
       return undefined
     }
     const agentBackupDir = this.agentDir(agentName)
@@ -219,6 +275,32 @@ export class AgentPromptManager {
       return false
     }
     if (source.kind === "missing") return false
+    if (source.kind === "plugin_override") {
+      if (source.target === "config" || !source.path) return false
+      const filePath = source.path
+      const lockPath = `${filePath}.lock`
+      const unlock = await acquireLock(lockPath)
+      try {
+        const agentBackupDir = this.agentDir(agentName)
+        let entries: string[] = []
+        try {
+          entries = await readdir(agentBackupDir)
+        } catch {
+          return false
+        }
+        if (entries.length === 0) return false
+        entries.sort().reverse()
+        const latest = entries[0]
+        if (await exists(filePath)) {
+          await this.backup(agentName, "pre-rollback")
+        }
+        const content = await readFile(join(agentBackupDir, latest), "utf-8")
+        await writeTextAtomic(filePath, content)
+        return true
+      } finally {
+        await unlock()
+      }
+    }
 
     const filePath = source.path
     const lockPath = `${filePath}.lock`
@@ -261,10 +343,31 @@ export class AgentPromptManager {
       throw new InlinePromptError(agentName)
     }
 
+    // `plugin_override` with a config target and a `prompt_append` field
+    // is a flat raw string in the source config file. We don't have a
+    // markdown section to write into, so we append the new content to the
+    // `prompt_append` value directly (idempotent, whitespace-normalised
+    // dedupe). For `prompt` (not append) the field fully replaces the
+    // upstream prompt and we refuse to mutate it directly.
+    if (source.kind === "plugin_override" && source.target === "config") {
+      if (!source.isAppend) {
+        throw new InlinePromptError(agentName)
+      }
+      let backupPath: string | undefined
+      if (backupEnabled) {
+        // Back up the config file itself so rollback is possible.
+        backupPath = await this.backup(agentName, "pre-improvement", maxBackups)
+      }
+      const sectionBody = `## ${sectionName}\n${content.trim()}`
+      await appendToPluginOverridePrompt(source, sectionBody)
+      this.invalidateSourceCache(agentName)
+      return backupPath
+    }
+
     const filePath =
       source.kind === "missing"
         ? defaultAgentFilePath(this.projectRoot, agentName)
-        : source.path
+        : (source as { path: string }).path
     const lockPath = `${filePath}.lock`
 
     const unlock = await acquireLock(lockPath)
