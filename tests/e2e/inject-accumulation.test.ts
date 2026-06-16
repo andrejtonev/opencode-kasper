@@ -96,7 +96,11 @@ describe.skipIf(!ENABLED)(
       const opencodeDir = join(projectDir, ".opencode", "kasper")
       execSync(`mkdir -p "${opencodeDir}"`, { stdio: "pipe" })
       writeFileSync(join(projectDir, "AGENTS.md"), realisticAgentsMd, "utf-8")
-      agentsMdManager = new AgentsMdManager(projectDir, opencodeDir, 5)
+      agentsMdManager = new AgentsMdManager(
+        join(projectDir, "AGENTS.md"),
+        opencodeDir,
+        5,
+      )
     })
 
     afterAll(() => {
@@ -254,7 +258,11 @@ describe.skipIf(!ENABLED)(
         "utf-8",
       )
 
-      const mgr = new AgentsMdManager(freshDir, opencodeDir, 5)
+      const mgr = new AgentsMdManager(
+        join(freshDir, "AGENTS.md"),
+        opencodeDir,
+        5,
+      )
       await mgr.lockedUpdate(async (existing) =>
         mgr.injectSection(existing, SECTION_NAME, "first improvement"),
       )
