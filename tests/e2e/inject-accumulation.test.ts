@@ -62,10 +62,6 @@ function countHeaders(content: string, sectionName: string): number {
   return (content.match(re) || []).length
 }
 
-function countProvenanceLines(content: string): number {
-  return (content.match(/<!-- kasper:/g) || []).length
-}
-
 describe.skipIf(!ENABLED)(
   "e2e: injectSection accumulation — reproduces issue, verifies fix",
   () => {
@@ -139,8 +135,21 @@ describe.skipIf(!ENABLED)(
         expect(after).toContain(imp)
       }
 
-      // ── Tertiary: only ONE provenance line, not stacked.
-      expect(countProvenanceLines(after)).toBe(1)
+      // ── Tertiary: per-addition provenance — ONE line per apply, in order,
+      //    each directly above the entry it belongs to. (3 applies → 3 lines.)
+      const provenanceLines = after.match(/<!-- kasper: [^>]+-->/g) || []
+      expect(provenanceLines.length).toBe(3)
+      for (const imp of threeImprovements) {
+        // Each rule must have a provenance line directly above it in the file.
+        const re = new RegExp(
+          `<!-- kasper: [^>]+-->\n${imp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+        )
+        expect(after).toMatch(re)
+      }
+      // No section-level provenance directly under the header (the OLD format
+      // had this; the new per-addition format does not).
+      const afterHeader = after.split("## Kasper Inferred Instructions")[1]
+      expect(afterHeader).toMatch(/^\nold improvement/)
 
       // ── Quaternary: order is chronological (oldest first, newest last).
       const idxOld = after.indexOf("old improvement from a prior apply")

@@ -4,15 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [1.1.2] - 2026-06-16
 
-A patch release. Fixes a regression introduced in 1.1.0 where successive `/kasper apply` invocations on a project whose `AGENTS.md` (or agent prompt) had a `# Title` and intro paragraph BEFORE the `## Kasper Inferred Instructions` section produced nested `## Kasper Inferred Instructions` headers and lost earlier improvements on every apply.
+A patch release. Builds on the `injectSection` accumulation fix (see the prior commit on the `fix/injectSection-accumulate` branch) by changing the `<!-- kasper: ISO -->` provenance comment from a single section-level timestamp to a per-addition timestamp attached directly above each new entry.
 
-### Fixed
+### Changed
 
-- **`injectSection` accumulation broke when the target section was preceded by other content** — `agents-md.ts:injectSection` and `agent-prompts.ts:injectSection` shared a `bodyStrip` regex anchored at `^##` that required a literal `\r?\n` after the header name. `sectionRegex` captured a leading `\n` via `(?:^|\n)##...` whenever the section was not at the start of the file, so `match[0]` started with `\n## Section` and `bodyStrip.replace()` was a no-op. The un-stripped header was then re-emitted by the subsequent `existing.replace(sectionRegex, ...)`, producing a nested duplicate header on every apply. Real-world AGENTS.md / agent-prompt files always start with a `# Title` and intro paragraph, so the bug was triggered on first use for every user. The fix extracts `injectSectionContent()` as a pure helper in `src/prompt-utils.ts` that uses `match[0].slice(match[1].length)` to extract the body (robust to leading newlines, missing-newline-at-EOF, and CRLF line endings) and strips the optional existing provenance line so it does not stack on repeated applies. Both managers now delegate to the helper, eliminating the duplicated buggy logic. The helper always produces a file that ends with a single trailing newline.
+- **Provenance comments are now per-addition, not section-level** — `injectSectionContent()` used to write a single `<!-- kasper: ISO -->` line directly under the section header on every apply, overwriting the previous timestamp. The most recent improvement's timestamp therefore masqueraded as the section's creation time, which made it impossible to tell when each individual rule was added by reading just the file. The new shape attaches a `<!-- kasper: ISO -->` line directly above each new entry:
 
-### Added
+      ## Kasper Inferred Instructions
+      old rule
 
-- **End-to-end regression test** — `tests/e2e/inject-accumulation.test.ts` (run with `OPENCODE_E2E=1 bun test tests/e2e/inject-accumulation.test.ts`) exactly reproduces the bug-report steps: a realistic AGENTS.md with `# My Project` + intro + `## Kasper Inferred Instructions` + `## Conventions`, three `injectSection` calls back-to-back (mirroring three `/kasper apply` invocations), and an assertion that the file ends with exactly ONE `## Kasper Inferred Instructions` header and contains all three improvements. The test fails on the original buggy code with `Expected: 1, Received: 4`, proving it would have caught the original bug. A parallel test exercises the same scenario on `AgentPromptManager` with a YAML-frontmatter agent prompt, and a third covers the freshly-created-file path. The 1.1.0 release's unit tests covered only the case where the target section was the first thing in the file, which is why the bug slipped through.
+      <!-- kasper: 2026-06-15T10:00:00Z -->
+      rule 1
+
+      <!-- kasper: 2026-06-16T07:00:00Z -->
+      rule 2
+
+  Migration is non-destructive: files written by older versions had a section-level `<!-- kasper: ISO -->` line under the header. The new helper preserves that line verbatim (it now reads as the timestamp for the pre-existing rules block above it) and attaches new entries with their own per-addition timestamp from then on. Regression tests `U) migration: a SECOND apply after migration uses per-addition for the new entry only` and `V) per-addition: gap between header and first content stays constant across applies` in `tests/prompt-utils.test.ts` cover the migration case and the body-normalization fix that was caught during this change.
+
+### Notes
+
+- The accumulation fix itself (slice-based body extraction, no nested headers) is on the `fix/injectSection-accumulate` branch. This branch assumes that fix is already in place — `fix/per-addition-provenance` is intended to be merged AFTER `fix/injectSection-accumulate`.
 
 ## [1.1.1] - 2026-06-11
 
