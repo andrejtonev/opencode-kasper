@@ -233,7 +233,7 @@ describe("kasper scoring", () => {
       enabled: true,
       min_session_messages: 1,
       evaluation_poll_interval_ms: 2_000,
-      model: "opencode/gemini-3-flash",
+      model: "opencode-go/minimax-m2.7",
       scoring_timeout_ms: 60_000,
       detail_level: "minimal",
       quiet: true,

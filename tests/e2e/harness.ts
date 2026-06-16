@@ -146,15 +146,25 @@ export function hasTextOutput(events: OpencodeEvent[]): boolean {
 
 // ── opencode run (spawnSync, NDJSON) ────────────────────────────────────
 
+/**
+ * Default model for e2e tests. Smaller, faster, and more reliable in CI
+ * environments than `opencode/gemini-3-flash` (which the project originally
+ * targeted). Set the `KASPER_E2E_MODEL` env var to override.
+ */
+export const KASPER_E2E_MODEL =
+  process.env.KASPER_E2E_MODEL ?? "opencode-go/minimax-m2.7"
+
 export function runOpenCode(
   dir: string,
   prompt: string,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; model?: string },
 ): RunResult {
   const args = [
     "run",
     "--format",
     "json",
+    "--model",
+    opts?.model ?? KASPER_E2E_MODEL,
     "--dir",
     dir,
     "--dangerously-skip-permissions",
@@ -297,7 +307,7 @@ export function runAttach(
   dir: string,
   prompt: string,
   port = SERVE_PORT,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; model?: string },
 ): RunResult {
   const result = spawnSync(
     "opencode",
@@ -307,6 +317,8 @@ export function runAttach(
       `http://localhost:${port}`,
       "--format",
       "json",
+      "--model",
+      opts?.model ?? KASPER_E2E_MODEL,
       "--dir",
       dir,
       "--dangerously-skip-permissions",
