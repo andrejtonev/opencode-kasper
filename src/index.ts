@@ -4,6 +4,7 @@ import type { Config, Plugin } from "@opencode-ai/plugin"
 import type { Event, Part, UserMessage } from "@opencode-ai/sdk"
 import { AgentPromptManager } from "./agent-prompts.js"
 import { AgentsMdManager } from "./agents-md.js"
+import { resolveAgentsMdSource } from "./agents-md-resolver.js"
 import {
   ensureDefaultKasperConfigFile,
   loadKasperConfig,
@@ -315,7 +316,15 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     )
   }
 
-  const agentsMd = new AgentsMdManager(cwd, stateDir, BACKUP_MAX_VERSIONS)
+  const agentsMdSource = await resolveAgentsMdSource(cwd, {
+    agentsMdPaths: config.agents_md_paths,
+    globalOpencodeDir: globalDir,
+  })
+  const agentsMd = new AgentsMdManager(
+    agentsMdSource.primary,
+    stateDir,
+    BACKUP_MAX_VERSIONS,
+  )
   await agentsMd.init()
 
   const agentPrompts = new AgentPromptManager(

@@ -7,6 +7,7 @@ import {
   unlink,
 } from "node:fs/promises"
 import { join, parse } from "node:path"
+import { backupDirNameFor } from "./agents-md-resolver.js"
 import { acquireLock } from "./lock.js"
 import {
   escapeRegex,
@@ -24,11 +25,21 @@ export class AgentsMdManager {
   private cachedMtime = 0
 
   constructor(
-    private readonly projectRoot: string,
+    /**
+     * Absolute path to the resolved rules file. The caller (typically
+     * `index.ts`) runs `resolveAgentsMdSource` first and passes the
+     * `primary` field here. Defaults to `<projectRoot>/AGENTS.md` for
+     * backward compatibility with call sites that have not yet been
+     * migrated to the resolver.
+     */
+    private readonly resolvedPath: string,
     kasperStateDir: string,
     private maxBackups: number = 20,
   ) {
-    this.backupsDir = join(kasperStateDir, "backups", "AGENTS.md")
+    // The backup directory is keyed on the resolved path so multiple
+    // rules files (e.g. one per project) don't share a single bucket.
+    const dirName = backupDirNameFor(resolvedPath)
+    this.backupsDir = join(kasperStateDir, "backups", dirName)
   }
 
   invalidateCache(): void {
@@ -45,7 +56,7 @@ export class AgentsMdManager {
   }
 
   get agentsMdPath(): string {
-    return join(this.projectRoot, "AGENTS.md")
+    return this.resolvedPath
   }
 
   async backup(label: string): Promise<string> {

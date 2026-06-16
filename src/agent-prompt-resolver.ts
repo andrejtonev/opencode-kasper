@@ -125,6 +125,13 @@ async function dirExists(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * Exported so the AGENTS.md resolver can reuse the same `stat`-backed
+ * checks.
+ */
+export const _fileExists = fileExists
+export const _dirExists = dirExists
+
 async function loadJsoncIfExists(
   path: string,
 ): Promise<Record<string, unknown> | undefined> {
@@ -174,6 +181,12 @@ function candidateGlobalOpencodeDirs(): string[] {
   dirs.push(join(homedir(), ".opencode"))
   return [...new Set(dirs)]
 }
+
+/**
+ * Exported so the AGENTS.md resolver can reuse the same global-directory
+ * candidate list (XDG_CONFIG_HOME, APPDATA on win32, ~/.opencode fallback).
+ */
+export const _candidateGlobalOpencodeDirs = candidateGlobalOpencodeDirs
 
 interface LoadedConfig {
   path: string
