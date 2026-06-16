@@ -6,6 +6,7 @@ import { join } from "node:path"
 import {
   escapeRegex,
   exists,
+  injectSectionContent,
   parseTimestampFromFilename,
   timestampFilename,
   withPathWriteLock,
@@ -139,5 +140,265 @@ describe("writeTextAtomic", () => {
     const content = await readFile(path, "utf-8")
     expect(content).toBe("hello world")
     await rm(dir, { recursive: true, force: true })
+  })
+})
+
+describe("injectSectionContent", () => {
+  const NOW = new Date("2026-06-16T05:33:11.079Z")
+  const countMatches = (s: string, re: RegExp) => (s.match(re) || []).length
+
+  // ---- Section exists — accumulation behavior ----
+
+  test("A) section at start of file — no regression", () => {
+    const existing = "## My Section\nold rule\n## Other\nstuff"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("old rule")
+    expect(updated).toContain("new rule")
+    expect(countMatches(updated, /^## My Section/gm)).toBe(1)
+    expect(updated).toContain("## Other\nstuff")
+  })
+
+  test("B) section preceded by # Title — the bug case (regression test for Issue #1)", () => {
+    const existing =
+      "# Title\n\nIntro paragraph.\n\n## My Section\nold rule\n\n## Other\nstuff"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("Intro paragraph.")
+    expect(updated).toContain("old rule")
+    expect(updated).toContain("new rule")
+    // Critical: exactly ONE ## My Section header, not two.
+    expect(countMatches(updated, /^## My Section/gm)).toBe(1)
+    // Chronological order: old before new
+    expect(updated.indexOf("old rule")).toBeLessThan(
+      updated.indexOf("new rule"),
+    )
+    // Surrounding sections preserved
+    expect(updated).toContain("## Other")
+  })
+
+  test("C) section preceded by YAML frontmatter — common agent-prompt case", () => {
+    const existing =
+      "---\nmode: subagent\n---\n\nYou are a build agent.\n\n## Kasper Rules\nold rule\n\n## Other\nstuff"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "Kasper Rules",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("mode: subagent")
+    expect(updated).toContain("You are a build agent.")
+    expect(updated).toContain("old rule")
+    expect(updated).toContain("new rule")
+    // Critical: exactly ONE ## Kasper Rules header
+    expect(countMatches(updated, /^## Kasper Rules/gm)).toBe(1)
+  })
+
+  test("D) section at EOF with no trailing newline", () => {
+    const existing = "## My Section\nold rule" // no final \n
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("old rule")
+    expect(updated).toContain("new rule")
+    expect(countMatches(updated, /^## My Section/gm)).toBe(1)
+    // The file should now end with a newline (Issue #3 consistency)
+    expect(updated.endsWith("\n")).toBe(true)
+  })
+
+  test("E) section preceded by other section content", () => {
+    const existing =
+      "## Intro\nWelcome.\n\n## Kasper Rules\nfirst\n\n## Notes\nsee below"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "Kasper Rules",
+      "second",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("Welcome.")
+    expect(updated).toContain("first")
+    expect(updated).toContain("second")
+    expect(countMatches(updated, /^## Kasper Rules/gm)).toBe(1)
+    expect(countMatches(updated, /^## /gm)).toBe(3) // Intro, Kasper Rules, Notes
+  })
+
+  test("F) header-only section (## Section with no body)", () => {
+    const existing = "# Title\n\n## My Section"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "first rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(countMatches(updated, /^## My Section/gm)).toBe(1)
+    expect(updated).toContain("first rule")
+    expect(updated.endsWith("\n")).toBe(true)
+  })
+
+  test("G) double-apply accumulation — no nested headers, no stacked provenance", () => {
+    const existing = "# Title\n\nintro\n\n## Rules\nold\n"
+    const r1 = injectSectionContent(existing, "Rules", "rule 1", NOW)
+    const r2 = injectSectionContent(r1.updated, "Rules", "rule 2", NOW)
+    expect(r2.existed).toBe(true)
+    expect(r2.updated).toContain("old")
+    expect(r2.updated).toContain("rule 1")
+    expect(r2.updated).toContain("rule 2")
+    expect(countMatches(r2.updated, /^## Rules/gm)).toBe(1)
+    // Exactly ONE provenance line, not stacked
+    expect(countMatches(r2.updated, /<!-- kasper: 2026-06-16/g)).toBe(1)
+    // Order: old < rule 1 < rule 2
+    expect(r2.updated.indexOf("old")).toBeLessThan(r2.updated.indexOf("rule 1"))
+    expect(r2.updated.indexOf("rule 1")).toBeLessThan(
+      r2.updated.indexOf("rule 2"),
+    )
+  })
+
+  test("H) triple-apply accumulation", () => {
+    const existing = "# Title\n\n## Rules\nold\n"
+    let r = injectSectionContent(existing, "Rules", "a", NOW)
+    r = injectSectionContent(r.updated, "Rules", "b", NOW)
+    r = injectSectionContent(r.updated, "Rules", "c", NOW)
+    expect(r.updated).toContain("old")
+    expect(r.updated).toContain("a")
+    expect(r.updated).toContain("b")
+    expect(r.updated).toContain("c")
+    expect(countMatches(r.updated, /^## Rules/gm)).toBe(1)
+    expect(countMatches(r.updated, /<!-- kasper: 2026-06-16/g)).toBe(1)
+  })
+
+  test("I) section doesn't exist — appends new section at end", () => {
+    const existing = "# Title\n\nintro\n\n## Other\nstuff"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "Kasper Rules",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(false)
+    expect(updated).toContain("## Kasper Rules")
+    expect(updated).toContain("new rule")
+    expect(updated).toContain("## Other")
+    // New section appears AFTER existing sections
+    expect(updated.indexOf("## Other")).toBeLessThan(
+      updated.indexOf("## Kasper Rules"),
+    )
+  })
+
+  test("J) section doesn't exist, empty file", () => {
+    const { updated, existed } = injectSectionContent(
+      "",
+      "Kasper Rules",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(false)
+    expect(updated).toContain("## Kasper Rules")
+    expect(updated).toContain("new rule")
+    expect(updated.endsWith("\n")).toBe(true)
+  })
+
+  test("K) section name with regex special chars", () => {
+    const existing = "## My Section (v2.0)\nold\n"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section (v2.0)",
+      "new",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("old")
+    expect(updated).toContain("new")
+    expect(countMatches(updated, /^## My Section \(v2\.0\)/gm)).toBe(1)
+  })
+
+  test("L) CRLF line endings (Windows file)", () => {
+    const existing =
+      "# Title\r\n\r\n## My Section\r\nold rule\r\n\r\n## Other\r\nstuff\r\n"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "new rule",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("old rule")
+    expect(updated).toContain("new rule")
+    expect(countMatches(updated, /^## My Section/gm)).toBe(1)
+  })
+
+  test("M) section with extra whitespace in header (##   Section)", () => {
+    const existing = "# Title\n\n##   My Section\nold\n"
+    const { updated, existed } = injectSectionContent(
+      existing,
+      "My Section",
+      "new",
+      NOW,
+    )
+    expect(existed).toBe(true)
+    expect(updated).toContain("old")
+    expect(updated).toContain("new")
+    expect(countMatches(updated, /^##\s+My Section/gm)).toBe(1)
+  })
+
+  test("N) middle section preserves order: A < Target < B", () => {
+    const existing = "## A\naaa\n\n## Target\nold\n\n## B\nbbb"
+    const { updated } = injectSectionContent(existing, "Target", "new", NOW)
+    const aIdx = updated.indexOf("## A")
+    const tIdx = updated.indexOf("## Target")
+    const bIdx = updated.indexOf("## B")
+    expect(aIdx).toBeGreaterThan(-1)
+    expect(tIdx).toBeGreaterThan(aIdx)
+    expect(bIdx).toBeGreaterThan(tIdx)
+    expect(updated.indexOf("aaa")).toBeLessThan(updated.indexOf("old"))
+    expect(updated.indexOf("old")).toBeLessThan(updated.indexOf("new"))
+    expect(updated.indexOf("new")).toBeLessThan(updated.indexOf("bbb"))
+  })
+
+  test("O) accumulated content has blank-line separator", () => {
+    const existing = "## Rules\nfirst"
+    const { updated } = injectSectionContent(existing, "Rules", "second", NOW)
+    // The helper should join with `\n\n` between old and new
+    expect(updated).toMatch(/first\n\nsecond/)
+  })
+
+  test("P) provenance line appears immediately after section header", () => {
+    const existing = "## Rules\nfirst"
+    const { updated } = injectSectionContent(existing, "Rules", "second", NOW)
+    const headerIdx = updated.indexOf("## Rules")
+    const provIdx = updated.indexOf("<!-- kasper:")
+    const bodyIdx = updated.indexOf("first")
+    expect(headerIdx).toBeGreaterThan(-1)
+    expect(provIdx).toBeGreaterThan(headerIdx)
+    expect(bodyIdx).toBeGreaterThan(provIdx)
+  })
+
+  test("Q) repeated apply strips old provenance so it doesn't stack", () => {
+    // If the bug is reintroduced, every apply will add a provenance line at
+    // the top of the body, leading to N provenance lines after N applies.
+    let existing = "# Title\n\n## Rules\nold\n"
+    for (let i = 0; i < 5; i++) {
+      const r = injectSectionContent(existing, "Rules", `r${i}`, NOW)
+      existing = r.updated
+    }
+    expect(countMatches(existing, /<!-- kasper:/g)).toBe(1)
+    // And still only one header
+    expect(countMatches(existing, /^## Rules/gm)).toBe(1)
   })
 })

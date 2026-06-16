@@ -84,7 +84,7 @@ describe("AgentsMdManager", () => {
       )
     })
 
-    test("replaces existing section with same name", () => {
+    test("accumulates content in existing section", () => {
       const existing = "## My Section\nold content\n## Other\nother stuff"
       const result = manager.injectSection(
         existing,
@@ -92,17 +92,17 @@ describe("AgentsMdManager", () => {
         "new content",
       )
       expect(result).toContain("new content")
-      expect(result).not.toContain("old content")
+      expect(result).toContain("old content")
       expect(result).toContain("## Other")
     })
 
-    test("trims trailing whitespace from replacement", () => {
+    test("trims trailing whitespace and preserves old", () => {
       const existing = "## My Section\nold\n"
       const result = manager.injectSection(existing, "My Section", "new\n\n")
       expect(result).toContain("## My Section")
       expect(result).toContain("new")
+      expect(result).toContain("old")
       expect(result).toMatch(/<!-- kasper:/)
-      expect(result).not.toContain("old")
     })
 
     test("section header includes section name", () => {
@@ -112,6 +112,145 @@ describe("AgentsMdManager", () => {
         "rules",
       )
       expect(result).toContain("## Kasper Inferred Instructions")
+    })
+
+    test("preserves existing section body and adds new content", () => {
+      const existing = "## My Section\nold rule\n## Other\nstuff"
+      const result = manager.injectSection(existing, "My Section", "new rule")
+      expect(result).toContain("old rule")
+      expect(result).toContain("new rule")
+      expect(result).toContain("## Other")
+      expect(result).toMatch(/<!-- kasper:/)
+    })
+
+    test("when section doesn't exist, creates it as normal", () => {
+      const existing = "## Existing\nstuff"
+      const result = manager.injectSection(
+        existing,
+        "New Section",
+        "fresh content",
+      )
+      expect(result).toContain("fresh content")
+      expect(result).toContain("## New Section")
+      expect(result).toContain("## Existing")
+    })
+
+    test("accumulates multiple improvements in order", () => {
+      let doc = "## Rules\ncode of conduct\n"
+      doc = manager.injectSection(doc, "Rules", "first rule")
+      doc = manager.injectSection(doc, "Rules", "second rule")
+      expect(doc).toContain("first rule")
+      expect(doc).toContain("second rule")
+      expect(doc).toContain("code of conduct")
+    })
+
+    // ---- Regression tests for the critical regex-anchoring bug (Issue #1) ----
+
+    test("does NOT produce nested headers when section is preceded by # Title", () => {
+      // This is the real-world case that the original PR did not cover: a
+      // typical AGENTS.md starts with a # Title and intro paragraphs.
+      const existing =
+        "# My Project\n\nIntro paragraph.\n\n## Kasper Inferred Instructions\nold rule\n\n## Other\nstuff"
+      const result = manager.injectSection(
+        existing,
+        "Kasper Inferred Instructions",
+        "new rule",
+      )
+      // Critical assertion: exactly ONE ## Kasper Inferred Instructions header
+      const headerCount = (
+        result.match(/^## Kasper Inferred Instructions/gm) || []
+      ).length
+      expect(headerCount).toBe(1)
+      expect(result).toContain("old rule")
+      expect(result).toContain("new rule")
+      expect(result).toContain("## Other")
+      expect(result).toContain("# My Project")
+      // Chronological order: old < new
+      expect(result.indexOf("old rule")).toBeLessThan(
+        result.indexOf("new rule"),
+      )
+    })
+
+    test("does NOT produce nested headers when section is preceded by another ## section", () => {
+      const existing =
+        "## Intro\nWelcome.\n\n## Kasper Inferred Instructions\nold\n\n## Notes\nsee below"
+      const result = manager.injectSection(
+        existing,
+        "Kasper Inferred Instructions",
+        "new",
+      )
+      const headerCount = (
+        result.match(/^## Kasper Inferred Instructions/gm) || []
+      ).length
+      expect(headerCount).toBe(1)
+      const totalHeaders = (result.match(/^## /gm) || []).length
+      expect(totalHeaders).toBe(3)
+    })
+
+    test("double-apply produces only ONE provenance line (no stacking)", () => {
+      let doc = "# Title\n\nintro\n\n## Rules\nold\n"
+      doc = manager.injectSection(doc, "Rules", "rule 1")
+      doc = manager.injectSection(doc, "Rules", "rule 2")
+      const provenanceCount = (doc.match(/<!-- kasper:/g) || []).length
+      expect(provenanceCount).toBe(1)
+    })
+
+    test("triple-apply still produces only ONE header (no accumulation bug)", () => {
+      let doc = "## Rules\nold\n"
+      doc = manager.injectSection(doc, "Rules", "a")
+      doc = manager.injectSection(doc, "Rules", "b")
+      doc = manager.injectSection(doc, "Rules", "c")
+      const headerCount = (doc.match(/^## Rules/gm) || []).length
+      expect(headerCount).toBe(1)
+      expect(doc).toContain("old")
+      expect(doc).toContain("a")
+      expect(doc).toContain("b")
+      expect(doc).toContain("c")
+    })
+
+    test("preserves trailing newline when section is the last thing in the file", () => {
+      // Issue #3: the new-section path always ended with \n; the old
+      // replace path sometimes dropped the trailing newline.
+      const result = manager.injectSection(
+        "## My Section\nold",
+        "My Section",
+        "new",
+      )
+      expect(result.endsWith("\n")).toBe(true)
+    })
+
+    test("preserves content order: A < Target < B when target is in the middle", () => {
+      const existing = "## A\naaa\n\n## Target\nold\n\n## B\nbbb"
+      const result = manager.injectSection(existing, "Target", "new")
+      const aIdx = result.indexOf("## A")
+      const tIdx = result.indexOf("## Target")
+      const bIdx = result.indexOf("## B")
+      expect(aIdx).toBeGreaterThan(-1)
+      expect(tIdx).toBeGreaterThan(aIdx)
+      expect(bIdx).toBeGreaterThan(tIdx)
+      expect(result.indexOf("aaa")).toBeLessThan(result.indexOf("old"))
+      expect(result.indexOf("old")).toBeLessThan(result.indexOf("new"))
+      expect(result.indexOf("new")).toBeLessThan(result.indexOf("bbb"))
+    })
+
+    test("handles section name with regex special characters", () => {
+      const existing = "## My Section (v2.0)\nold\n"
+      const result = manager.injectSection(existing, "My Section (v2.0)", "new")
+      const headerCount = (result.match(/^## My Section \(v2\.0\)/gm) || [])
+        .length
+      expect(headerCount).toBe(1)
+      expect(result).toContain("old")
+      expect(result).toContain("new")
+    })
+
+    test("CRLF line endings: still produces only one header", () => {
+      const existing =
+        "# Title\r\n\r\n## My Section\r\nold rule\r\n\r\n## Other\r\nstuff\r\n"
+      const result = manager.injectSection(existing, "My Section", "new rule")
+      const headerCount = (result.match(/^## My Section/gm) || []).length
+      expect(headerCount).toBe(1)
+      expect(result).toContain("old rule")
+      expect(result).toContain("new rule")
     })
   })
 
