@@ -11,6 +11,7 @@ import { acquireLock } from "./lock.js"
 import {
   escapeRegex,
   exists,
+  injectSectionContent,
   parseTimestampFromFilename,
   timestampFilename,
   writeTextAtomic,
@@ -170,23 +171,9 @@ export class AgentsMdManager {
     sectionName: string,
     content: string,
   ): string {
-    const header = this.sectionHeader(sectionName)
-    const sectionRegex = new RegExp(
-      `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
-    )
-    const provenance = `<!-- kasper: ${new Date().toISOString()} -->\n`
-    const sectionBlock = `${header}\n${provenance}${content.trim()}\n`
-
-    if (sectionRegex.test(existing)) {
-      return existing.replace(
-        sectionRegex,
-        `$1\n${provenance}${content.trim()}`,
-      )
-    }
-
-    const eofSection = `${sectionBlock}\n`
-    const trimmed = existing.trimEnd()
-    return trimmed ? `${trimmed}\n\n${eofSection}` : eofSection
+    // Delegates to the shared helper. Kept as a method on AgentsMdManager
+    // because the existing public API is `(existing, sectionName, content)`.
+    return injectSectionContent(existing, sectionName, content).updated
   }
 
   removeSection(existing: string, sectionName: string): string {

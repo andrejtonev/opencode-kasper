@@ -117,3 +117,55 @@ export async function writeTextAtomic(
       : new Error(String(lastError ?? "atomic write failed"))
   })
 }
+
+/**
+ * Inject content into a markdown section. If the section already exists, the
+ * existing body is preserved and the new content is appended after a blank
+ * line. A provenance comment `<!-- kasper: ISO -->` is always written directly
+ * after the section header so the section's "last updated" timestamp is
+ * visible without scanning the body.
+ *
+ * Always produces a file that ends with a single trailing newline.
+ *
+ * Pure function (no I/O) so it is trivially testable.
+ */
+export function injectSectionContent(
+  existing: string,
+  sectionName: string,
+  newContent: string,
+  now: Date = new Date(),
+): { updated: string; existed: boolean } {
+  const sectionRegex = new RegExp(
+    `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
+  )
+  const provenance = `<!-- kasper: ${now.toISOString()} -->\n`
+
+  const match = existing.match(sectionRegex)
+  if (match) {
+    // match[1] is the captured header (including the optional leading \n).
+    // Slice it off the front of match[0] to get the body — this is robust to
+    // the body starting with a newline (when the section is not at the start
+    // of the file) or directly after the header (EOF case).
+    const headerMatched = match[1]
+    const body = match[0].slice(headerMatched.length)
+    // Strip the optional provenance line at the start of the body so we
+    // don't stack timestamps on every apply.
+    const bodyStripped = body.replace(/^\r?\n(?:<!-- kasper:.*?-->\r?\n)?/, "")
+    const existingBody = bodyStripped.trim()
+    const finalContent = existingBody
+      ? `${existingBody}\n\n${newContent.trim()}`
+      : newContent.trim()
+    const updated = existing.replace(
+      sectionRegex,
+      `${headerMatched}\n${provenance}${finalContent}\n`,
+    )
+    return { updated, existed: true }
+  }
+
+  // Section does not exist — append it at the end of the file.
+  const header = `## ${sectionName}`
+  const sectionBlock = `${header}\n${provenance}${newContent.trim()}\n`
+  const trimmed = existing.trimEnd()
+  const updated = trimmed ? `${trimmed}\n\n${sectionBlock}` : sectionBlock
+  return { updated, existed: false }
+}

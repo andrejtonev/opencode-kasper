@@ -9,6 +9,7 @@ import { acquireLock } from "./lock.js"
 import {
   escapeRegex,
   exists,
+  injectSectionContent,
   timestampFilename,
   writeTextAtomic,
 } from "./prompt-utils.js"
@@ -278,27 +279,22 @@ export class AgentPromptManager {
       let updated: string
       if (injectMode === "inline") {
         updated = appendInlineImprovement(existing, content.trim())
+      } else if (!existing.trim()) {
+        // Empty file: create with frontmatter + a fresh section.
+        const sectionBlock = `## ${sectionName}\n<!-- kasper: ${new Date().toISOString()} -->\n${content.trim()}\n`
+        const frontmatter = `---\nmode: ${mode}\n---\n\n`
+        updated = `${frontmatter + sectionBlock}\n`
       } else {
-        const header = `## ${sectionName}`
-        const sectionRegex = new RegExp(
-          `((?:^|\\n)##\\s*${escapeRegex(sectionName)})[\\s\\S]*?(?=\\r?\\n##|$)`,
+        // Section-mode on a non-empty file: delegate to the shared helper.
+        // The helper handles accumulation when the section already exists and
+        // appends a new section when it does not. In both cases the file ends
+        // with a trailing newline.
+        const result = injectSectionContent(
+          existing,
+          sectionName,
+          content.trim(),
         )
-        const provenance = `<!-- kasper: ${new Date().toISOString()} -->\n`
-        const sectionBlock = `${header}\n${provenance}${content.trim()}\n`
-
-        if (!existing.trim()) {
-          const frontmatter = `---\nmode: ${mode}\n---\n\n`
-          updated = `${frontmatter + sectionBlock}\n`
-        } else if (sectionRegex.test(existing)) {
-          updated = existing.replace(
-            sectionRegex,
-            `$1\n${provenance}${content.trim()}`,
-          )
-        } else {
-          const eofSection = `${sectionBlock}\n`
-          const trimmed = existing.trimEnd()
-          updated = trimmed ? `${trimmed}\n\n${eofSection}` : eofSection
-        }
+        updated = result.updated
       }
 
       let backupPath: string | undefined
