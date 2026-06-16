@@ -187,12 +187,16 @@ describe("AgentsMdManager", () => {
       expect(totalHeaders).toBe(3)
     })
 
-    test("double-apply produces only ONE provenance line (no stacking)", () => {
+    test("double-apply produces ONE provenance line per apply (per-addition provenance)", () => {
       let doc = "# Title\n\nintro\n\n## Rules\nold\n"
       doc = manager.injectSection(doc, "Rules", "rule 1")
       doc = manager.injectSection(doc, "Rules", "rule 2")
+      // Per-addition provenance: 2 applies → 2 provenance lines (one per entry).
       const provenanceCount = (doc.match(/<!-- kasper:/g) || []).length
-      expect(provenanceCount).toBe(1)
+      expect(provenanceCount).toBe(2)
+      // Each provenance line should appear IMMEDIATELY before its entry's content.
+      expect(doc).toMatch(/<!-- kasper:[^>]+-->\nrule 1/)
+      expect(doc).toMatch(/<!-- kasper:[^>]+-->\nrule 2/)
     })
 
     test("triple-apply still produces only ONE header (no accumulation bug)", () => {
