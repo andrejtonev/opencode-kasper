@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.2] - 2026-06-16
+
+A patch release. Fixes a regression introduced in 1.1.0 where successive `/kasper apply` invocations on a project whose `AGENTS.md` (or agent prompt) had a `# Title` and intro paragraph BEFORE the `## Kasper Inferred Instructions` section produced nested `## Kasper Inferred Instructions` headers and lost earlier improvements on every apply.
+
+### Fixed
+
+- **`injectSection` accumulation broke when the target section was preceded by other content** — `agents-md.ts:injectSection` and `agent-prompts.ts:injectSection` shared a `bodyStrip` regex anchored at `^##` that required a literal `\r?\n` after the header name. `sectionRegex` captured a leading `\n` via `(?:^|\n)##...` whenever the section was not at the start of the file, so `match[0]` started with `\n## Section` and `bodyStrip.replace()` was a no-op. The un-stripped header was then re-emitted by the subsequent `existing.replace(sectionRegex, ...)`, producing a nested duplicate header on every apply. Real-world AGENTS.md / agent-prompt files always start with a `# Title` and intro paragraph, so the bug was triggered on first use for every user. The fix extracts `injectSectionContent()` as a pure helper in `src/prompt-utils.ts` that uses `match[0].slice(match[1].length)` to extract the body (robust to leading newlines, missing-newline-at-EOF, and CRLF line endings) and strips the optional existing provenance line so it does not stack on repeated applies. Both managers now delegate to the helper, eliminating the duplicated buggy logic. The helper always produces a file that ends with a single trailing newline.
+
+### Added
+
+- **End-to-end regression test** — `tests/e2e/inject-accumulation.test.ts` (run with `OPENCODE_E2E=1 bun test tests/e2e/inject-accumulation.test.ts`) exactly reproduces the bug-report steps: a realistic AGENTS.md with `# My Project` + intro + `## Kasper Inferred Instructions` + `## Conventions`, three `injectSection` calls back-to-back (mirroring three `/kasper apply` invocations), and an assertion that the file ends with exactly ONE `## Kasper Inferred Instructions` header and contains all three improvements. The test fails on the original buggy code with `Expected: 1, Received: 4`, proving it would have caught the original bug. A parallel test exercises the same scenario on `AgentPromptManager` with a YAML-frontmatter agent prompt, and a third covers the freshly-created-file path. The 1.1.0 release's unit tests covered only the case where the target section was the first thing in the file, which is why the bug slipped through.
+
 ## [1.1.1] - 2026-06-11
 
 A patch release. Fixes a false-positive on every startup, removes a startup-time hang in the worst case, and corrects a misleading example in the README.
