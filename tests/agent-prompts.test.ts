@@ -68,7 +68,7 @@ describe("AgentPromptManager", () => {
       expect(content).toContain("be faster")
     })
 
-    test("replaces existing section with same name", async () => {
+    test("accumulates content in existing section", async () => {
       await manager.write(
         "build",
         "## Kasper Rules\nold rule\n\n## Other\nstuff",
@@ -76,7 +76,7 @@ describe("AgentPromptManager", () => {
       await manager.injectSection("build", "Kasper Rules", "new rule")
       const content = await manager.read("build")
       expect(content).toContain("new rule")
-      expect(content).not.toContain("old rule")
+      expect(content).toContain("old rule")
       expect(content).toContain("## Other")
     })
 
@@ -86,6 +86,264 @@ describe("AgentPromptManager", () => {
       const content = await manager.read("build")
       expect(content).toContain("## Other")
       expect(content).toContain("## New Section")
+    })
+
+    test("preserves existing section body and adds new content", async () => {
+      await manager.write(
+        "build",
+        "## Kasper Rules\nold rule\n\n## Other\nstuff",
+      )
+      await manager.injectSection(
+        "build",
+        "Kasper Rules",
+        "new rule",
+        true, // backupEnabled
+        20, // maxBackups
+        "subagent", // mode
+        "section", // injectMode
+      )
+      const content = await manager.read("build")
+      expect(content).toContain("old rule")
+      expect(content).toContain("new rule")
+      expect(content).toContain("## Other")
+    })
+
+    test("accumulates multiple improvements", async () => {
+      await manager.write("build", "")
+      await manager.injectSection(
+        "build",
+        "Rules",
+        "rule 1",
+        true,
+        20,
+        "subagent",
+        "section",
+      )
+      await manager.injectSection(
+        "build",
+        "Rules",
+        "rule 2",
+        true,
+        20,
+        "subagent",
+        "section",
+      )
+      const content = await manager.read("build")
+      expect(content).toContain("rule 1")
+      expect(content).toContain("rule 2")
+    })
+
+    test("default call accumulates existing content", async () => {
+      await manager.write(
+        "build",
+        "## Kasper Rules\nold rule\n\n## Other\nstuff",
+      )
+      await manager.injectSection("build", "Kasper Rules", "new rule")
+      const content = await manager.read("build")
+      expect(content).toContain("new rule")
+      expect(content).toContain("old rule")
+    })
+
+    // ---- Regression tests for the critical regex-anchoring bug (Issue #1) ----
+
+    test("does NOT produce nested headers when section is preceded by frontmatter", async () => {
+      // The most common real-world case for an agent prompt file: it
+      // starts with YAML frontmatter and a description.
+      const frontmatter = [
+        "---",
+        "description: My agent",
+        "mode: subagent",
+        "---",
+        "",
+        "# My Agent",
+        "",
+        "Follow these rules:",
+        "  1. Be polite",
+        "  2. Be thorough",
+        "",
+        "## Kasper Inferred Instructions",
+        "old rule",
+        "",
+      ].join("\n")
+      await manager.write("build", frontmatter)
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "new rule",
+      )
+      const content = await manager.read("build")
+      // Critical: exactly ONE ## Kasper Inferred Instructions header
+      const headerCount = (
+        content.match(/^## Kasper Inferred Instructions/gm) || []
+      ).length
+      expect(headerCount).toBe(1)
+      expect(content).toContain("old rule")
+      expect(content).toContain("new rule")
+      // Frontmatter and pre-section content preserved
+      expect(content).toContain("description: My agent")
+      expect(content).toContain("Follow these rules:")
+      expect(content).toContain("Be polite")
+      // Chronological order
+      expect(content.indexOf("old rule")).toBeLessThan(
+        content.indexOf("new rule"),
+      )
+    })
+
+    test("does NOT produce nested headers when section is preceded by # Title and intro", async () => {
+      const existing =
+        "# My Build Agent\n\nIntro paragraph.\n\n## Kasper Inferred Instructions\nold rule\n\n## Other\nstuff"
+      await manager.write("build", existing)
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "new rule",
+      )
+      const content = await manager.read("build")
+      const headerCount = (
+        content.match(/^## Kasper Inferred Instructions/gm) || []
+      ).length
+      expect(headerCount).toBe(1)
+      expect(content).toContain("Intro paragraph.")
+      expect(content).toContain("old rule")
+      expect(content).toContain("new rule")
+    })
+
+    test("double-apply produces ONE provenance line per apply (per-addition provenance)", async () => {
+      await manager.write("build", "# Title\n\nintro\n\n## Rules\nold\n")
+      await manager.injectSection("build", "Rules", "rule 1")
+      await manager.injectSection("build", "Rules", "rule 2")
+      const content = await manager.read("build")
+      // Per-addition provenance: 2 applies → 2 provenance lines.
+      const provenanceCount = (content.match(/<!-- kasper:/g) || []).length
+      expect(provenanceCount).toBe(2)
+      // Each provenance line should appear IMMEDIATELY before its entry's content.
+      expect(content).toMatch(/<!-- kasper:[^>]+-->\nrule 1/)
+      expect(content).toMatch(/<!-- kasper:[^>]+-->\nrule 2/)
+    })
+
+    test("triple-apply still produces only ONE header (no accumulation bug)", async () => {
+      await manager.write("build", "## Rules\nold\n")
+      await manager.injectSection("build", "Rules", "a")
+      await manager.injectSection("build", "Rules", "b")
+      await manager.injectSection("build", "Rules", "c")
+      const content = await manager.read("build")
+      const headerCount = (content.match(/^## Rules/gm) || []).length
+      expect(headerCount).toBe(1)
+      expect(content).toContain("old")
+      expect(content).toContain("a")
+      expect(content).toContain("b")
+      expect(content).toContain("c")
+    })
+
+    test("preserves trailing newline when section is the last thing in the file", async () => {
+      await manager.write("build", "## My Section\nold")
+      await manager.injectSection("build", "My Section", "new")
+      const content = await manager.read("build")
+      expect(content.endsWith("\n")).toBe(true)
+    })
+
+    test("preserves content order: A < Target < B when target is in the middle", async () => {
+      await manager.write("build", "## A\naaa\n\n## Target\nold\n\n## B\nbbb")
+      await manager.injectSection("build", "Target", "new")
+      const content = await manager.read("build")
+      expect(content.indexOf("## A")).toBeGreaterThan(-1)
+      expect(content.indexOf("## Target")).toBeGreaterThan(
+        content.indexOf("## A"),
+      )
+      expect(content.indexOf("## B")).toBeGreaterThan(
+        content.indexOf("## Target"),
+      )
+      expect(content.indexOf("aaa")).toBeLessThan(content.indexOf("old"))
+      expect(content.indexOf("old")).toBeLessThan(content.indexOf("new"))
+      expect(content.indexOf("new")).toBeLessThan(content.indexOf("bbb"))
+    })
+
+    test("CRLF line endings: still produces only one header", async () => {
+      await manager.write(
+        "build",
+        "# Title\r\n\r\n## My Section\r\nold rule\r\n\r\n## Other\r\nstuff\r\n",
+      )
+      await manager.injectSection("build", "My Section", "new rule")
+      const content = await manager.read("build")
+      const headerCount = (content.match(/^## My Section/gm) || []).length
+      expect(headerCount).toBe(1)
+      expect(content).toContain("old rule")
+      expect(content).toContain("new rule")
+    })
+
+    test("5x repeated apply: exactly one header, 5 provenance lines, all rules preserved", async () => {
+      await manager.write("build", "## Rules\nold\n")
+      for (let i = 0; i < 5; i++) {
+        await manager.injectSection("build", "Rules", `r${i}`)
+      }
+      const content = await manager.read("build")
+      expect((content.match(/^## Rules/gm) || []).length).toBe(1)
+      // Per-addition provenance: 5 applies → 5 provenance lines.
+      expect((content.match(/<!-- kasper:/g) || []).length).toBe(5)
+      expect(content).toContain("old")
+      for (let i = 0; i < 5; i++) {
+        expect(content).toContain(`r${i}`)
+        // Each rule has its own provenance line directly above it.
+        expect(content).toMatch(new RegExp(`<!-- kasper:[^>]+-->\\nr${i}\\b`))
+      }
+    })
+
+    test("per-addition: each entry's timestamp is directly above its content", async () => {
+      await manager.write(
+        "build",
+        "---\nmode: subagent\n---\n\n# Build\n\n## Kasper Inferred Instructions\nold rule\n",
+      )
+      // No way to inject different timestamps via the public API (it uses
+      // `new Date()`), so we just verify the SHAPE: provenance directly
+      // above each entry, in order, no section-level provenance.
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "rule A",
+      )
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "rule B",
+      )
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "rule C",
+      )
+      const content = await manager.read("build")
+      // 3 provenance lines, all at entry-level
+      expect((content.match(/<!-- kasper:/g) || []).length).toBe(3)
+      // No provenance line directly under the section header (the old
+      // section-level format had this; the new per-addition format does not).
+      const afterHeader = content.split("## Kasper Inferred Instructions")[1]
+      expect(afterHeader).toMatch(/^\nold rule/)
+    })
+
+    test("migration: legacy section-level timestamp is preserved on the next apply", async () => {
+      // A file written by the previous version of kasper has:
+      //   ## Kasper Inferred Instructions
+      //   <!-- kasper: OLD_TS -->
+      //   old rule
+      // The new helper must preserve the OLD_TS line and append a new
+      // per-addition provenance for the new entry — no destructive rewrite.
+      const OLD_TS = "2026-06-10T08:00:00.000Z"
+      await manager.write(
+        "build",
+        `## Kasper Inferred Instructions\n<!-- kasper: ${OLD_TS} -->\nold rule\n`,
+      )
+      await manager.injectSection(
+        "build",
+        "Kasper Inferred Instructions",
+        "new rule",
+      )
+      const content = await manager.read("build")
+      // Legacy timestamp is preserved
+      expect(content).toContain(OLD_TS)
+      // New entry has its own provenance
+      expect((content.match(/<!-- kasper:/g) || []).length).toBe(2)
+      expect(content).toContain("old rule")
+      expect(content).toContain("new rule")
     })
   })
 
