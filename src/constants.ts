@@ -33,6 +33,14 @@ export const BACKUP_MAX_VERSIONS = 20
 // bounds the log so a long-lived session doesn't grow without limit.
 export const LOG_MAX_LINES = 5000
 export const MAX_HISTORY = 100
+
+// Default for the configurable `min_observations_for_update` field
+// (KasperConfig / DEFAULT_CONFIG in src/types.ts). Exported for
+// symmetry with the other tunable defaults, but the runtime gate at
+// src/evaluate.ts:1679 reads `config.min_observations_for_update`,
+// NOT this constant. Tests reference this name in comments but the
+// import site is zero. Kept here so a future "reset to default" path
+// has a single source of truth.
 export const MIN_OBSERVATIONS_FOR_UPDATE = 2
 
 // Built-in opencode agent names per https://opencode.ai/docs/agents.
