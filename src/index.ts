@@ -187,13 +187,13 @@ async function probePaths(
 
 async function runHealthCheck(
   stateDir: string,
-  cwd: string,
   config: KasperConfig,
   logger: KasperLogger,
+  agentsMdPath: string,
+  agentsMdReason: string,
 ): Promise<HealthReport> {
   const backupDir = join(stateDir, "backups")
   const lockPath = join(stateDir, "state.json.lock")
-  const agentsMdPath = join(cwd, "AGENTS.md")
   const stateFilePath = join(stateDir, "state.json")
 
   const checks = await probePaths([
@@ -212,8 +212,11 @@ async function runHealthCheck(
     {
       name: "agents_md",
       path: agentsMdPath,
-      presentDetail: agentsMdPath,
-      absentDetail: "no AGENTS.md found in project root",
+      // Surface the resolver's reason so the user can tell where the
+      // path came from (configured / local-walkup / global-opencode /
+      // global-claude / opencode-config-dir / fallback-project-root).
+      presentDetail: `${agentsMdPath} (${agentsMdReason})`,
+      absentDetail: `no rules file found at resolved location (${agentsMdReason})`,
     },
     {
       name: "backup_dir",
@@ -289,7 +292,25 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     threshold: config.scoring_threshold,
   })
 
-  const health = await runHealthCheck(stateDir, cwd, config, logger)
+  // Resolve the project's rules file BEFORE the health check so the
+  // health check reports the path the resolver will actually use
+  // (which may be a configured `agents_md_paths` entry, an ancestor's
+  // AGENTS.md, the global opencode dir, or `~/.claude/CLAUDE.md`).
+  // Pre-fix the health check hardcoded `<cwd>/AGENTS.md` and reported
+  // it as missing even when the resolver had found a valid file
+  // elsewhere.
+  const agentsMdSource = await resolveAgentsMdSource(cwd, {
+    agentsMdPaths: config.agents_md_paths,
+    globalOpencodeDir: globalDir,
+  })
+
+  const health = await runHealthCheck(
+    stateDir,
+    config,
+    logger,
+    agentsMdSource.primary,
+    agentsMdSource.reason,
+  )
   if (!health.ok) {
     const failChecks = health.checks.filter((c) => !c.ok)
     for (const c of failChecks) {
@@ -316,10 +337,6 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     )
   }
 
-  const agentsMdSource = await resolveAgentsMdSource(cwd, {
-    agentsMdPaths: config.agents_md_paths,
-    globalOpencodeDir: globalDir,
-  })
   const agentsMd = new AgentsMdManager(
     agentsMdSource.primary,
     stateDir,
@@ -396,12 +413,25 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
       ctx.config = fresh
       ctx.stateStore.reloadConfig(fresh)
       ctx.scorer.reloadModel(fresh)
-      ctx.agentsMd.invalidateCache()
+      // Re-resolve the rules file if `agents_md_paths` changed, and
+      // push the new resolver inputs into the agent-prompt manager.
+      // Pre-fix, the reload timer only invalidated the AGENTS.md
+      // *content* cache — it left the managers pinned to old paths
+      // until opencode restarted, so editing `agents_md_paths` or
+      // `prompt_paths` in `kasper.json` had no effect (B4).
+      const newAgentsMdSource = await resolveAgentsMdSource(cwd, {
+        agentsMdPaths: fresh.agents_md_paths,
+        globalOpencodeDir: globalDir,
+      })
+      ctx.agentsMd.setResolvedPath(newAgentsMdSource.primary)
+      ctx.agentPrompts.setResolverInputs(globalDir, fresh.prompt_paths)
       await ctx.logger.log("config_reloaded", {
         model: fresh.model,
         prevModel,
         autoUpdate: fresh.auto_update,
         threshold: fresh.scoring_threshold,
+        agentsMdPath: newAgentsMdSource.primary,
+        agentsMdReason: newAgentsMdSource.reason,
       })
     } catch {
       await ctx.logger.log("debug", {

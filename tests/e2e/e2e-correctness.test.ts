@@ -305,8 +305,16 @@ describe("log-verified scoring", () => {
       }
 
       // At minimum: we should have scoring_session_created and evaluation_done
-      expect(hasLogEventForSession(logEntries, "scoring_session_created", r.sessionID)).toBe(true)
-      expect(hasLogEventForSession(logEntries, "evaluation_done", r.sessionID)).toBe(true)
+      expect(
+        hasLogEventForSession(
+          logEntries,
+          "scoring_session_created",
+          r.sessionID,
+        ),
+      ).toBe(true)
+      expect(
+        hasLogEventForSession(logEntries, "evaluation_done", r.sessionID),
+      ).toBe(true)
     } else {
       log("(warn) no scoring — checking what log events exist")
       const allEvents = [...new Set(logEntries.map((e) => e.event))]

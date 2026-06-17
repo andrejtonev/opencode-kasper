@@ -81,18 +81,37 @@ export class AgentPromptManager {
     { source: AgentPromptSource; ts: number }
   >()
   private static readonly SOURCE_CACHE_TTL_MS = 30_000
+  private globalOpencodeDir: string | undefined
+  private customPromptPaths: readonly string[] | undefined
 
   constructor(
     private readonly projectRoot: string,
     readonly kasperStateDir: string,
-    private readonly globalOpencodeDir?: string,
-    private readonly customPromptPaths?: readonly string[],
+    globalOpencodeDir?: string,
+    customPromptPaths?: readonly string[],
   ) {
     this.backupsDir = join(kasperStateDir, "backups", "agents")
+    this.globalOpencodeDir = globalOpencodeDir
+    this.customPromptPaths = customPromptPaths
   }
 
   async init(): Promise<void> {
     await mkdir(this.backupsDir, { recursive: true })
+  }
+
+  /**
+   * Update the resolver inputs that come from `kasper.json` at runtime.
+   * Used by the config reload timer when the user edits `prompt_paths`
+   * or the global opencode dir config. Clears the source cache so the
+   * next `resolve()` call re-resolves against the new inputs.
+   */
+  setResolverInputs(
+    globalOpencodeDir: string | undefined,
+    customPromptPaths: readonly string[] | undefined,
+  ): void {
+    this.globalOpencodeDir = globalOpencodeDir
+    this.customPromptPaths = customPromptPaths
+    this.invalidateSourceCache()
   }
 
   /**
@@ -364,10 +383,31 @@ export class AgentPromptManager {
       return backupPath
     }
 
-    const filePath =
-      source.kind === "missing"
-        ? defaultAgentFilePath(this.projectRoot, agentName)
-        : (source as { path: string }).path
+    // `inline`, `missing`, and `plugin_override (config)` are all handled
+    // in earlier branches. The remaining shapes (`external_file`,
+    // `project_file`, `global_file`, and `plugin_override` with a file
+    // target) all carry a `path` field. Use a switch on `source.kind`
+    // so TypeScript checks exhaustiveness — adding a new source kind
+    // will fail the build here until the new case is handled.
+    const filePath: string = (() => {
+      switch (source.kind) {
+        case "missing":
+          return defaultAgentFilePath(this.projectRoot, agentName)
+        case "external_file":
+        case "project_file":
+        case "global_file":
+          return source.path
+        case "plugin_override":
+          // `plugin_override` with a `file` or `file_uri` target
+          // always has a `path` (set by the resolver). The
+          // `target === "config"` case is handled above.
+          if (source.path) return source.path
+          throw new Error(
+            `injectSection: plugin_override for ${agentName} has no path ` +
+              `(target=${source.target})`,
+          )
+      }
+    })()
     const lockPath = `${filePath}.lock`
 
     const unlock = await acquireLock(lockPath)

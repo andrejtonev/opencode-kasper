@@ -1,7 +1,12 @@
 import { readdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, isAbsolute, join, relative } from "node:path"
-import { applyEdits, type ModificationOptions, modify } from "jsonc-parser"
+import { basename, dirname, isAbsolute, join, relative } from "node:path"
+import {
+  applyEdits,
+  type ModificationOptions,
+  modify,
+  parse,
+} from "jsonc-parser"
 import {
   candidateGlobalOpencodeDirs,
   dirExists,
@@ -84,6 +89,14 @@ export type AgentPromptSource =
        *                  upstream prompt; kasper treats it as inline.
        */
       kind: "plugin_override"
+      /**
+       * The agent name this override belongs to. The resolver fills this
+       * in from the JSON map key it was found under. Writers MUST use it
+       * (not a value-based scan) to locate the entry — see B1 regression
+       * for why a value-based scan modifies the wrong agent when two
+       * agents share the same prompt text.
+       */
+      agentName: string
       target: "file" | "file_uri" | "config"
       /** Absolute path to the referenced file (for `file` and `file_uri`). */
       path?: string
@@ -113,8 +126,6 @@ async function loadJsoncIfExists(
   try {
     const raw = await readFile(path, "utf-8")
     if (!raw.trim()) return undefined
-    // Local import of jsonc-parser's parse to avoid coupling to the Kasper config layer
-    const { parse } = await import("jsonc-parser")
     const errors: Array<{ error: number; offset: number; length: number }> = []
     const parsed = parse(raw, errors, {
       allowTrailingComma: true,
@@ -242,13 +253,20 @@ function sanitizeName(name: string): string {
 /**
  * Try to extract a `prompt` or `prompt_append` override entry for `agentName`
  * from any of the standard `agent`/`agents` map locations in a config object.
- * Returns the first hit with the field name, or undefined.
+ * Returns the first hit with the field name and the map key the entry was
+ * found under, or undefined. `mapKey` is returned alongside so the writer
+ * can rebuild the correct JSON path (we must not infer the map from a value
+ * scan — see B1).
  */
 function readPluginOverrideEntry(
   raw: Record<string, unknown> | undefined,
   agentName: string,
 ):
-  | { entry: Record<string, unknown>; promptField: "prompt" | "prompt_append" }
+  | {
+      entry: Record<string, unknown>
+      promptField: "prompt" | "prompt_append"
+      mapKey: "agent" | "agents"
+    }
   | undefined {
   if (!raw) return undefined
   // Prefer the standard `agent` map (opencode.json + most plugins).
@@ -259,10 +277,10 @@ function readPluginOverrideEntry(
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
     const e = entry as Record<string, unknown>
     if (typeof e.prompt_append === "string" && e.prompt_append.length > 0) {
-      return { entry: e, promptField: "prompt_append" }
+      return { entry: e, promptField: "prompt_append", mapKey: key }
     }
     if (typeof e.prompt === "string" && e.prompt.length > 0) {
-      return { entry: e, promptField: "prompt" }
+      return { entry: e, promptField: "prompt", mapKey: key }
     }
   }
   return undefined
@@ -271,8 +289,12 @@ function readPluginOverrideEntry(
 /**
  * Classify a `prompt` or `prompt_append` string into one of the three
  * `plugin_override.target` shapes and produce a complete source object.
+ * `agentName` is the JSON map key the override lives under and MUST be
+ * propagated to the source so writers can locate the entry by name (not
+ * by scanning for an identical value, which is unsafe — see B1).
  */
 function buildPluginOverride(
+  agentName: string,
   value: string,
   promptField: "prompt" | "prompt_append",
   configPath: string,
@@ -284,6 +306,7 @@ function buildPluginOverride(
     const path = resolveDirectivePath(fileMatch[1], dirname(configPath))
     return {
       kind: "plugin_override",
+      agentName,
       target: "file",
       path,
       configPath,
@@ -300,6 +323,7 @@ function buildPluginOverride(
     if (raw.startsWith("/")) {
       return {
         kind: "plugin_override",
+        agentName,
         target: "file_uri",
         path: raw,
         configPath,
@@ -310,6 +334,7 @@ function buildPluginOverride(
     if (raw.startsWith("~/")) {
       return {
         kind: "plugin_override",
+        agentName,
         target: "file_uri",
         path: join(homedir(), raw.slice(2)),
         configPath,
@@ -320,6 +345,7 @@ function buildPluginOverride(
     if (raw.startsWith("./") || raw.startsWith("../")) {
       return {
         kind: "plugin_override",
+        agentName,
         target: "file_uri",
         path: join(dirname(configPath), raw),
         configPath,
@@ -330,6 +356,7 @@ function buildPluginOverride(
     // Unknown file:// form — degrade to config-raw to avoid a bad path.
     return {
       kind: "plugin_override",
+      agentName,
       target: "config",
       value,
       configPath,
@@ -340,6 +367,7 @@ function buildPluginOverride(
   // Anything else is a raw string in the config file.
   return {
     kind: "plugin_override",
+    agentName,
     target: "config",
     value,
     configPath,
@@ -391,6 +419,10 @@ async function listOpencodeJsonFiles(dir: string): Promise<string[]> {
  * Scan a single `.opencode/` directory for a plugin override. Skips the
  * standard `opencode.json`/`opencode.jsonc` (already handled by the caller)
  * to avoid double-counting.
+ *
+ * Use `basename()` from node:path, not a hand-rolled `split("/")` — on
+ * Windows the path uses `\` as the separator, so the manual split would
+ * fail to isolate the filename and the skip would never fire (B2).
  */
 async function findOverrideInDir(
   dir: string,
@@ -398,12 +430,13 @@ async function findOverrideInDir(
 ): Promise<AgentPromptSource | undefined> {
   const files = await listOpencodeJsonFiles(dir)
   for (const file of files) {
-    const base = file.split("/").pop() ?? ""
+    const base = basename(file)
     if (base === "opencode.json" || base === "opencode.jsonc") continue
     const raw = await loadJsoncIfExists(file)
     const hit = readPluginOverrideEntry(raw, agentName)
     if (hit)
       return buildPluginOverride(
+        agentName,
         hit.entry[hit.promptField] as string,
         hit.promptField,
         file,
@@ -565,6 +598,8 @@ export interface PluginOverrideAppendResult {
   mapKey: "agent" | "agents"
   /** The prompt field that was updated (`prompt` or `prompt_append`). */
   promptField: "prompt" | "prompt_append"
+  /** The agent name (map key) that was updated. */
+  agentName: string
   /** New value of the field after appending. */
   newValue: string
 }
@@ -575,10 +610,14 @@ export interface PluginOverrideAppendResult {
  * (case-insensitive, whitespace-normalised) the file is left untouched and
  * `applied: false` is returned via `newValue` matching the previous value.
  *
- * Walks the config object looking for the first `agent` or `agents` map
- * that contains the agent name with the requested field. The map key
- * discovered during the write is returned so the caller can keep the
- * resolver and the writer in sync.
+ * Locates the target entry by `source.agentName` + `source.promptField`,
+ * NOT by scanning for an identical `value` (which was the B1 bug — when
+ * two agents in the same file share the same prompt text, the first one
+ * in insertion order would win and the wrong agent would be edited).
+ *
+ * The `mapKey` (whether the entry lives under `agent` or `agents`) is
+ * discovered by scanning the parsed object for the named entry, but the
+ * agent name is fixed by `source.agentName` — never inferred from values.
  */
 export async function appendToPluginOverridePrompt(
   source: Extract<AgentPromptSource, { kind: "plugin_override" }>,
@@ -590,62 +629,59 @@ export async function appendToPluginOverridePrompt(
       configPath: source.configPath,
       mapKey: "agent",
       promptField: source.promptField,
+      agentName: source.agentName,
       newValue: source.value ?? "",
     }
   }
   const original = await readFile(source.configPath, "utf-8")
-  // Find which top-level map the agent lives in. The resolver already
-  // prefers `agent`, but we re-scan to be robust to the value being
-  // present under either key in the same file.
-  const parsed = await (async () => {
-    const { parse } = await import("jsonc-parser")
-    const errors: Array<{ error: number; offset: number; length: number }> = []
-    return parse(original, errors, {
-      allowTrailingComma: true,
-      disallowComments: false,
-      allowEmptyContent: false,
-    })
-  })()
+  const errors: Array<{ error: number; offset: number; length: number }> = []
+  const parsed = parse(original, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+    allowEmptyContent: false,
+  })
   const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<
     string,
     unknown
   >
 
-  // Resolve the agent name by scanning both top-level maps for an entry
-  // whose `prompt` or `prompt_append` matches `source.value`. The agent
-  // name is not carried on the source object itself.
-  let mapKey: "agent" | "agents" = "agent"
-  let agentName: string | undefined
+  // Locate the entry by NAME (the value of source.agentName) under either
+  // the `agent` or `agents` map. The agent identity comes from the source
+  // — the resolver already established it during read. A value-based scan
+  // is unsafe and was the root cause of B1.
+  const agentName = source.agentName
+  let mapKey: "agent" | "agents" | undefined
   for (const key of ["agent", "agents"] as const) {
     const m = raw[key]
     if (!m || typeof m !== "object" || Array.isArray(m)) continue
-    for (const [name, entry] of Object.entries(m as Record<string, unknown>)) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
-      const e = entry as Record<string, unknown>
-      if (
-        typeof e[source.promptField] === "string" &&
-        e[source.promptField] === source.value
-      ) {
-        agentName = name
-        mapKey = key
-        break
-      }
+    if ((m as Record<string, unknown>)[agentName] !== undefined) {
+      mapKey = key
+      break
     }
-    if (agentName) break
   }
-  if (!agentName) {
+  if (!mapKey) {
     throw new Error(
-      `appendToPluginOverridePrompt: could not locate agent entry in ${source.configPath}`,
+      `appendToPluginOverridePrompt: could not locate agent "${agentName}" ` +
+        `under "agent" or "agents" in ${source.configPath}`,
     )
   }
 
-  // Idempotency check: case-insensitive, whitespace-normalised.
+  // Idempotency check: split the existing value into blocks and test for
+  // an exact match. Splitting on `\n\n` avoids the substring false-positive
+  // where a longer existing block contains the new block as a prefix
+  // (e.g. existing "Be thorough and be fast" would incorrectly subsume new
+  // "Be thorough").
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
-  if (norm(source.value ?? "").includes(norm(trimmed))) {
+  const existingBlocks = (source.value ?? "")
+    .split(/\n\s*\n+/)
+    .map((b) => norm(b))
+    .filter(Boolean)
+  if (existingBlocks.includes(norm(trimmed))) {
     return {
       configPath: source.configPath,
       mapKey,
       promptField: source.promptField,
+      agentName,
       newValue: source.value ?? "",
     }
   }
@@ -674,6 +710,7 @@ export async function appendToPluginOverridePrompt(
     configPath: source.configPath,
     mapKey,
     promptField: source.promptField,
+    agentName,
     newValue,
   }
 }
@@ -710,7 +747,6 @@ export async function materializePluginOverrideToFile(
   const newPromptValue = `{file:${relPath}}`
 
   const original = await readFile(configPath, "utf-8")
-  const { parse } = await import("jsonc-parser")
   const errors: Array<{ error: number; offset: number; length: number }> = []
   const parsed = parse(original, errors, {
     allowTrailingComma: true,

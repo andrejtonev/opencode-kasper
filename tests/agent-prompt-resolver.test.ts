@@ -6,6 +6,7 @@ import { join, relative } from "node:path"
 import {
   defaultAgentFilePath,
   materializeInlinePrompt,
+  materializePluginOverrideToFile,
   resolveAgentPromptSource,
 } from "../src/agent-prompt-resolver.js"
 import { AgentPromptManager, InlinePromptError } from "../src/agent-prompts.js"
@@ -927,5 +928,187 @@ describe("AgentPromptManager (resolver-aware)", () => {
     const manager = new AgentPromptManager(projectRoot, stateDir, globalDir)
     await manager.init()
     expect(await manager.exists("nope")).toBe(false)
+  })
+})
+
+describe("materializePluginOverrideToFile", () => {
+  // C2: this function had no unit tests; the inline-prompt equivalent
+  // has 4 tests but the plugin-override version was unverified.
+  let projectRoot: string
+  let globalDir: string
+
+  beforeEach(async () => {
+    projectRoot = tmpDir()
+    globalDir = join(projectRoot, "global-opencode")
+    await mkdir(globalDir, { recursive: true })
+    await mkdir(join(projectRoot, ".opencode"), { recursive: true })
+  })
+
+  afterEach(async () => {
+    await rm(projectRoot, { recursive: true, force: true })
+  })
+
+  test("creates a project prompt file and rewrites the config to a {file:...} directive", async () => {
+    // Plugin override with a `prompt_append` of a raw string. Materialize
+    // it to a real file and verify both the new file and the rewritten
+    // config.
+    const originalPrompt = "Be thorough. Be fast."
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({
+        agent: { sisyphus: { prompt_append: originalPrompt } },
+      }),
+    )
+
+    const result = await materializePluginOverrideToFile(
+      "sisyphus",
+      {
+        kind: "plugin_override",
+        agentName: "sisyphus",
+        target: "config",
+        value: originalPrompt,
+        configPath,
+        promptField: "prompt_append",
+        isAppend: true,
+      },
+      projectRoot,
+    )
+
+    expect(result.fileCreated).toBe(true)
+    expect(result.configModified).toBe(true)
+    expect(result.configPath).toBe(configPath)
+
+    // File was created with the original prompt content
+    const fileContent = await readFile(result.filePath, "utf-8")
+    expect(fileContent).toContain("mode: subagent")
+    expect(fileContent).toContain(originalPrompt)
+
+    // Config was rewritten with a {file:...} directive
+    const newConfig = JSON.parse(await readFile(configPath, "utf-8"))
+    expect(newConfig.agent.sisyphus.prompt_append).toMatch(/^\{file:.+\}$/)
+  })
+
+  test("preserves other fields in the agent entry", async () => {
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({
+        agent: {
+          sisyphus: {
+            prompt_append: "Override text.",
+            model: "anthropic/claude-sonnet-4-6",
+            description: "orchestrator",
+          },
+        },
+      }),
+    )
+
+    await materializePluginOverrideToFile(
+      "sisyphus",
+      {
+        kind: "plugin_override",
+        agentName: "sisyphus",
+        target: "config",
+        value: "Override text.",
+        configPath,
+        promptField: "prompt_append",
+        isAppend: true,
+      },
+      projectRoot,
+    )
+
+    const newConfig = JSON.parse(await readFile(configPath, "utf-8"))
+    expect(newConfig.agent.sisyphus.model).toBe("anthropic/claude-sonnet-4-6")
+    expect(newConfig.agent.sisyphus.description).toBe("orchestrator")
+    expect(newConfig.agent.sisyphus.prompt_append).toMatch(/^\{file:.+\}$/)
+  })
+
+  test("does NOT overwrite an existing file at the conventional path", async () => {
+    // If a file already exists at `<root>/.opencode/agents/<name>.md`,
+    // we leave it in place and only rewrite the config. This matches
+    // the inline-prompt behaviour.
+    const existingFile = join(projectRoot, ".opencode", "agents", "sisyphus.md")
+    await mkdir(join(projectRoot, ".opencode", "agents"), { recursive: true })
+    await writeFile(existingFile, "Already here.", "utf-8")
+
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({
+        agent: { sisyphus: { prompt_append: "Override text." } },
+      }),
+    )
+
+    const result = await materializePluginOverrideToFile(
+      "sisyphus",
+      {
+        kind: "plugin_override",
+        agentName: "sisyphus",
+        target: "config",
+        value: "Override text.",
+        configPath,
+        promptField: "prompt_append",
+        isAppend: true,
+      },
+      projectRoot,
+    )
+    expect(result.fileCreated).toBe(false)
+    // The existing content is preserved.
+    expect(await readFile(existingFile, "utf-8")).toBe("Already here.")
+  })
+
+  test("uses primary mode when specified", async () => {
+    const configPath = join(projectRoot, ".opencode", "oh-my-opencode.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({
+        agent: { sisyphus: { prompt_append: "Override." } },
+      }),
+    )
+
+    const result = await materializePluginOverrideToFile(
+      "sisyphus",
+      {
+        kind: "plugin_override",
+        agentName: "sisyphus",
+        target: "config",
+        value: "Override.",
+        configPath,
+        promptField: "prompt_append",
+        isAppend: true,
+      },
+      projectRoot,
+      { mode: "primary" },
+    )
+    const fileContent = await readFile(result.filePath, "utf-8")
+    expect(fileContent).toContain("mode: primary")
+  })
+
+  test("discovers the `agents` (plural) map key when the entry lives there", async () => {
+    const configPath = join(projectRoot, ".opencode", "plugin.json")
+    await writeJsonc(
+      configPath,
+      JSON.stringify({
+        agents: { sisyphus: { prompt_append: "Override." } },
+      }),
+    )
+
+    const result = await materializePluginOverrideToFile(
+      "sisyphus",
+      {
+        kind: "plugin_override",
+        agentName: "sisyphus",
+        target: "config",
+        value: "Override.",
+        configPath,
+        promptField: "prompt_append",
+        isAppend: true,
+      },
+      projectRoot,
+    )
+    expect(result.configModified).toBe(true)
+    const newConfig = JSON.parse(await readFile(configPath, "utf-8"))
+    expect(newConfig.agents.sisyphus.prompt_append).toMatch(/^\{file:.+\}$/)
   })
 })

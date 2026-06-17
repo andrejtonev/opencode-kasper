@@ -281,9 +281,7 @@ export function stopServe(port?: number): void {
 export function isServeRunning(port = SERVE_PORT): boolean {
   try {
     const authFlag =
-      _SERVER_USER && _SERVER_PASS
-        ? `-u "${_SERVER_USER}:${_SERVER_PASS}"`
-        : ""
+      _SERVER_USER && _SERVER_PASS ? `-u "${_SERVER_USER}:${_SERVER_PASS}"` : ""
     // Use root `/` (returns 200 with HTML) rather than `/api/session` which
     // requires a `?limit=N` query parameter in opencode >=1.15.x.
     const resp = execSync(
@@ -312,14 +310,11 @@ export function isServeRunning(port = SERVE_PORT): boolean {
  */
 export function fetchAPI(path: string, port = SERVE_PORT): unknown {
   const authFlag =
-    _SERVER_USER && _SERVER_PASS
-      ? `-u "${_SERVER_USER}:${_SERVER_PASS}"`
-      : ""
+    _SERVER_USER && _SERVER_PASS ? `-u "${_SERVER_USER}:${_SERVER_PASS}"` : ""
   // opencode >=1.15.x requires a `?limit=N` query parameter on the
   // `/api/session` list endpoint (default limit=0 causes a 400 error).
   // If the caller requests the bare list endpoint, add a reasonable limit.
-  const resolvedPath =
-    path === "/api/session" ? "/api/session?limit=100" : path
+  const resolvedPath = path === "/api/session" ? "/api/session?limit=100" : path
   const url = `http://localhost:${port}${resolvedPath}`
   const raw = execSync(`curl -s ${authFlag} "${url}"`, {
     stdio: "pipe",

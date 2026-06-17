@@ -212,11 +212,18 @@ describe.skipIf(!ENABLED)(
         expect(afterPromptAppend).toContain(beforePromptAppend)
         // No new top-level keys were introduced.
         expect(Object.keys(afterParsed).sort()).toEqual(beforeKeys)
-        // The agent entry still has ONLY the prompt_append field (no
-        // kasper-specific pollution like a `kasper: true` flag).
-        expect(
-          Object.keys(afterParsed.agent[install.agentName]).sort(),
-        ).toEqual(["prompt_append"])
+        // The agent entry still has `prompt_append` and kasper didn't
+        // introduce any kasper-specific pollution. We deliberately do NOT
+        // assert the entry has ONLY `prompt_append` — oh-my-opencode
+        // could legitimately add sibling fields (e.g. `model`) in a
+        // future release and this test should keep passing.
+        expect(afterParsed.agent[install.agentName]).toHaveProperty(
+          "prompt_append",
+        )
+        const agentKeys = Object.keys(afterParsed.agent[install.agentName])
+        for (const k of agentKeys) {
+          expect(k).not.toMatch(/^kasper[-_]/)
+        }
       },
     )
 

@@ -20,9 +20,11 @@ import {
 import type { BackupEntry } from "./types.js"
 
 export class AgentsMdManager {
-  private readonly backupsDir: string
+  private readonly kasperStateDir: string
+  private backupsDir: string
   private cachedContent: string | null = null
   private cachedMtime = 0
+  private resolvedPath: string
 
   constructor(
     /**
@@ -32,14 +34,37 @@ export class AgentsMdManager {
      * backward compatibility with call sites that have not yet been
      * migrated to the resolver.
      */
-    private readonly resolvedPath: string,
+    resolvedPath: string,
     kasperStateDir: string,
     private maxBackups: number = 20,
   ) {
+    this.kasperStateDir = kasperStateDir
+    this.resolvedPath = resolvedPath
     // The backup directory is keyed on the resolved path so multiple
     // rules files (e.g. one per project) don't share a single bucket.
-    const dirName = backupDirNameFor(resolvedPath)
-    this.backupsDir = join(kasperStateDir, "backups", dirName)
+    this.backupsDir = join(
+      kasperStateDir,
+      "backups",
+      backupDirNameFor(resolvedPath),
+    )
+  }
+
+  /**
+   * Update the resolved rules file path at runtime — used by the config
+   * reload timer when the user changes `agents_md_paths` in
+   * `kasper.json`. Recomputes the backup directory (which is keyed on
+   * the path) and clears the in-memory content cache so the next read
+   * hits the new file.
+   */
+  setResolvedPath(newPath: string): void {
+    if (newPath === this.resolvedPath) return
+    this.resolvedPath = newPath
+    this.backupsDir = join(
+      this.kasperStateDir,
+      "backups",
+      backupDirNameFor(newPath),
+    )
+    this.invalidateCache()
   }
 
   invalidateCache(): void {
