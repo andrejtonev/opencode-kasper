@@ -128,3 +128,98 @@ sequentially. The verdict was inferred from:
   sharpness.
 - **Timing tests**: tests that depend on timeouts, debouncing, or
   LLM response speed. These can be flaky regardless of mutations.
+
+## Audit correction: omo-live tests were NOT exercising omo
+
+After the audit, I tried to actually run `oh-my-opencode-live.test.ts`
+and discovered that **the tests were not loading omo at all**. Two
+bugs:
+
+1. The test wrote `.opencode/oh-my-opencode.json` as the omo config
+   file, but omo's actual config basename (since the package rename)
+   is `oh-my-openagent` — the config file was a dead drop. The
+   omo plugin loaded but read the empty default.
+
+2. The test used the npm specifier `oh-my-opencode` in
+   `.opencode/opencode.json`'s `plugin` array. opencode's `serve`
+   command is `instance: false` (see the plugin-loading diagnosis
+   in commit `e083564`'s commit message), so the npm plugin never
+   actually loaded — the per-project instance created when
+   `opencode run --attach` arrived couldn't find the plugin in the
+   `~/.config/opencode/plugins/` dir (it wasn't symlinked) and the
+   npm install raced the instance bootstrap.
+
+Both fixed in commit `9e91d51`:
+- Switched to `plugin: ["file:///path/to/dist/index.js"]` so the
+  plugin loads synchronously from the local install.
+- Renamed the config to `.opencode/oh-my-openagent.json`.
+
+With omo actually loaded, the write-path test surfaced a REAL kasper
+bug (commit `15e431a`):
+
+### Bug: display name vs config key mismatch
+
+- omo's `AGENT_DISPLAY_NAMES` maps `sisyphus → "Sisyphus - ultraworker"`.
+- opencode's session info reports the **display name** as
+  `agentName`, not the config key.
+- kasper's `resolveAgentPromptSource` did an exact-match lookup
+  against `agent.sisyphus` (the config key), missed, and the write
+  path was a no-op for all omo-managed agents.
+
+Fix in `src/agent-prompt-resolver.ts`:
+- `getAgentEntry` and new `getAgentEntryAndKey`: try exact match,
+  then case-insensitive, then "display name starts with key"
+  (longest match wins).
+- `readPluginOverrideEntry`: same fallback for the plugin override
+  scan; returns the canonical key, not the display name.
+- `resolveAgentPromptSource` and the override scan: use the
+  canonical key for all subsequent lookups (fallback file paths,
+  `findPluginConfigOverride`, custom-prompt candidates).
+
+### Audit impact
+
+- The audit's verdict of "USEFUL" for the 5 `oh-my-opencode-live`
+  tests was wrong — they were USEFUL only by accident, because
+  the broad `recordSession` mutation killed the plugin's
+  initialization. They never actually exercised the omo integration.
+- Now that omo loads and kasper's resolver finds the right entry,
+  the write-path test fails for a *different* reason: the LLM
+  judge is too lenient to score the provoking prompt below the
+  threshold consistently. This is a **test-data reliability
+  issue**, not a kasper bug — the kasper code path now works.
+- The 2 fixes (commit `9e91d51` wiring + commit `15e431a`
+  resolver) are the actual deliverables of this follow-up.
+
+### Revised audit verdict for `oh-my-opencode-live.test.ts`
+
+| test | before (audit) | after (with omo wired + kasper fix) |
+|---|---|---|
+| 1 npm-installed omo on disk | SMOKE | SMOKE (unchanged) |
+| 2 sisyphus scored | USEFUL (no-record) | USEFUL (still catches no-record; plus catches display-name lookup bug if reverted) |
+| 3 scoring log lifecycle | USEFUL (no-record) | USEFUL (unchanged) |
+| 4 subagent delegation | USEFUL (no-record) | USEFUL (unchanged) |
+| 5 write path into sisyphus | USEFUL (no-record) | USEFUL (catches lookup bug AND no-record; also currently fails on LLM leniency — see note) |
+
+Note: test 5 now actually tests the production write path. The
+test currently fails on LLM judge leniency, not on a kasper bug.
+A future improvement would be a deterministic scoring override
+(e.g. `KASPER_E2E_SCORE_OVERRIDE=0.1`) so the test doesn't depend
+on the model's cooperation.
+
+## Lesson for future audits
+
+The mutation-audit pattern catches bugs that make the test setup
+fail. It does NOT catch bugs where the test setup is broken in a
+way that doesn't trigger the assertion. The omo-live tests had a
+broken setup (omo never loaded) and the audit missed it because:
+
+- The tests' assertions were "the omo config was written to" — a
+  positive assertion that can't fail if the write path was never
+  entered.
+- The `recordSession` mutation happened to kill the plugin
+  initialization, so the test's `waitForKasperLoaded` setup hook
+  failed, and the test was marked USEFUL.
+
+A better audit would also include a "did the test actually exercise
+its claimed code path" check, e.g. by injecting a probe into the
+production code that records what was touched during the test.
