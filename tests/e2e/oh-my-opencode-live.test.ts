@@ -46,11 +46,16 @@
  *   - The model sometimes doesn't actually delegate (it might answer the
  *     question directly). We treat the main-session card as required and
  *     the subagent card as a best-effort signal we log if present.
- *   - `auto_update: true` + `MIN_OBSERVATIONS_FOR_UPDATE = 2` means the
- *     first run won't auto-update; the test sends a second run so a
- *     kasper section actually lands. If auto-update doesn't fire (e.g. the
- *     model doesn't surface weaknesses that warrant an update), the test
- *     still passes the structural checks and logs a warning.
+ *   - `auto_update: true` + `min_observations_for_update: 1` + a low
+ *     `scoring_threshold: 0.3` means the FIRST run is enough: any session
+ *     whose overall score is below 0.3 immediately triggers the
+ *     improvement / write path. We craft the second-run prompt to be
+ *     deliberately shoddy (asks the agent to skip verification, the
+ *     classic "code-quality" / "completeness" weakness that kasper's
+ *     LLM judge surfaces at low confidence) so the judge scores below
+ *     threshold on the first card. That makes the write assertion hard:
+ *     no `if (write happened)` guard. If the write doesn't land, the
+ *     test FAILS, not logs-and-continues.
  *
  * Skip conditions (in addition to `OPENCODE_E2E != 1`):
  *   - `npm install oh-my-opencode` fails (offline / network)
@@ -173,10 +178,14 @@ describe.skipIf(!ENABLED)(
 
       // 3. Start a kasper-enabled opencode serve. We use a low
       //    min_session_messages (=1) so the scoring pipeline can pick up
-      //    short subagent sessions, and disable the auto-update threshold
-      //    via MIN_OBSERVATIONS_FOR_UPDATE overrides? No — that's a
-      //    constant, not a config. We send two runs so the second one
-      //    can pass the threshold.
+      //    short subagent sessions, and we set:
+      //      * scoring_threshold = 0.3 (low; any non-perfect session
+      //        triggers the improvement path)
+      //      * min_observations_for_update = 1 (first observation is
+      //        enough; no need to send two runs)
+      //    With these, the first run that scores below 0.3 will fire
+      //    auto-apply. The second-run prompt is crafted to provoke a
+      //    weakness the LLM judge will score low (see below).
       project = {
         dir: projectDir,
         packageDir,
@@ -189,10 +198,11 @@ describe.skipIf(!ENABLED)(
         {
           enabled: true,
           min_session_messages: 1,
+          min_observations_for_update: 1,
           evaluation_poll_interval_ms: 4_000,
           model: "opencode-go/minimax-m2.7",
           scoring_timeout_ms: 120_000,
-          scoring_threshold: 1.0,
+          scoring_threshold: 0.3,
           auto_update: true,
           detail_level: "minimal",
           quiet: true,
@@ -367,86 +377,85 @@ describe.skipIf(!ENABLED)(
       }
     }, 60_000)
 
-    test("after a second run, kasper writes its section into sisyphus's plugin_override (production write path)", async () => {
-      // Second run: pass MIN_OBSERVATIONS_FOR_UPDATE so auto-apply fires.
-      // We deliberately send a similar prompt to maximize the chance of
-      // a weakness being observed.
+    test("kasper writes its section into sisyphus's plugin_override (production write path)", async () => {
+      // The prompt is deliberately crafted to provoke a weakness the
+      // LLM judge will surface and score below the 0.3 threshold:
+      //   * "do not read any files" → completeness / code-quality
+      //     weakness (the agent is supposed to ground its answer in
+      //     the project)
+      //   * "guess" → reasoning weakness
+      //   * "do not run any commands" → tool-use weakness
+      // The judge gives this kind of session a low score, the gate at
+      // evaluate.ts:349 (`overall_score < scoring_threshold`) fires,
+      // and with `min_observations_for_update: 1` the auto-apply path
+      // runs on the first card. The write path is:
+      //   AgentPromptManager.injectSection → plugin_override branch →
+      //   appendToPluginOverridePrompt (the function B1 fixed).
       const prompt =
-        `Run as ${project.mainAgent}. Briefly read the AGENTS.md and ` +
-        `package.json, then report a one-line summary. Do not delegate.`
+        `Run as ${project.mainAgent}. Do not read any files and do not ` +
+        `run any commands. Guess what the package.json name and version ` +
+        `are, and report a one-line answer. Do not delegate.`
       const r = runAttach(project.dir, prompt, servePort, {
         timeoutMs: 240_000,
       })
-      log(`run 2 session=${r.sessionID.slice(0, 16)}… exit=${r.exitCode}`)
+      log(`write-test session=${r.sessionID.slice(0, 16)}… exit=${r.exitCode}`)
       expect(r.exitCode).toBe(0)
 
-      // Give auto-apply a moment to run after the second scoring
-      // completes. 60s is generous given evaluation_poll_interval=4s
-      // and scoring_timeout=120s.
+      // Wait for the first card to be produced AND for the write to
+      // land on disk. With auto_update + min_observations_for_update=1
+      // + scoring_threshold=0.3, a low-scoring card fires the write
+      // almost immediately after evaluation_done.
       const state = await waitForScoredSessions(project.dir, {
-        minCount: 2,
+        minCount: 1,
         maxWaitMs: 240_000,
       })
       if (!state) {
-        log("(warn) second scoring did not complete")
+        log("(warn) scoring did not complete within maxWaitMs")
         return
       }
 
-      // Wait a bit for auto-apply to fire after the second card lands.
+      // Wait for auto-apply to actually write the file. 30s is generous
+      // given evaluation_poll_interval=4s and scoring_timeout=120s.
       try {
-        execSync("sleep 15", { stdio: "pipe" })
+        execSync("sleep 30", { stdio: "pipe" })
       } catch {
         /* ok */
       }
 
-      // Read the omo config back and assert the kasper section landed
-      // in sisyphus's prompt_append. This is the production write path:
-      // AgentPromptManager.injectSection → plugin_override branch →
-      // appendToPluginOverridePrompt (the function B1 fixed).
+      // Read the omo config back and HARD-assert the kasper section
+      // landed in sisyphus's prompt_append. With scoring_threshold=0.3
+      // and the weakness-provoking prompt above, this MUST happen.
+      // If it doesn't, the production write path is broken and the
+      // test fails (no more "log a warning" path).
       const cfg = JSON.parse(readFileSync(project.omoConfigPath, "utf-8"))
       const sisyphusAppend: string =
         cfg.agent?.[project.mainAgent]?.prompt_append ?? ""
       log(
         `sisyphus prompt_append length: ${sisyphusAppend.length}, ` +
-          `contains 'Kasper': ${sisyphusAppend.includes("Kasper")}`,
+          `contains 'Kasper Inferred Instructions': ${sisyphusAppend.includes("Kasper Inferred Instructions")}`,
       )
 
-      if (sisyphusAppend.includes("Kasper Inferred Instructions")) {
-        // The write path landed. Verify the build agent was NOT touched
-        // (B1 regression — the per-agent name-based write must target
-        // sisyphus only, not by-value scan the build entry).
-        const buildAppend: string =
-          cfg.agent?.[project.subagent]?.prompt_append ?? ""
-        log(
-          `build prompt_append length: ${buildAppend.length}, ` +
-            `contains 'Kasper': ${buildAppend.includes("Kasper")}`,
-        )
-        // build's prompt must be untouched (no Kasper section, length
-        // unchanged from the original).
-        const originalBuildPrompt =
-          "# Build agent base prompt\n\n" +
-          "You are the build agent. Compile and run type checks. " +
-          "Report exact command output and exit codes."
-        expect(buildAppend).toBe(originalBuildPrompt)
-        // And sisyphus's prompt must contain BOTH the original
-        // user content and the kasper-injected section.
-        expect(sisyphusAppend).toContain("Sisyphus base prompt")
-        expect(sisyphusAppend).toContain("Kasper Inferred Instructions")
-      } else {
-        // Auto-apply didn't fire. This can happen if the model didn't
-        // surface weaknesses on either run, or if the LLM judge scored
-        // both sessions at the high end (threshold=1.0). We log a
-        // warning rather than failing — the rest of the test (resolver,
-        // write path, subagent) is still covered by sibling tests and
-        // the unit suite.
-        log(
-          "(warn) no Kasper section in sisyphus.prompt_append — " +
-            "auto-apply did not fire. This is OK if both runs scored " +
-            "above threshold or no weaknesses were observed. The " +
-            "production write path is exercised by tests/b*-regression " +
-            "and tests/agent-prompt-resolver.test.ts.",
-        )
-      }
+      // HARD assert: the write path landed. This is the only assertion
+      // in the test that proves the production injectSection chain.
+      expect(sisyphusAppend).toContain("Kasper Inferred Instructions")
+      // And sisyphus's prompt must still contain the original content
+      // (the kasper section is appended, not replacing).
+      expect(sisyphusAppend).toContain("Sisyphus base prompt")
+
+      // B1 regression in production form: the per-agent name-based
+      // write must target sisyphus only, not by-value scan the build
+      // entry. build's prompt must be untouched.
+      const buildAppend: string =
+        cfg.agent?.[project.subagent]?.prompt_append ?? ""
+      log(
+        `build prompt_append length: ${buildAppend.length}, ` +
+          `contains 'Kasper': ${buildAppend.includes("Kasper")}`,
+      )
+      const originalBuildPrompt =
+        "# Build agent base prompt\n\n" +
+        "You are the build agent. Compile and run type checks. " +
+        "Report exact command output and exit codes."
+      expect(buildAppend).toBe(originalBuildPrompt)
     }, 600_000)
   },
 )
