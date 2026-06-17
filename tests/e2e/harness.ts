@@ -630,10 +630,11 @@ function sleepMs(ms: number): Promise<void> {
 
 export async function waitForScoredSessions(
   dir: string,
-  opts?: { minCount?: number; maxWaitMs?: number },
+  opts?: { minCount?: number; maxWaitMs?: number; sessionID?: string },
 ): Promise<Record<string, unknown> | null> {
   const minCount = opts?.minCount ?? 1
   const maxWaitMs = opts?.maxWaitMs ?? 90_000
+  const sessionID = opts?.sessionID
   const deadline = Date.now() + maxWaitMs
   let checks = 0
 
@@ -642,11 +643,19 @@ export async function waitForScoredSessions(
     const state = readKasperState(dir)
     if (state && typeof state === "object") {
       const sessions = getScoredSessions(state)
-      const allScored =
-        sessions.length >= minCount &&
-        sessions.every((s) => ((s.score as number) ?? 0) > 0)
-      if (allScored) {
-        return state
+      if (sessionID) {
+        // Wait for THIS specific session to land in state with a score.
+        const hit = sessions.find((s) => s.id === sessionID)
+        if (hit && typeof hit.score === "number") {
+          return state
+        }
+      } else {
+        const allScored =
+          sessions.length >= minCount &&
+          sessions.every((s) => ((s.score as number) ?? 0) > 0)
+        if (allScored) {
+          return state
+        }
       }
     }
     await sleepMs(2_000)

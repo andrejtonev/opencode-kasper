@@ -329,6 +329,8 @@ function readPluginOverrideEntry(
       entry: Record<string, unknown>
       promptField: "prompt" | "prompt_append"
       mapKey: "agent" | "agents"
+      /** The canonical config key the entry was found under. */
+      key: string
     }
   | undefined {
   if (!raw) return undefined
@@ -336,17 +338,55 @@ function readPluginOverrideEntry(
   for (const key of ["agent", "agents"] as const) {
     const map = raw[key]
     if (!map || typeof map !== "object" || Array.isArray(map)) continue
-    const entry = (map as Record<string, unknown>)[agentName]
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
-    const e = entry as Record<string, unknown>
-    if (typeof e.prompt_append === "string" && e.prompt_append.length > 0) {
-      return { entry: e, promptField: "prompt_append", mapKey: key }
+    const { entry, key: actualKey } =
+      lookupAgentEntryWithFallback(map as Record<string, unknown>, agentName) ?? {}
+    if (!entry) continue
+    if (typeof entry.prompt_append === "string" && entry.prompt_append.length > 0) {
+      return {
+        entry,
+        promptField: "prompt_append",
+        mapKey: key,
+        key: actualKey,
+      }
     }
-    if (typeof e.prompt === "string" && e.prompt.length > 0) {
-      return { entry: e, promptField: "prompt", mapKey: key }
+    if (typeof entry.prompt === "string" && entry.prompt.length > 0) {
+      return { entry, promptField: "prompt", mapKey: key, key: actualKey }
     }
   }
   return undefined
+}
+
+/**
+ * Like {@link getAgentEntry} but for an already-extracted `agent`/`agents`
+ * map value (no raw-config wrapper). Returns the entry AND the canonical
+ * key it was found under, so callers can use the canonical key for
+ * subsequent JSON-path operations (jsonc modify, etc.).
+ */
+function lookupAgentEntryWithFallback(
+  map: Record<string, unknown>,
+  name: string,
+): { entry: Record<string, unknown>; key: string } | undefined {
+  // Exact match first.
+  const exact = map[name]
+  if (exact && typeof exact === "object" && !Array.isArray(exact))
+    return { entry: exact as Record<string, unknown>, key: name }
+  // Display-name fallback (see getAgentEntry comment).
+  const lowerName = name.toLowerCase()
+  let best: { key: string; len: number } | undefined
+  for (const key of Object.keys(map)) {
+    if (key.toLowerCase() === lowerName) {
+      best = { key, len: key.length }
+      break
+    }
+    if (lowerName.startsWith(key.toLowerCase())) {
+      if (!best || key.length > best.len) best = { key, len: key.length }
+    }
+  }
+  if (!best) return undefined
+  const entry = map[best.key]
+  if (!entry || typeof entry !== "object" || Array.isArray(entry))
+    return undefined
+  return { entry: entry as Record<string, unknown>, key: best.key }
 }
 
 /**
@@ -499,7 +539,12 @@ async function findOverrideInDir(
     const hit = readPluginOverrideEntry(raw, agentName)
     if (hit)
       return buildPluginOverride(
-        agentName,
+        // Use the canonical key the entry was found under, NOT the
+        // display name the caller passed. Subsequent code in
+        // appendToPluginOverridePrompt uses this name in a jsonc
+        // modify() path — passing the display name would write to
+        // a non-existent key, leaving the actual agent entry untouched.
+        hit.key,
         hit.entry[hit.promptField] as string,
         hit.promptField,
         file,
@@ -716,8 +761,11 @@ export async function appendToPluginOverridePrompt(
 
   // Locate the entry by NAME (the value of source.agentName) under either
   // the `agent` or `agents` map. The agent identity comes from the source
-  // — the resolver already established it during read. A value-based scan
-  // is unsafe and was the root cause of B1.
+  // — the resolver already established it during read. `source.agentName`
+  // is the canonical config key (e.g. "sisyphus"), not a display name
+  // (e.g. "Sisyphus - ultraworker"); the read path normalizes via
+  // readPluginOverrideEntry → lookupAgentEntryWithFallback. A value-based
+  // scan is unsafe and was the root cause of B1.
   const agentName = source.agentName
   let mapKey: "agent" | "agents" | undefined
   for (const key of ["agent", "agents"] as const) {

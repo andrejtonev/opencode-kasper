@@ -240,7 +240,7 @@ describe.skipIf(!ENABLED)(
           evaluation_poll_interval_ms: 4_000,
           model: "opencode-go/minimax-m2.7",
           scoring_timeout_ms: 120_000,
-          scoring_threshold: 0.3,
+          scoring_threshold: 0.4,
           auto_update: true,
           detail_level: "minimal",
           quiet: true,
@@ -432,35 +432,29 @@ describe.skipIf(!ENABLED)(
     }, 60_000)
 
     test("kasper writes its section into sisyphus's plugin_override (production write path)", async () => {
-      // The prompt is deliberately crafted to provoke a weakness the
-      // LLM judge will surface and score below the 0.3 threshold:
-      //   * "do not read any files" → completeness / code-quality
-      //     weakness (the agent is supposed to ground its answer in
-      //     the project)
-      //   * "guess" → reasoning weakness
-      //   * "do not run any commands" → tool-use weakness
-      // The judge gives this kind of session a low score, the gate at
-      // evaluate.ts:349 (`overall_score < scoring_threshold`) fires,
-      // and with `min_observations_for_update: 1` the auto-apply path
-      // runs on the first card. The write path is:
-      //   AgentPromptManager.injectSection → plugin_override branch →
-      //   appendToPluginOverridePrompt (the function B1 fixed).
+      // The prompt is deliberately crafted to provoke a low score from
+      // the LLM judge. We give an unprovoked, low-context instruction
+      // that doesn't require any tool use — "what's the project name"
+      // — and explicitly forbid tool use. A good agent would still
+      // take the safe path (read package.json once), but omo's sisyphus
+      // with strong instruction-following weights will comply and
+      // hallucinate, which the judge scores below threshold.
       const prompt =
-        `Run as ${project.mainAgent}. Do not read any files and do not ` +
-        `run any commands. Guess what the package.json name and version ` +
-        `are, and report a one-line answer. Do not delegate.`
+        `Run as ${project.mainAgent}. Without using any tools, ` +
+        `just guess — what is the project name? Reply in 5 words or fewer.`
       const r = runAttach(project.dir, prompt, servePort, {
         timeoutMs: 240_000,
       })
       log(`write-test session=${r.sessionID.slice(0, 16)}… exit=${r.exitCode}`)
       expect(r.exitCode).toBe(0)
 
-      // Wait for the first card to be produced AND for the write to
-      // land on disk. With auto_update + min_observations_for_update=1
-      // + scoring_threshold=0.3, a low-scoring card fires the write
-      // almost immediately after evaluation_done.
+      // Wait for THIS session to be scored. Earlier preflight tests
+      // may have already produced scored sessions, so the
+      // pre-existing minCount: 1 wait returns immediately. We
+      // specifically need to wait for the new session to be
+      // evaluated before the write-path check below.
       const state = await waitForScoredSessions(project.dir, {
-        minCount: 1,
+        sessionID: r.sessionID,
         maxWaitMs: 240_000,
       })
       if (!state) {
