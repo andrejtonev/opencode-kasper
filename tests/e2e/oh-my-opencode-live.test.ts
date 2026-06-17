@@ -147,14 +147,44 @@ describe.skipIf(!ENABLED)(
       const projectDir = mkdtempSync(join(tmpdir(), "kasper-e2e-omo-live-"))
       const packageDir = npmInstallOmo(projectDir)
 
-      // 2. Write the user's plugin config with TWO agents: the main
+      // 2. Wire up opencode to actually load omo. Without this, the
+      //    .opencode/oh-my-openagent.json below is a dead file —
+      //    opencode's `serve` command never loads plugins until a
+      //    per-project instance is created, and the npm specifier
+      //    `oh-my-opencode` triggers a bun install that races the
+      //    instance creation. Using the file:// URL to the local
+      //    install skips the npm resolution entirely. Per opencode
+      //    docs (opencode.ai/docs/config — "Plugins" section), the
+      //    plugin field accepts npm names, file:// URLs, and local
+      //    paths.
+      const opencodeDir = join(projectDir, ".opencode")
+      mkdirSync(opencodeDir, { recursive: true })
+      const opencodeJsonPath = join(opencodeDir, "opencode.json")
+      writeFileSync(
+        opencodeJsonPath,
+        JSON.stringify(
+          {
+            plugin: [`file://${join(packageDir, "dist", "index.js")}`],
+          },
+          null,
+          2,
+        ),
+        "utf-8",
+      )
+
+      // 3. Write the user's plugin config with TWO agents: the main
       //    orchestrator (sisyphus, mode=primary) and a subagent it
       //    delegates to (build, mode=subagent). We give each a
       //    `prompt_append` so kasper can later find them as
       //    `plugin_override` sources and the write path is exercised.
-      const opencodeDir = join(projectDir, ".opencode")
-      mkdirSync(opencodeDir, { recursive: true })
-      const omoConfigPath = join(opencodeDir, "oh-my-opencode.json")
+      //
+      //    NOTE: omo's actual config basename is `oh-my-openagent`
+      //    (the package was renamed from oh-my-opencode). The
+      //    previous version of this test wrote
+      //    `.opencode/oh-my-opencode.json` — omo never read it.
+      //    The `oh-my-openagent.json` filename is set in
+      //    `dist/index.js` (`configBasename: "oh-my-openagent"`).
+      const omoConfigPath = join(opencodeDir, "oh-my-openagent.json")
       const mainAgent = "sisyphus"
       const subagent = "build"
       const mainPrompt =
