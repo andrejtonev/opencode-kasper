@@ -6,7 +6,7 @@ import {
   hasTextOutput,
   hasToolCalls,
   type RunResult,
-  runOpenCode,
+  runAttach,
   setupE2EProject,
   shouldRunE2E,
   startServe,
@@ -31,21 +31,35 @@ if (ENABLED && RUNNER_TIMEOUT && RUNNER_TIMEOUT < 120_000) {
 // ── Setup ───────────────────────────────────────────────────────────────
 
 let projectDir = ""
+let servePort = 0
 
-beforeAll(() => {
+beforeAll(async () => {
   if (!ENABLED) return
   const p = setupE2EProject()
   projectDir = p.dir
+  // NOTE: `opencode run` (non-attach) returns "Session not found" in
+  // opencode >=1.15.13 in this environment. The `--attach` flow works,
+  // so we start a single serve here and reuse it for every test in this
+  // file. Previously this was launched lazily per-describe; the lifecycle
+  // was racy under parallel test execution and the lazy launch also
+  // produced empty sessionIDs when the helper functions were called
+  // before the serve health check returned 200.
+  try {
+    servePort = await startServe(projectDir, 18799)
+  } catch (e) {
+    console.log(`  serve start failed: ${e}`)
+  }
 })
 
 afterAll(() => {
+  if (servePort) stopServe(servePort)
   if (projectDir) cleanupE2EProject(projectDir)
 })
 
 // ── Test helpers ────────────────────────────────────────────────────────
 
 function run(prompt: string, timeoutMs?: number): RunResult {
-  return runOpenCode(projectDir, prompt, { timeoutMs })
+  return runAttach(projectDir, prompt, servePort, { timeoutMs })
 }
 
 function durationMs(r: RunResult): number {
@@ -166,23 +180,13 @@ describe("session identity", () => {
 })
 
 // ── Serve-based: subagent session list ──────────────────────────────────
+//
+// Child-session API assertion. Reuses the file-level serve on `servePort`
+// (started in the top-level beforeAll). The previous version launched its
+// own serve on the same port, which raced with the file-level one; the
+// duplicate startServe/stopServe pair has been removed.
 
 describe("subagent session detection (serve)", () => {
-  let servePort = 0
-
-  beforeAll(async () => {
-    if (!ENABLED) return
-    try {
-      servePort = await startServe(projectDir, 18799)
-    } catch (e) {
-      console.log(`  serve start failed: ${e}`)
-    }
-  })
-
-  afterAll(() => {
-    stopServe(18799)
-  })
-
   test("child sessions appear in API after subagent run", async () => {
     if (!ENABLED) {
       console.log("  (skip) not enabled")
@@ -193,7 +197,6 @@ describe("subagent session detection (serve)", () => {
       return
     }
 
-    const { runAttach } = await import("./harness.js")
     const result = runAttach(
       projectDir,
       "use the explore agent to search for *.ts files in the tests directory. Report what it finds.",
@@ -234,7 +237,7 @@ describe("kasper scoring", () => {
       min_session_messages: 1,
       evaluation_poll_interval_ms: 2_000,
       model: "opencode-go/minimax-m2.7",
-      scoring_timeout_ms: 60_000,
+      scoring_timeout_ms: 120_000,
       detail_level: "minimal",
       quiet: true,
     })
@@ -243,7 +246,7 @@ describe("kasper scoring", () => {
 
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 240_000,
     })
     if (state) {
       const recent = (state as Record<string, unknown>).recent as

@@ -54,6 +54,13 @@ const DEFAULT_OPENCODE_CONFIG: Record<string, unknown> = {
   // No need to duplicate here — avoids double-loading
 }
 
+// Auth credentials for opencode serve (opencode >=1.15.x requires HTTP Basic
+// Auth on all API endpoints). Read from environment — never hardcode real
+// credentials in source. The spawned serve process inherits these from env;
+// the curl-based health-check helpers use them for the Authorization header.
+const _SERVER_USER = process.env.OPENCODE_SERVER_USERNAME ?? ""
+const _SERVER_PASS = process.env.OPENCODE_SERVER_PASSWORD ?? ""
+
 const RUN_TIMEOUT_MS = process.env.KASPER_E2E_TIMEOUT
   ? parseInt(process.env.KASPER_E2E_TIMEOUT, 10)
   : 180_000
@@ -273,29 +280,59 @@ export function stopServe(port?: number): void {
 
 export function isServeRunning(port = SERVE_PORT): boolean {
   try {
+    const authFlag =
+      _SERVER_USER && _SERVER_PASS
+        ? `-u "${_SERVER_USER}:${_SERVER_PASS}"`
+        : ""
+    // Use root `/` (returns 200 with HTML) rather than `/api/session` which
+    // requires a `?limit=N` query parameter in opencode >=1.15.x.
     const resp = execSync(
-      `curl -s -o /dev/null -w "%{http_code}" http://localhost:${port}/api/session`,
+      `curl -s -o /dev/null -w "%{http_code}" ${authFlag} http://localhost:${port}/`,
       {
         stdio: "pipe",
         encoding: "utf-8",
-        timeout: 3_000,
+        timeout: 5_000,
       },
     )
-    return resp.trim() === "200"
+    return resp.trim().startsWith("2")
   } catch {
     return false
   }
 }
 
+/**
+ * Call the opencode HTTP REST API and parse the JSON response.
+ *
+ * Known upstream issue (opencode server 1.15.x): `GET /api/session` lists
+ * sessions from **all** projects (not just the current directory). If any
+ * session in the global database has corrupt timestamp fields the entire
+ * response fails with HTTP 400 / `InvalidRequestError`. We detect this and
+ * return `null` so callers degrade gracefully (empty results) instead of
+ * crashing on a malformed upstream response.
+ */
 export function fetchAPI(path: string, port = SERVE_PORT): unknown {
-  const url = `http://localhost:${port}${path}`
-  const raw = execSync(`curl -s "${url}"`, {
+  const authFlag =
+    _SERVER_USER && _SERVER_PASS
+      ? `-u "${_SERVER_USER}:${_SERVER_PASS}"`
+      : ""
+  // opencode >=1.15.x requires a `?limit=N` query parameter on the
+  // `/api/session` list endpoint (default limit=0 causes a 400 error).
+  // If the caller requests the bare list endpoint, add a reasonable limit.
+  const resolvedPath =
+    path === "/api/session" ? "/api/session?limit=100" : path
+  const url = `http://localhost:${port}${resolvedPath}`
+  const raw = execSync(`curl -s ${authFlag} "${url}"`, {
     stdio: "pipe",
     encoding: "utf-8",
     timeout: 5_000,
   })
   try {
-    return JSON.parse(raw)
+    const parsed = JSON.parse(raw)
+    // Detect opencode error response and return null instead
+    if (parsed && typeof parsed === "object" && "_tag" in parsed) {
+      return null
+    }
+    return parsed
   } catch {
     return raw
   }
@@ -570,6 +607,49 @@ export function getLogEventFields(
   field: string,
 ): unknown[] {
   return log
+    .filter((e) => e.event === event)
+    .map((e) => e[field])
+    .filter((v) => v !== undefined)
+}
+
+/**
+ * Return only the log entries that pertain to a specific session. Kasper
+ * attaches the original session's `sessionID` to most log entries (e.g.
+ * `run_eval_start`, `scoring_prompt_sending`, `evaluation_done`,
+ * `state_record_session`). Some entries use a different field — most
+ * notably `state_record_session` uses `sessionId` (no `sessionID` suffix).
+ * We match either form so a single helper covers all of them.
+ *
+ * This is the right primitive for e2e lifecycle assertions: rather than
+ * asking "did this event ever fire in the entire log?", we ask "did the
+ * lifecycle for THIS session run end-to-end?" The former is fragile
+ * because the on-disk log is trimmed (LOG_MAX_LINES) and the latter is
+ * stable.
+ */
+export function filterLogBySession(
+  log: LogEntry[],
+  sessionID: string,
+): LogEntry[] {
+  return log.filter(
+    (e) => e.sessionID === sessionID || e.sessionId === sessionID,
+  )
+}
+
+export function hasLogEventForSession(
+  log: LogEntry[],
+  event: string,
+  sessionID: string,
+): boolean {
+  return filterLogBySession(log, sessionID).some((e) => e.event === event)
+}
+
+export function getLogEventFieldsForSession(
+  log: LogEntry[],
+  event: string,
+  field: string,
+  sessionID: string,
+): unknown[] {
+  return filterLogBySession(log, sessionID)
     .filter((e) => e.event === event)
     .map((e) => e[field])
     .filter((v) => v !== undefined)

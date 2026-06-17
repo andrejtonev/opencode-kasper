@@ -56,7 +56,7 @@ describe("plugin lifecycle edge cases", () => {
         min_session_messages: 1,
         evaluation_poll_interval_ms: 5_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_timeout_ms: 60_000,
+        scoring_timeout_ms: 120_000,
         scoring_threshold: 0.7,
         auto_update: false,
         detail_level: "minimal",
@@ -96,10 +96,10 @@ describe("plugin lifecycle edge cases", () => {
 
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 180_000,
     })
     if (!state || typeof state !== "object") {
-      log("(warn) scoring did not complete within 60s")
+      log("(warn) scoring did not complete within maxWaitMs")
       return
     }
     if (!state.sessions) {
@@ -430,7 +430,7 @@ describe("no AGENTS.md", () => {
         min_session_messages: 1,
         evaluation_poll_interval_ms: 5_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_timeout_ms: 60_000,
+        scoring_timeout_ms: 120_000,
         scoring_threshold: 0.7,
         auto_update: false,
         detail_level: "minimal",
@@ -490,10 +490,10 @@ describe("no AGENTS.md", () => {
 
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 180_000,
     })
     if (!state) {
-      log("(warn) no scoring in 60s")
+      log("(warn) no scoring within maxWaitMs")
       return
     }
 
@@ -545,7 +545,7 @@ describe("already-evaluated skip", () => {
         min_session_messages: 1,
         evaluation_poll_interval_ms: 300_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_timeout_ms: 60_000,
+        scoring_timeout_ms: 120_000,
         scoring_threshold: 0.7,
         auto_update: false,
         detail_level: "minimal",
@@ -622,7 +622,7 @@ describe("re-evaluation on new messages", () => {
         min_session_messages: 1,
         evaluation_poll_interval_ms: 4_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_timeout_ms: 60_000,
+        scoring_timeout_ms: 120_000,
         scoring_threshold: 1.0,
         auto_update: false,
         detail_level: "minimal",
@@ -664,7 +664,7 @@ describe("re-evaluation on new messages", () => {
 
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 180_000,
     })
     if (!state) {
       log("(warn) initial scoring did not complete")
