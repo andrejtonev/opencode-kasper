@@ -221,7 +221,15 @@ describe.skipIf(!ENABLED)(
       } catch {
         /* ok */
       }
-      if (project?.dir) cleanupE2EProject(project.dir)
+      if (!project?.dir) return
+      // Diagnostic hook: keep the project dir on disk so you can
+      // inspect .opencode/oh-my-opencode.json and the kasper state
+      // after the run. Default is still to clean up.
+      if (process.env.KASPER_E2E_KEEP_TMP === "1") {
+        log(`(info) KASPER_E2E_KEEP_TMP=1 — leaving ${project.dir} on disk`)
+        return
+      }
+      cleanupE2EProject(project.dir)
     })
 
     test("npm-installed oh-my-opencode is on disk and exposes sisyphus+build", () => {
