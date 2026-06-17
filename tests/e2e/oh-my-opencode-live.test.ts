@@ -76,7 +76,9 @@ import { join } from "node:path"
 
 import {
   cleanupE2EProject,
+  disableKasperPlugin,
   type E2EProject,
+  enableKasperPlugin,
   fetchAPI,
   getScoredSessions,
   hasTextOutput,
@@ -87,6 +89,7 @@ import {
   shouldRunE2E,
   startServeWithConfig,
   stopServe,
+  waitForKasperLoaded,
   waitForScoredSessions,
 } from "./harness.js"
 
@@ -130,11 +133,16 @@ interface OmoProject extends E2EProject {
 
 let project: OmoProject
 let servePort = 0
+let pluginEnabled = false
 
 describe.skipIf(!ENABLED)(
   "e2e: kasper evaluates and updates oh-my-opencode agents (main + subagent)",
   () => {
     beforeAll(async () => {
+      // Enable the kasper plugin symlink so opencode serve loads it.
+      enableKasperPlugin()
+      pluginEnabled = true
+
       // 1. Fresh project + install the real omo package.
       const projectDir = mkdtempSync(join(tmpdir(), "kasper-e2e-omo-live-"))
       const packageDir = npmInstallOmo(projectDir)
@@ -210,6 +218,9 @@ describe.skipIf(!ENABLED)(
         },
         SERVE_PORT,
       )
+      // Verify the kasper plugin actually loaded. Fails loudly if
+      // the symlink toggle silently failed (e.g. file is .disabled).
+      await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
       log(`serve started on port ${servePort}`)
     }, 300_000)
 
@@ -221,15 +232,20 @@ describe.skipIf(!ENABLED)(
       } catch {
         /* ok */
       }
-      if (!project?.dir) return
-      // Diagnostic hook: keep the project dir on disk so you can
-      // inspect .opencode/oh-my-opencode.json and the kasper state
-      // after the run. Default is still to clean up.
-      if (process.env.KASPER_E2E_KEEP_TMP === "1") {
-        log(`(info) KASPER_E2E_KEEP_TMP=1 — leaving ${project.dir} on disk`)
-        return
+      if (project?.dir) {
+        // Diagnostic hook: keep the project dir on disk so you can
+        // inspect .opencode/oh-my-opencode.json and the kasper state
+        // after the run. Default is still to clean up.
+        if (process.env.KASPER_E2E_KEEP_TMP === "1") {
+          log(`(info) KASPER_E2E_KEEP_TMP=1 — leaving ${project.dir} on disk`)
+        } else {
+          cleanupE2EProject(project.dir)
+        }
       }
-      cleanupE2EProject(project.dir)
+      if (pluginEnabled) {
+        disableKasperPlugin()
+        pluginEnabled = false
+      }
     })
 
     test("npm-installed oh-my-opencode is on disk and exposes sisyphus+build", () => {

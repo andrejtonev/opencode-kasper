@@ -308,11 +308,7 @@ describe("log-verified scoring", () => {
 
     // At minimum: we should have scoring_session_created and evaluation_done
     expect(
-      hasLogEventForSession(
-        logEntries,
-        "scoring_session_created",
-        r.sessionID,
-      ),
+      hasLogEventForSession(logEntries, "scoring_session_created", r.sessionID),
     ).toBe(true)
     expect(
       hasLogEventForSession(logEntries, "evaluation_done", r.sessionID),
@@ -623,8 +619,12 @@ describe("auto-apply file targeting", () => {
 
     // If both AGENTS.md and an agent prompt have sections, verify
     // they are different content (not duplicated).
-    if (agentsMd && customPrompt &&
-        hasKasperSection(agentsMd) && hasKasperSection(customPrompt)) {
+    if (
+      agentsMd &&
+      customPrompt &&
+      hasKasperSection(agentsMd) &&
+      hasKasperSection(customPrompt)
+    ) {
       const agentsMdContent = getKasperSectionContent(agentsMd)
       const customContent = getKasperSectionContent(customPrompt)
       if (agentsMdContent && customContent) {
