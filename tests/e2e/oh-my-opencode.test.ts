@@ -228,15 +228,32 @@ describe.skipIf(!ENABLED)(
     )
 
     test("kasper.write() is idempotent — second call with same content does not duplicate", async () => {
+      // First write establishes the rule.
       await manager.write(install.agentName, "New rule from kasper e2e test.")
-      const afterRaw = readFileSync(install.configPath, "utf-8")
-      const afterParsed = JSON.parse(afterRaw)
-      const occurrences = (
-        afterParsed.agent[install.agentName].prompt_append.match(
+      const afterFirstRaw = readFileSync(install.configPath, "utf-8")
+      const afterFirstParsed = JSON.parse(afterFirstRaw)
+      const firstCount = (
+        afterFirstParsed.agent[install.agentName].prompt_append.match(
           /New rule from kasper e2e test\./g,
         ) ?? []
       ).length
-      expect(occurrences).toBe(1)
+      // After the first write, the rule must appear exactly once.
+      expect(firstCount).toBe(1)
+
+      // Second write with the SAME content must be deduped (not duplicated).
+      // This is the regression that catches a broken dedupe path in
+      // appendToPluginOverridePrompt at src/agent-prompt-resolver.ts.
+      await manager.write(install.agentName, "New rule from kasper e2e test.")
+      const afterSecondRaw = readFileSync(install.configPath, "utf-8")
+      const afterSecondParsed = JSON.parse(afterSecondRaw)
+      const secondCount = (
+        afterSecondParsed.agent[install.agentName].prompt_append.match(
+          /New rule from kasper e2e test\./g,
+        ) ?? []
+      ).length
+      // After the second (idempotent) write, the rule must STILL appear
+      // exactly once — not twice.
+      expect(secondCount).toBe(1)
     })
 
     test("the agent's resolve result is stable across calls (no drift)", async () => {
