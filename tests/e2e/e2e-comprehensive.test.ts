@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import { execSync } from "node:child_process"
 import {
   cleanupE2EProject,
+  disableKasperPlugin,
+  enableKasperPlugin,
   getKasperSectionContent,
   getScoredSessions,
   getSessionsWithSubagents,
@@ -18,6 +21,7 @@ import {
   startServeWithConfig,
   stopServe,
   waitForChildSessions,
+  waitForKasperLoaded,
   waitForScoredSessions,
 } from "./harness.js"
 
@@ -32,7 +36,6 @@ function log(msg: string): void {
 }
 
 function execSleep(seconds: number): void {
-  const { execSync } = require("node:child_process")
   try {
     execSync(`sleep ${seconds}`, { stdio: "pipe" })
   } catch {
@@ -63,22 +66,28 @@ function attach(
 describe("auto mode (polling + auto-apply)", () => {
   let projectDir = ""
   let servePort = 0
+  let pluginEnabled = false
 
   beforeAll(async () => {
     if (!ENABLED) return
+    enableKasperPlugin()
+    pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
 
-    // Low poll interval, auto_update on, threshold 1.0 (trigger on any score < 1.0)
+    // Low poll interval, auto_update on, threshold 0.6 (low — first
+    // session triggers considerImprovement), min_observations=1
+    // (one card is enough to write).
     servePort = await startServeWithConfig(
       projectDir,
       {
         enabled: true,
         min_session_messages: 1,
+        min_observations_for_update: 1,
         evaluation_poll_interval_ms: 3_000,
         scoring_timeout_ms: 60_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_threshold: 1.0,
+        scoring_threshold: 0.6,
         auto_update: true,
         max_agent_guidance_chars: 2000,
         detail_level: "minimal",
@@ -88,6 +97,7 @@ describe("auto mode (polling + auto-apply)", () => {
       SERVE_PORT_AUTO,
     )
 
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
     log(`serve started on port ${servePort}`)
   })
 
@@ -95,6 +105,10 @@ describe("auto mode (polling + auto-apply)", () => {
     stopServe(SERVE_PORT_AUTO)
     execSleep(3) // let port fully release
     if (projectDir) cleanupE2EProject(projectDir)
+    if (pluginEnabled) {
+      disableKasperPlugin()
+      pluginEnabled = false
+    }
   })
 
   test("a. auto-poll scores sessions after tool use", async () => {
@@ -102,10 +116,7 @@ describe("auto mode (polling + auto-apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     const r = attach(
       projectDir,
@@ -117,16 +128,15 @@ describe("auto mode (polling + auto-apply)", () => {
     expect(r.sessionID).toBeTruthy()
     expect(hasToolCalls(r.events)).toBe(true)
 
+    // HARD assert: scoring MUST complete. Previous version logged
+    // "scoring failed (LLM unavailable)" and passed.
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
       maxWaitMs: 90_000,
     })
-    if (!state) {
-      log("scoring failed (LLM unavailable)")
-      return
-    }
+    expect(state).toBeTruthy()
 
-    const sessions = getScoredSessions(state)
+    const sessions = getScoredSessions(state!)
     log(`scored: ${sessions.length} session(s)`)
     for (const s of sessions) {
       const sc = s.score_card as Record<string, unknown> | undefined
@@ -155,10 +165,7 @@ describe("auto mode (polling + auto-apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     const r = attach(
       projectDir,
@@ -177,10 +184,16 @@ describe("auto mode (polling + auto-apply)", () => {
     // Wait for auto-poll to score
     execSleep(20)
 
+    // HARD assert: state must exist (kasper ran).
     const state = readKasperState(projectDir)
-    const subagentSessions = getSessionsWithSubagents(state)
+    expect(state).toBeTruthy()
+    const subagentSessions = getSessionsWithSubagents(state!)
     log(`scored subagent sessions: ${subagentSessions.length}`)
 
+    // If the model did delegate, the subagent MUST be scored and the
+    // metadata MUST be correct. We allow the model to NOT delegate
+    // (it sometimes handles the prompt directly) — in that case we
+    // only check the main session was scored.
     if (subagentSessions.length > 0) {
       for (const s of subagentSessions) {
         log(
@@ -193,8 +206,18 @@ describe("auto mode (polling + auto-apply)", () => {
         expect(s.score).toBeGreaterThan(0)
       }
     } else if (children.length > 0) {
+      // children exist in /api/session but not in kasper state — this
+      // is a kasper bug (auto-poll not picking them up), not a
+      // silent pass. Hard-assert the equivalence.
+      throw new Error(
+        `${children.length} child session(s) visible in /api/session ` +
+          `but kasper state has no subagent records — auto-poll is ` +
+          `not picking up delegated sessions.`,
+      )
+    } else {
       log(
-        "child sessions found but not scored — auto-poll may not be picking them up",
+        "(info) model did not delegate on this run; the main-session " +
+          "scoring path is verified by test (a) and (c).",
       )
     }
   })
@@ -204,15 +227,14 @@ describe("auto mode (polling + auto-apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
-    // Run another session to potentially reach MIN_OBSERVATIONS_FOR_UPDATE (2)
+    // Run a weakness-provoking session. With scoring_threshold=0.6
+    // and min_observations_for_update=1, the first card below 0.6
+    // fires auto-apply.
     const r = attach(
       projectDir,
-      "read package.json and summarize its contents",
+      "Do not read any files. Do not run any commands. Guess what package.json contains and report a one-line answer.",
       servePort,
       90_000,
     )
@@ -240,17 +262,16 @@ describe("auto mode (polling + auto-apply)", () => {
       updated.push("explore prompt")
     }
 
-    if (updated.length > 0) {
-      expect(updated.length).toBeGreaterThanOrEqual(1)
-    } else {
-      log(
-        "no prompt updates — MIN_OBSERVATIONS_FOR_UPDATE (2) may not have been met, or scores were too high",
-      )
-    }
+    // HARD assert: with scoring_threshold=0.6 and a weakness-provoking
+    // prompt, at least one of AGENTS.md / general / explore MUST have
+    // been updated. Previous version used `if (updated.length > 0)`
+    // and silently passed otherwise.
+    expect(updated.length).toBeGreaterThanOrEqual(1)
 
     // Verify state contains weaknesses after multiple sessions
     const state = readKasperState(projectDir)
-    const sessions = getScoredSessions(state)
+    expect(state).toBeTruthy()
+    const sessions = getScoredSessions(state!)
     log(`total scored sessions: ${sessions.length}`)
     const agg = (state as Record<string, unknown>)?.aggregate as
       | Record<string, unknown>
@@ -269,9 +290,12 @@ describe("manual mode (explicit scoring + manual apply)", () => {
   let projectDir = ""
   let servePort = 0
   const sessionIDs: string[] = []
+  let pluginEnabled = false
 
   beforeAll(async () => {
     if (!ENABLED) return
+    enableKasperPlugin()
+    pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
 
@@ -284,7 +308,8 @@ describe("manual mode (explicit scoring + manual apply)", () => {
         evaluation_poll_interval_ms: 300_000,
         scoring_timeout_ms: 60_000,
         model: "opencode-go/minimax-m2.7",
-        scoring_threshold: 1.0,
+        scoring_threshold: 0.6,
+        min_observations_for_update: 1,
         auto_update: false,
         detail_level: "minimal",
         quiet: true,
@@ -293,6 +318,7 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       SERVE_PORT_MANUAL,
     )
 
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
     log(`serve started on port ${servePort}`)
   })
 
@@ -300,6 +326,10 @@ describe("manual mode (explicit scoring + manual apply)", () => {
     stopServe(SERVE_PORT_MANUAL)
     execSleep(3)
     if (projectDir) cleanupE2EProject(projectDir)
+    if (pluginEnabled) {
+      disableKasperPlugin()
+      pluginEnabled = false
+    }
   })
 
   test("d. batch score evaluates all sessions", async () => {
@@ -307,10 +337,7 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     // Create sessions to score (moved from beforeAll to keep hook lightweight)
     if (sessionIDs.length === 0) {
@@ -334,15 +361,15 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       log(`created ${sessionIDs.length} sessions for manual scoring`)
     }
 
-    if (sessionIDs.length === 0) {
-      log("no sessions to score")
-      return
-    }
+    // HARD assert: we created sessions to score.
+    expect(sessionIDs.length).toBeGreaterThanOrEqual(2)
 
-    const before = getScoredSessions(readKasperState(projectDir)).length
+    const before = getScoredSessions(readKasperState(projectDir)!).length
     log(`scored before batch: ${before}`)
 
-    // Trigger batch scoring via kasper tool
+    // Trigger batch scoring via kasper tool. The LLM may or may not
+    // actually invoke the tool — this is best-effort. We just
+    // observe what happens.
     const cmd = attach(
       projectDir,
       "call the kasper_score_session tool with count=5 to evaluate recent sessions. Return the tool's output verbatim.",
@@ -353,23 +380,15 @@ describe("manual mode (explicit scoring + manual apply)", () => {
 
     execSleep(10)
 
-    const after = getScoredSessions(readKasperState(projectDir)).length
+    // HARD assert: state exists (kasper loaded).
+    const state = readKasperState(projectDir)
+    expect(state).toBeTruthy()
+    const after = getScoredSessions(state!).length
     log(`scored after batch: ${after}`)
 
-    if (after > before) {
-      expect(after).toBeGreaterThan(before)
-      const state = readKasperState(projectDir)
-      const sessions = getScoredSessions(state)
-      for (const s of sessions) {
-        log(
-          `  id=${(s.id as string)?.slice(0, 16)}… score=${(s.score as number)?.toFixed(2)} type=${s.agent_type ?? "?"}`,
-        )
-      }
-    } else {
-      log(
-        "no new scores — batch scoring may have failed (LLM unavailable or sessions already scored)",
-      )
-    }
+    // The batch tool may or may not be invoked by the LLM. We don't
+    // hard-assert it (that would be flaky). The state-exists check
+    // is the real signal that kasper is running.
   })
 
   test("e. single session scoring produces valid score_card", async () => {
@@ -377,18 +396,13 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
-    if (sessionIDs.length === 0) {
-      log("no sessions to score")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
+    expect(sessionIDs.length).toBeGreaterThanOrEqual(1)
 
     const targetID = sessionIDs[0]
     log(`scoring session: ${targetID.slice(0, 20)}…`)
 
+    // Best-effort: the LLM may or may not invoke kasper_score_session.
     const cmd = attach(
       projectDir,
       `call the kasper_score_session tool with session_id="${targetID}". Return the tool's output.`,
@@ -400,7 +414,8 @@ describe("manual mode (explicit scoring + manual apply)", () => {
     execSleep(5)
 
     const state = readKasperState(projectDir)
-    const scored = getScoredSessions(state).find((s) => s.id === targetID)
+    expect(state).toBeTruthy()
+    const scored = getScoredSessions(state!).find((s) => s.id === targetID)
 
     if (scored) {
       log(`session scored: score=${(scored.score as number)?.toFixed(2)}`)
@@ -411,7 +426,11 @@ describe("manual mode (explicit scoring + manual apply)", () => {
         expect(card.overall_score).toBeGreaterThan(0)
       }
     } else {
-      log("session not scored — manual scoring failed (LLM unavailable)")
+      log(
+        "(info) session not scored — LLM did not invoke kasper_score_session. " +
+          "This is best-effort; the auto-mode tests in the first describe " +
+          "block cover the scoring pipeline end-to-end.",
+      )
     }
   })
 
@@ -420,22 +439,16 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     // Check current state
     const state = readKasperState(projectDir)
-    const sessions = getScoredSessions(state)
+    expect(state).toBeTruthy()
+    const sessions = getScoredSessions(state!)
     log(`scored sessions before apply: ${sessions.length}`)
 
-    if (sessions.length === 0) {
-      log("no scored sessions — skipping manual apply test")
-      return
-    }
-
-    // Check if any improvements are pending
+    // Best-effort: invoke kasper_improve / kasper_apply via the LLM.
+    // The LLM may or may not actually call the tool. We just observe.
     const improveResult = attach(
       projectDir,
       "call the kasper_improve tool to show improvements. Use dry_run=true to just preview.",
@@ -444,7 +457,6 @@ describe("manual mode (explicit scoring + manual apply)", () => {
     )
     log(`improve: ${improveResult.raw.slice(0, 300)}`)
 
-    // Try to apply first improvement
     const applyResult = attach(
       projectDir,
       "call the kasper_apply tool with index=1 to apply the first improvement. Return the result.",
@@ -466,11 +478,13 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       log("general prompt has Kasper section after manual apply")
     }
 
+    // Best-effort. The LLM may or may not invoke the tools. The
+    // auto-mode test (c) is the hard assertion for auto-apply.
     const anyUpdated =
       hasKasperSection(agentsMd) || hasKasperSection(generalPrompt)
     if (!anyUpdated) {
       log(
-        "no file updates — improvements require LLM scoring + weakness detection + MIN_OBSERVATIONS >= 2",
+        "(info) no file updates via manual apply — LLM did not invoke the tools.",
       )
     }
   })
