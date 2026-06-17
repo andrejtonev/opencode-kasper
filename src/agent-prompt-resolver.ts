@@ -148,10 +148,73 @@ function getAgentEntry(
   const agent = raw.agent
   if (!agent || typeof agent !== "object" || Array.isArray(agent))
     return undefined
-  const entry = (agent as Record<string, unknown>)[name]
+  // Exact match first.
+  const exact = (agent as Record<string, unknown>)[name]
+  if (exact && typeof exact === "object" && !Array.isArray(exact))
+    return exact as Record<string, unknown>
+  // Fallback: name may be a display name (e.g. omo registers
+  // `sisyphus: "Sisyphus - ultraworker"` in opencode's session info, so
+  // `agentName` arrives as the human-readable string rather than the
+  // canonical config key). Try a case-insensitive match, then a
+  // "display name starts with key" match. We return the FIRST longest
+  // matching key so that `sisyphus` wins over `sisyphus-junior` when
+  // the display name is "Sisyphus - ultraworker".
+  const lowerName = name.toLowerCase()
+  let best: { key: string; len: number } | undefined
+  for (const key of Object.keys(agent as Record<string, unknown>)) {
+    if (key.toLowerCase() === lowerName) {
+      best = { key, len: key.length }
+      break
+    }
+    if (lowerName.startsWith(key.toLowerCase())) {
+      if (!best || key.length > best.len) {
+        best = { key, len: key.length }
+      }
+    }
+  }
+  if (!best) return undefined
+  const entry = (agent as Record<string, unknown>)[best.key]
   if (!entry || typeof entry !== "object" || Array.isArray(entry))
     return undefined
   return entry as Record<string, unknown>
+}
+
+/**
+ * Like {@link getAgentEntry} but also returns the canonical config key
+ * the entry was found under. When the caller passes a display name
+ * (e.g. "Sisyphus - ultraworker"), this returns the matched key
+ * (e.g. "sisyphus") so the caller can use the canonical name in
+ * subsequent operations (file paths, override sources).
+ */
+function getAgentEntryAndKey(
+  raw: Record<string, unknown> | undefined,
+  name: string,
+): { entry: Record<string, unknown>; key: string } | undefined {
+  if (!raw) return undefined
+  const agent = raw.agent
+  if (!agent || typeof agent !== "object" || Array.isArray(agent))
+    return undefined
+  // Exact match.
+  const exact = (agent as Record<string, unknown>)[name]
+  if (exact && typeof exact === "object" && !Array.isArray(exact))
+    return { entry: exact as Record<string, unknown>, key: name }
+  // Fallback (see getAgentEntry comment).
+  const lowerName = name.toLowerCase()
+  let best: { key: string; len: number } | undefined
+  for (const key of Object.keys(agent as Record<string, unknown>)) {
+    if (key.toLowerCase() === lowerName) {
+      best = { key, len: key.length }
+      break
+    }
+    if (lowerName.startsWith(key.toLowerCase())) {
+      if (!best || key.length > best.len) best = { key, len: key.length }
+    }
+  }
+  if (!best) return undefined
+  const entry = (agent as Record<string, unknown>)[best.key]
+  if (!entry || typeof entry !== "object" || Array.isArray(entry))
+    return undefined
+  return { entry: entry as Record<string, unknown>, key: best.key }
 }
 
 interface LoadedConfig {
@@ -513,14 +576,20 @@ export async function resolveAgentPromptSource(
   // Project wins over global. If both define the agent, prefer the project
   // entry — that matches opencode's deep-merge semantics where the project
   // config overrides the global.
-  const projectEntry = getAgentEntry(projectConfig?.raw, agentName)
-  const globalEntry = getAgentEntry(globalConfig?.raw, agentName)
-  const entry = projectEntry ?? globalEntry
-  const entryConfig = projectEntry
+  const projectHit = getAgentEntryAndKey(projectConfig?.raw, agentName)
+  const globalHit = getAgentEntryAndKey(globalConfig?.raw, agentName)
+  const entry = projectHit?.entry ?? globalHit?.entry
+  const entryConfig = projectHit
     ? projectConfig
-    : globalEntry
+    : globalHit
       ? globalConfig
       : undefined
+  // If the agentName passed in is a display name (e.g. "Sisyphus -
+  // ultraworker") and the config defines the agent under the canonical key
+  // (e.g. "sisyphus"), the helpers above resolve to the canonical key.
+  // Subsequent fallbacks (file paths, plugin_override scan) need the
+  // canonical name to find on-disk artefacts keyed by the config key.
+  const effectiveName = projectHit?.key ?? globalHit?.key ?? agentName
 
   if (entry && entryConfig) {
     const prompt = entry.prompt
@@ -541,10 +610,10 @@ export async function resolveAgentPromptSource(
   }
 
   // Fall back to conventional file locations
-  for (const p of projectAgentDirCandidates(projectRoot, agentName)) {
+  for (const p of projectAgentDirCandidates(projectRoot, effectiveName)) {
     if (await fileExists(p)) return { kind: "project_file", path: p }
   }
-  for (const p of globalAgentDirCandidates(globalOpencodeDir, agentName)) {
+  for (const p of globalAgentDirCandidates(globalOpencodeDir, effectiveName)) {
     if (await fileExists(p)) return { kind: "global_file", path: p }
   }
 
@@ -555,7 +624,7 @@ export async function resolveAgentPromptSource(
   // any top-level `agent` or `agents` map with a `prompt`/`prompt_append`
   // field for this agent, and surface it as a `plugin_override` source.
   const pluginOverride = await findPluginConfigOverride(
-    agentName,
+    effectiveName,
     projectRoot,
     globalOpencodeDir,
   )
@@ -567,7 +636,7 @@ export async function resolveAgentPromptSource(
   for (const p of customPromptPathCandidates(
     customPromptPaths,
     projectRoot,
-    agentName,
+    effectiveName,
   )) {
     if (await fileExists(p)) return { kind: "project_file", path: p }
   }
