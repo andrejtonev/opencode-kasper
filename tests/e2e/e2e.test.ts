@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import {
   cleanupE2EProject,
+  disableKasperPlugin,
+  enableKasperPlugin,
   fetchAPI,
   getToolCalls,
   hasTextOutput,
@@ -11,6 +13,7 @@ import {
   shouldRunE2E,
   startServe,
   stopServe,
+  waitForKasperLoaded,
   waitForScoredSessions,
   writeKasperConfig,
 } from "./harness.js"
@@ -32,9 +35,16 @@ if (ENABLED && RUNNER_TIMEOUT && RUNNER_TIMEOUT < 120_000) {
 
 let projectDir = ""
 let servePort = 0
+let pluginEnabled = false
 
 beforeAll(async () => {
   if (!ENABLED) return
+  // Enable the kasper plugin symlink. If it's already enabled we leave
+  // it; the matching disable is in afterAll unless
+  // KASPER_E2E_LEAVE_PLUGIN_ENABLED=1 is set.
+  enableKasperPlugin()
+  pluginEnabled = true
+
   const p = setupE2EProject()
   projectDir = p.dir
   // NOTE: `opencode run` (non-attach) returns "Session not found" in
@@ -44,16 +54,19 @@ beforeAll(async () => {
   // was racy under parallel test execution and the lazy launch also
   // produced empty sessionIDs when the helper functions were called
   // before the serve health check returned 200.
-  try {
-    servePort = await startServe(projectDir, 18799)
-  } catch (e) {
-    console.log(`  serve start failed: ${e}`)
-  }
+  servePort = await startServe(projectDir, 18799)
+  // Verify the kasper plugin actually loaded into the serve. If the
+  // symlink toggle silently failed, this throws with a clear error.
+  await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
 })
 
 afterAll(() => {
   if (servePort) stopServe(servePort)
   if (projectDir) cleanupE2EProject(projectDir)
+  if (pluginEnabled) {
+    disableKasperPlugin()
+    pluginEnabled = false
+  }
 })
 
 // ── Test helpers ────────────────────────────────────────────────────────
@@ -118,6 +131,10 @@ describe("tool call detection", () => {
 })
 
 describe("subagent call detection", () => {
+  // The `task` tool is how the opencode primary agent spawns subagents.
+  // This test proves that prompt → subagent delegation works in the
+  // opencode version we test against. We use the `explore` agent because
+  // it's an opencode built-in available in every recent release.
   test("task tool spawns subagent", async () => {
     if (!ENABLED) {
       console.log("  (skip) not enabled")
@@ -130,14 +147,12 @@ describe("subagent call detection", () => {
     expect(result.sessionID).toBeTruthy()
 
     const taskCalls = getToolCalls(result.events, "task")
-    if (taskCalls.length > 0) {
-      expect(taskCalls[0].part?.tool).toBe("task")
-      console.log(`  ok — ${taskCalls.length} task call(s) detected`)
-    } else {
-      console.log(
-        `  info — no task calls (agent may not have spawned subagent)`,
-      )
-    }
+    // HARD assert: a delegation prompt MUST produce a task call. The
+    // previous version used `if (taskCalls.length > 0)` and silently
+    // passed otherwise.
+    expect(taskCalls.length).toBeGreaterThanOrEqual(1)
+    expect(taskCalls[0].part?.tool).toBe("task")
+    console.log(`  ok — ${taskCalls.length} task call(s) detected`)
   })
 })
 
@@ -192,10 +207,6 @@ describe("subagent session detection (serve)", () => {
       console.log("  (skip) not enabled")
       return
     }
-    if (!servePort) {
-      console.log("  (skip) serve not available")
-      return
-    }
 
     const result = runAttach(
       projectDir,
@@ -205,21 +216,22 @@ describe("subagent session detection (serve)", () => {
     )
     console.log(`  session: ${result.sessionID.slice(0, 20)}…`)
 
-    await new Promise((resolve) => setTimeout(resolve, 3_000))
+    // Give the opencode session store a moment to flush the child
+    // session to disk. 5s is generous for a same-host subagent spawn.
+    await new Promise((resolve) => setTimeout(resolve, 5_000))
 
     const data = fetchAPI("/api/session", servePort) as {
       items?: Array<{ id: string; parentID?: string; agent?: string }>
     }
     const items = data?.items ?? []
 
-    const children = items.filter((s) => s.parentID)
+    const children = items.filter((s) => s.parentID === result.sessionID)
     console.log(`  sessions=${items.length} children=${children.length}`)
-    if (children.length > 0) {
-      expect(children.length).toBeGreaterThanOrEqual(1)
-      children.forEach((c) => {
-        console.log(`    child: ${c.id.slice(0, 20)}… agent=${c.agent}`)
-      })
+    for (const c of children) {
+      console.log(`    child: ${c.id.slice(0, 20)}… agent=${c.agent}`)
     }
+    // HARD assert: a delegation prompt MUST produce a child session.
+    expect(children.length).toBeGreaterThanOrEqual(1)
   })
 })
 
@@ -244,20 +256,21 @@ describe("kasper scoring", () => {
 
     run("list files using ls")
 
+    // HARD assert: the scoring pipeline MUST produce a card within
+    // 240s. The previous version logged a warning and passed if
+    // scoring didn't complete, which masked the disabled-plugin bug.
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
       maxWaitMs: 240_000,
     })
-    if (state) {
-      const recent = (state as Record<string, unknown>).recent as
-        | Array<{ score: number; id: string }>
-        | undefined
-      console.log(`  scored: ${recent?.length ?? 0} sessions`)
-      if (recent && recent.length > 0 && recent[0].score > 0) {
-        expect(recent[0].score).toBeGreaterThan(0)
-      }
-    } else {
-      console.log(`  no scored sessions after 30s`)
-    }
+    expect(state).toBeTruthy()
+    const recent = (state as Record<string, unknown>).recent as
+      | Array<{ score: number; id: string }>
+      | undefined
+    console.log(`  scored: ${recent?.length ?? 0} sessions`)
+    expect(recent).toBeTruthy()
+    expect(recent!.length).toBeGreaterThanOrEqual(1)
+    // A session that ran a tool successfully must score > 0.
+    expect(recent![0].score).toBeGreaterThan(0)
   })
 })

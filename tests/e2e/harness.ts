@@ -4,7 +4,14 @@ import {
   spawn,
   spawnSync,
 } from "node:child_process"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -13,7 +20,6 @@ import { join } from "node:path"
 export interface OpencodeEvent {
   type: string
   timestamp: number
-  sessionID: string
   part?: {
     type?: string
     tool?: string
@@ -41,17 +47,21 @@ export interface E2EProject {
 
 // ── Config ──────────────────────────────────────────────────────────────
 
-const _PLUGIN_PATH = join(
+const PLUGIN_DIR = join(
   process.env.HOME ?? "/home/user",
   ".config",
   "opencode",
   "plugins",
-  "opencode-kasper.ts",
 )
+const PLUGIN_ENABLED_PATH = join(PLUGIN_DIR, "opencode-kasper.ts")
+const PLUGIN_DISABLED_PATH = join(PLUGIN_DIR, "opencode-kasper.ts.disabled")
 
 const DEFAULT_OPENCODE_CONFIG: Record<string, unknown> = {
-  // Plugin is loaded from global plugins directory (~/.config/opencode/plugins/)
-  // No need to duplicate here — avoids double-loading
+  // The kasper plugin is loaded from the global plugins directory
+  // (~/.config/opencode/plugins/opencode-kasper.ts). Each e2e test is
+  // responsible for calling enableKasperPlugin() in beforeAll and
+  // disableKasperPlugin() in afterAll so we don't clobber a developer's
+  // local plugin state. See enableKasperPlugin in this file for details.
 }
 
 // Auth credentials for opencode serve (opencode >=1.15.x requires HTTP Basic
@@ -101,6 +111,111 @@ export function cleanupE2EProject(dir: string): void {
   } catch {
     // best-effort
   }
+}
+
+// ── Plugin toggle (Kasper plugin symlink) ───────────────────────────────
+//
+// The kasper plugin lives at ~/.config/opencode/plugins/opencode-kasper.ts
+// (a symlink to src/index.ts). The convention in this repo is to keep the
+// plugin .ts.disabled (skip loading) by default; e2e tests that need the
+// plugin loaded call `enableKasperPlugin()` in beforeAll and
+// `disableKasperPlugin()` in afterAll. We do NOT touch this when the env
+// var KASPER_E2E_LEAVE_PLUGIN_ENABLED=1 is set, in case a developer has
+// already enabled the plugin and wants their state preserved.
+//
+// Why this is needed: opencode's plugin loader SKIPS files with the
+// .disabled suffix. If the plugin stays .disabled, `opencode serve` runs
+// without kasper loaded, every kasper-driven assertion is moot, and
+// `waitForScoredSessions` times out — historically the e2e suite masked
+// this with `if (!state) return` paths that silently passed. With these
+// helpers, the test can detect the missing-plugin case at beforeAll time
+// and fail loudly.
+
+const _pluginToggleStack: Array<"enabled" | "disabled"> = []
+
+export function isKasperPluginEnabled(): boolean {
+  return existsSync(PLUGIN_ENABLED_PATH)
+}
+
+export function isKasperPluginDisabled(): boolean {
+  return existsSync(PLUGIN_DISABLED_PATH)
+}
+
+export function enableKasperPlugin(): void {
+  if (existsSync(PLUGIN_ENABLED_PATH)) {
+    _pluginToggleStack.push("enabled")
+    return
+  }
+  if (!existsSync(PLUGIN_DISABLED_PATH)) {
+    throw new Error(
+      `Kasper plugin not found at ${PLUGIN_DISABLED_PATH}. ` +
+        `Expected a symlink to src/index.ts. Did the install step run?`,
+    )
+  }
+  renameSync(PLUGIN_DISABLED_PATH, PLUGIN_ENABLED_PATH)
+  _pluginToggleStack.push("disabled")
+}
+
+export function disableKasperPlugin(): void {
+  if (existsSync(PLUGIN_DISABLED_PATH)) {
+    _pluginToggleStack.push("enabled")
+    return
+  }
+  if (!existsSync(PLUGIN_ENABLED_PATH)) {
+    // already gone
+    _pluginToggleStack.push("disabled")
+    return
+  }
+  if (process.env.KASPER_E2E_LEAVE_PLUGIN_ENABLED === "1") {
+    // Developer opted in to leaving the plugin enabled across test runs.
+    _pluginToggleStack.push("enabled")
+    return
+  }
+  renameSync(PLUGIN_ENABLED_PATH, PLUGIN_DISABLED_PATH)
+  _pluginToggleStack.push("enabled")
+}
+
+// Pop the toggle stack — call in afterAll to restore original state.
+export function restoreKasperPlugin(): void {
+  const last = _pluginToggleStack.pop()
+  if (last === undefined) return
+  if (last === "enabled" && existsSync(PLUGIN_ENABLED_PATH)) {
+    if (process.env.KASPER_E2E_LEAVE_PLUGIN_ENABLED === "1") return
+    if (!existsSync(PLUGIN_DISABLED_PATH)) {
+      renameSync(PLUGIN_ENABLED_PATH, PLUGIN_DISABLED_PATH)
+    }
+  }
+  // If last === "disabled" we previously enabled and the afterAll caller
+  // is responsible for the matching disable; this is a no-op here.
+}
+
+/**
+ * Poll for evidence that kasper actually loaded inside the opencode
+ * serve. The .opencode/kasper/state.json file is created on plugin init
+ * (src/index.ts:321 — `new KasperStateStore` followed by `stateStore.init()`).
+ * If the plugin is .disabled, this file is NEVER created, so the timeout
+ * is the real "plugin not loaded" signal.
+ *
+ * Returns the absolute path of the state file, or throws on timeout.
+ */
+export async function waitForKasperLoaded(
+  projectDir: string,
+  opts?: { maxWaitMs?: number; pollMs?: number },
+): Promise<string> {
+  const maxWaitMs = opts?.maxWaitMs ?? 30_000
+  const pollMs = opts?.pollMs ?? 500
+  const statePath = join(projectDir, ".opencode", "kasper", "state.json")
+  const deadline = Date.now() + maxWaitMs
+  while (Date.now() < deadline) {
+    if (existsSync(statePath)) return statePath
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+  throw new Error(
+    `Kasper plugin did not load within ${maxWaitMs / 1000}s — ` +
+      `${statePath} was never created. This usually means the plugin ` +
+      `symlink is .disabled. Run \`mv ~/.config/opencode/plugins/opencode-kasper.ts.disabled ~/.config/opencode/plugins/opencode-kasper.ts\` ` +
+      `or set KASPER_E2E_LEAVE_PLUGIN_ENABLED=1 in the environment.`,
+  )
 }
 
 // ── NDJSON helpers ──────────────────────────────────────────────────────
