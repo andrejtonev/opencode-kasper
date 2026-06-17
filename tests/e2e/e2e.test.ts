@@ -264,13 +264,18 @@ describe("kasper scoring", () => {
       maxWaitMs: 240_000,
     })
     expect(state).toBeTruthy()
-    const recent = (state as Record<string, unknown>).recent as
-      | Array<{ score: number; id: string }>
-      | undefined
-    console.log(`  scored: ${recent?.length ?? 0} sessions`)
-    expect(recent).toBeTruthy()
-    expect(recent!.length).toBeGreaterThanOrEqual(1)
+    // The state.json has no `recent` field (that's an in-memory helper
+    // on the StateStore). Use the persisted `sessions` map instead.
+    const sessions = (state as { sessions?: Record<string, { score?: number }> })
+      .sessions
+    expect(sessions).toBeTruthy()
+    const recent = Object.entries(sessions!).map(([id, s]) => ({
+      id,
+      score: (s as { score?: number }).score ?? 0,
+    }))
+    console.log(`  scored: ${recent.length} sessions`)
+    expect(recent.length).toBeGreaterThanOrEqual(1)
     // A session that ran a tool successfully must score > 0.
-    expect(recent![0].score).toBeGreaterThan(0)
+    expect(recent[0].score).toBeGreaterThan(0)
   })
 })

@@ -556,19 +556,20 @@ describe("auto-apply file targeting", () => {
 
     // HARD assert: at least one auto-apply log event MUST have fired.
     // The previous version used `if (!hasAgentsMdLog && !hasAgentPromptLog)`
-    // and silently passed if neither fired.
-    const hasAgentsMdLog =
-      hasLogEvent(logEntries, "agents_md_updated") ||
-      hasLogEvent(logEntries, "agents_md_no_change")
-    const hasAgentPromptLog =
-      hasLogEvent(logEntries, "agent_prompt_updated") ||
-      hasLogEvent(logEntries, "agent_prompt_not_found") ||
-      hasLogEvent(logEntries, "agent_prompt_unchanged")
+    // and silently passed if neither fired. Note: kasper logs the generic
+    // `improvement_applied` event (with `target` distinguishing the file);
+    // there is no separate `agents_md_updated` / `agent_prompt_updated`
+    // event name.
+    const hasImprovementApplied = hasLogEvent(logEntries, "improvement_applied")
+    const hasReroutedToAgentsMd = hasLogEvent(
+      logEntries,
+      "improvement_rerouted_to_agents_md",
+    )
 
-    log(`agents_md log events: ${hasAgentsMdLog}`)
-    log(`agent_prompt log events: ${hasAgentPromptLog}`)
+    log(`improvement_applied: ${hasImprovementApplied}`)
+    log(`improvement_rerouted_to_agents_md: ${hasReroutedToAgentsMd}`)
 
-    expect(hasAgentsMdLog || hasAgentPromptLog).toBe(true)
+    expect(hasImprovementApplied || hasReroutedToAgentsMd).toBe(true)
   })
 
   test("AGENTS.md is updated with project-level guidance when weakness is project-wide", async () => {
