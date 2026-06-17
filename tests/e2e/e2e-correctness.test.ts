@@ -92,7 +92,7 @@ describe("agent-specific file targeting", () => {
       SERVE_PORT_CORRECT,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -139,7 +139,6 @@ describe("agent-specific file targeting", () => {
         "--agent",
         "reviewer",
         "--dangerously-skip-permissions",
-        "--pure",
         "review file package.json for security issues",
       ],
       {
@@ -234,7 +233,7 @@ describe("log-verified scoring", () => {
       18789,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -487,7 +486,7 @@ describe("auto-apply file targeting", () => {
       18788,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 

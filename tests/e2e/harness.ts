@@ -200,11 +200,46 @@ export function restoreKasperPlugin(): void {
  */
 export async function waitForKasperLoaded(
   projectDir: string,
-  opts?: { maxWaitMs?: number; pollMs?: number },
+  opts?: { maxWaitMs?: number; pollMs?: number; port?: number },
 ): Promise<string> {
   const maxWaitMs = opts?.maxWaitMs ?? 30_000
   const pollMs = opts?.pollMs ?? 500
   const statePath = join(projectDir, ".opencode", "kasper", "state.json")
+  const port = opts?.port ?? SERVE_PORT
+  // Warm up the per-project instance: in opencode >=1.15.13, the `serve`
+  // command (instance: false) does not load plugins at startup. Plugins are
+  // only loaded when a per-project InstanceContext is created, which happens
+  // when a request with `x-opencode-directory: <dir>` reaches the server —
+  // i.e. when `opencode run --attach --dir <dir>` runs a session.
+  // We send a trivial attach-driven session so the serve instantiates the
+  // project and the global `~/.config/opencode/plugins/` symlink is resolved.
+  // (The reply contents don't matter; we only need the request to land.)
+  if (isServeRunning(port)) {
+    spawnSync(
+      "opencode",
+      [
+        "run",
+        "--attach",
+        `http://localhost:${port}`,
+        "--format",
+        "json",
+        "--model",
+        KASPER_E2E_MODEL,
+        "--dir",
+        projectDir,
+        "--dangerously-skip-permissions",
+        "ping",
+      ],
+      {
+        cwd: projectDir,
+        timeout: 30_000,
+        encoding: "utf-8",
+        stdio: "pipe",
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...process.env },
+      },
+    )
+  }
   const deadline = Date.now() + maxWaitMs
   while (Date.now() < deadline) {
     if (existsSync(statePath)) return statePath
@@ -290,7 +325,6 @@ export function runOpenCode(
     "--dir",
     dir,
     "--dangerously-skip-permissions",
-    "--pure",
   ]
 
   const result = spawnSync("opencode", [...args, prompt], {
@@ -469,7 +503,6 @@ export function runAttach(
       "--dir",
       dir,
       "--dangerously-skip-permissions",
-      "--pure",
       prompt,
     ],
     {

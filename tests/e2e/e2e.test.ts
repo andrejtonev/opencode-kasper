@@ -57,7 +57,7 @@ beforeAll(async () => {
   servePort = await startServe(projectDir, 18799)
   // Verify the kasper plugin actually loaded into the serve. If the
   // symlink toggle silently failed, this throws with a clear error.
-  await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+  await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
 })
 
 afterAll(() => {

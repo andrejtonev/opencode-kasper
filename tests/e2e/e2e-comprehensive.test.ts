@@ -97,7 +97,7 @@ describe("auto mode (polling + auto-apply)", () => {
       SERVE_PORT_AUTO,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -318,7 +318,7 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       SERVE_PORT_MANUAL,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 

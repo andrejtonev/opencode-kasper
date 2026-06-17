@@ -220,7 +220,7 @@ describe.skipIf(!ENABLED)(
       )
       // Verify the kasper plugin actually loaded. Fails loudly if
       // the symlink toggle silently failed (e.g. file is .disabled).
-      await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+      await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
       log(`serve started on port ${servePort}`)
     }, 300_000)
 

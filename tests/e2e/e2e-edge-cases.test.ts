@@ -72,7 +72,7 @@ describe("plugin lifecycle edge cases", () => {
       SERVE_PORT_EDGE,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -385,7 +385,7 @@ describe("no AGENTS.md", () => {
       18793,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -500,7 +500,7 @@ describe("already-evaluated skip", () => {
       18792,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
@@ -586,7 +586,7 @@ describe("re-evaluation on new messages", () => {
       18791,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000 })
+    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
     log(`serve started on port ${servePort}`)
   })
 
