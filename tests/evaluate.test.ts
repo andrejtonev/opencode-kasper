@@ -323,6 +323,49 @@ describe("runEvaluation", () => {
     expect(result).toBe(false)
   })
 
+  test("fallback card (e.g. model unavailable) does NOT mark session as evaluated", async () => {
+    // Regression: a primary session whose scorer returns a fallback
+    // card (because session.create threw — e.g. user picked a model
+    // that doesn't exist, or the model provider is down) used to be
+    // added to ctx.sessionsEvaluated unconditionally. The
+    // runEvaluation() short-circuit at line 96 then skipped the
+    // session for the rest of the plugin lifetime, silently disabling
+    // any future re-attempt. The user would have to restart opencode
+    // to retry. The fix: the fallback path records nothing. Only the
+    // successful-recording path (recordSession + addEvaluatedSession)
+    // is allowed to mark a session as evaluated.
+    const ctx = mockCtx({
+      scorer: {
+        evaluate: async (_input: any) =>
+          makeScoreCard({ fallback: true, overall_score: 0.5 }),
+      } as any,
+    })
+    const result = await runEvaluation(
+      makePendingEval({ sessionID: "broken-model-session" }),
+      ctx,
+    )
+    expect(result).toBe(false)
+    // The fallback path must NOT add the session to sessionsEvaluated.
+    // If it does, the next runEvaluation() call for the same session
+    // id will short-circuit at the line-96 guard and never call the
+    // LLM again.
+    expect(ctx.sessionsEvaluated.has("broken-model-session")).toBe(false)
+
+    // And the next call must actually re-attempt the scoring.
+    let secondCallCount = 0
+    ctx.scorer = {
+      evaluate: async (_input: any) => {
+        secondCallCount++
+        return makeScoreCard({ fallback: true, overall_score: 0.5 })
+      },
+    } as any
+    await runEvaluation(
+      makePendingEval({ sessionID: "broken-model-session" }),
+      ctx,
+    )
+    expect(secondCallCount).toBe(1)
+  })
+
   test("truncates long agent response before scoring", async () => {
     let receivedResponse = ""
     const ctx = mockCtx({
