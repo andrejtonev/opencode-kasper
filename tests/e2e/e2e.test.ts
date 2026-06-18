@@ -266,8 +266,9 @@ describe("kasper scoring", () => {
     expect(state).toBeTruthy()
     // The state.json has no `recent` field (that's an in-memory helper
     // on the StateStore). Use the persisted `sessions` map instead.
-    const sessions = (state as { sessions?: Record<string, { score?: number }> })
-      .sessions
+    const sessions = (
+      state as { sessions?: Record<string, { score?: number }> }
+    ).sessions
     expect(sessions).toBeTruthy()
     const recent = Object.entries(sessions!).map(([id, s]) => ({
       id,

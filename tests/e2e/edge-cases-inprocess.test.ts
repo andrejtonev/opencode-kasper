@@ -28,17 +28,10 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { randomBytes } from "node:crypto"
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs"
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import KasperPlugin from "../../src/index.js"
-import { flushKasperState } from "../../src/registry.js"
 
 function tmpDir(prefix: string): string {
   return join(

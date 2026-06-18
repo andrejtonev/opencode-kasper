@@ -283,10 +283,13 @@ function readPluginOverrideEntry(
   for (const key of ["agent", "agents"] as const) {
     const map = raw[key]
     if (!map || typeof map !== "object" || Array.isArray(map)) continue
-    const { entry, key: actualKey } =
-      lookupAgentEntryWithFallback(map as Record<string, unknown>, agentName) ??
-      {}
-    if (!entry) continue
+    const hit = lookupAgentEntryWithFallback(
+      map as Record<string, unknown>,
+      agentName,
+    )
+    if (!hit) continue
+    const { entry, key: actualKey } = hit
+    if (!entry || !actualKey) continue
     if (
       typeof entry.prompt_append === "string" &&
       entry.prompt_append.length > 0

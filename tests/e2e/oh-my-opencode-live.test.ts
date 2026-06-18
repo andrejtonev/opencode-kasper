@@ -401,9 +401,7 @@ describe.skipIf(!ENABLED)(
           s.agent_name === project.mainAgent ||
           // omo's display name for the sisyphus agent (per
           // omo-opencode/src/shared/agent-display-names.ts).
-          (s.agent_name as string)?.toLowerCase().startsWith(
-            project.mainAgent,
-          ),
+          (s.agent_name as string)?.toLowerCase().startsWith(project.mainAgent),
       )
       expect(sisyphusCard).toBeTruthy()
       expect((sisyphusCard!.score as number) ?? 0).toBeGreaterThanOrEqual(0)
@@ -421,9 +419,7 @@ describe.skipIf(!ENABLED)(
       const sisyphusSession = sessions.find(
         (s) =>
           s.agent_name === project.mainAgent ||
-          (s.agent_name as string)?.toLowerCase().startsWith(
-            project.mainAgent,
-          ),
+          (s.agent_name as string)?.toLowerCase().startsWith(project.mainAgent),
       )
       if (!sisyphusSession) {
         log("(warn) no sisyphus card, skipping log check")

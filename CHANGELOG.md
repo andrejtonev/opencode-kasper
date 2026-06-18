@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-06-18
+
+A feature release that hardens the resolver for opencode plugin ecosystems (oh-my-opencode, omo), tightens test discipline, and adds the deterministic scoring override that the e2e suite had been missing. No breaking changes — the public plugin surface and `kasper.jsonc` / `kasper` key config are unchanged.
+
+### Fixed
+
+- **Plugin-override entries are now located by name, not by value (B1–B4 regression)** — `appendToPluginOverridePrompt` used to scan the agent map for entries whose `prompt`/`prompt_append` text matched `source.value`. With two agents sharing the same prompt text, the first one in insertion order won and kasper silently edited the wrong agent. The writer now uses `source.agentName` (the canonical config key) to locate the entry directly via the jsonc `modify()` path. Regression coverage in `tests/oh-my-opencode.test.ts` (idempotency, B1) and `tests/agent-prompt-resolver.test.ts` (display-name fallback).
+- **Display name → canonical key fallback for plugin overrides** — omo registers `sisyphus: "Sisyphus - ultraworker"` in `AGENT_DISPLAY_NAMES`, and opencode's session info reports the display name as `agentName`, not the canonical config key. The resolver's `lookupAgentEntryWithFallback` and the inline fallback in `getAgentEntryAndKey` now try exact → case-insensitive → "display name starts with key" (longest match wins). The writer threads the canonical key through every subsequent lookup so the jsonc `modify()` path targets the right entry. Without this, kasper's write path was a no-op for every omo-managed agent.
+- **Display-name fallback now requires a space (or end-of-string) after the matched key** — a follow-up to the above that prevents false positives on hyphenated agent names. A test creating `code-quality-0b16404e` no longer false-positive matches a global `code-quality` agent and silently routes the improvement to the wrong file. The omo convention `<key> - <descriptor>` (with a space after the key) is preserved. Closes a real production bug surfaced by `tests/auto-update.test.ts` "auto-update respects subagent agentType" — that test was failing on master since the resolver fix.
+- **`appendToPluginOverridePrompt` no longer reads `actualKey` as `string | undefined`** — pre-existing TypeScript errors in the destructuring of `lookupAgentEntryWithFallback` are now resolved. The build (`npm run build`) and `tsc --noEmit` are clean for the first time since the resolver refactor.
+- **`bun run lint` is now clean** — removed unused imports in `tests/e2e/edge-cases-inprocess.test.ts` and applied biome formatting across `tests/`. `prepublishOnly` can now succeed.
+
+### Added
+
+- **`KASPER_E2E_SCORE_OVERRIDE=<float>` test-only env var** — read at the top of `Scorer.evaluate()` in `src/scorer.ts`. When set, returns a synthetic low-score card without calling the LLM, making the e2e write-path tests deterministic. The override is read at the very top of the function so it short-circuits the LLM call entirely; production users never set this env var. This was the missing piece for the e2e auto-apply tests — the LLM judge was too lenient to reliably score the provocation prompt below `scoring_threshold`, so the auto-apply path was never exercised in CI.
+- **`{path:...}` and `file://` URI prompt definition support in `opencode.json`** — the resolver now recognises the same four prompt shapes opencode does: inline string, `{file:/abs/path}`, `{path:/abs/path}`, and `file:///abs/path` (in plugin override files). Documentation in the README's "Prompt Resolution" section. The `file://` URI is the form used by oh-my-opencode to redirect built-in agent prompts.
+- **11 in-process unit tests covering all four prompt-source shapes** (`tests/e2e/prompt-shapes.test.ts`) — runs in ~40 ms without spawning opencode. Verifies the resolver's classification, the inline→file promote path (`materializeInlinePrompt`), and the write-path `file_uri`/`external_file` replace semantics.
+- **5 in-process tests replacing the USELESS EC-2 and EC-7 from the original audit** (`tests/e2e/edge-cases-inprocess.test.ts`) — 4 unit tests of `isKasperSession` (the pure function both filter sites depend on) plus 1 disabled-mode integration test. Verified USEFUL: with the audit's targeted mutations, the new tests fail.
+- **Artifact-verification report** (`tests/e2e/ARTIFACT-VERIFICATION.md`) — proves via on-disk evidence that kasper's tests actually produce the artifacts they claim. Each row is the result of running the test with `KASPER_E2E_KEEP_TMP=1` and reading the artifact back. 11 rows covering omo + kasper integration, AGENTS.md auto-apply, state.json lifecycle, different prompt definition types, different AGENTS.md locations, and different agent files. This is a stricter standard than the mutation audit: it proves the test's *claim* about the side effect, not just that some code path was exercised.
+- **Mutation audit** (`tests/e2e/MUTATION-AUDIT.md`) — documents the targeted mutations applied per test, which tests are USEFUL (catch the mutation) vs USELESS (vacuous) vs SMOKE (test opencode, not kasper). The audit was the basis for the EC-2 / EC-7 fix in this release.
+
+### Changed
+
+- **Test discipline: silent passes are gone** — every `expect()` in the e2e suite is now load-bearing. The audit found multiple tests that were *vacuous* (the assertion could never fail) or relied on `if (state) { log warn; return }` paths that silently passed on failure. Every e2e describe block now uses `waitForKasperLoaded()` in beforeAll to fail loudly if the plugin symlink is `.disabled`, and assertions that previously only logged are now `expect()`s.
+- **`oh-my-opencode-live` test is now a real e2e of the integration** — previously the test's omo config was a dead-drop file (`.opencode/oh-my-opencode.json` was the wrong basename after the package rename to `oh-my-openagent`) and the npm specifier `oh-my-opencode` never actually loaded in `opencode serve` (the serve command is `instance: false` — plugins only load when a per-project instance is created via `opencode run --attach`). The test now uses `plugin: ["file:///path/to/dist/index.js"]` to load the local omo install synchronously, and writes the omo config to `.opencode/oh-my-openagent.json`. With these wiring fixes plus the resolver fixes, the write-path test now produces a real, visible change in the live omo config file: `sisyphus.prompt_append` gains the `## Kasper Inferred Instructions` section, `build.prompt_append` is unchanged.
+- **E2E suite is deterministic for the auto-apply path** — the `e2e-correctness :: auto-apply file targeting` describe block and the `e2e-comprehensive :: auto mode` / `manual mode` describe blocks now set `KASPER_E2E_SCORE_OVERRIDE=0.3` in their beforeAll, restoring the previous value in afterAll. The 2 e2e tests that were previously flaky on the LLM judge are now deterministic.
+- **`cleanupE2EProject` honors `KASPER_E2E_KEEP_TMP=1`** — every e2e test that produces a durable artifact leaves it on disk for inspection. The inline `rmSync` in `oh-my-opencode.test.ts` was patched to honor the same flag.
+
+### Notes
+
+- No public plugin API changes. `package.json` `main` / `types` / `exports` are unchanged. The new `KASPER_E2E_SCORE_OVERRIDE` is opt-in via env var; existing kasper deployments are unaffected.
+- All 542 unit tests pass (up from 308 in 1.0.0); the e2e suite adds another 78 tests (up from 32 in 1.1.0). 27 e2e tests are skipped when the `opencode` binary is not on `$PATH` (gated behind `OPENCODE_E2E=1`).
+- The branch `feature/prompt-paths-and-plugin-override` was used for the work; the release is cut from `main` (or the user's default branch) with this commit as the tip.
+
 ## [1.1.2] - 2026-06-16
 
 A patch release. Builds on the `injectSection` accumulation fix (see the prior commit on the `fix/injectSection-accumulate` branch) by changing the `<!-- kasper: ISO -->` provenance comment from a single section-level timestamp to a per-addition timestamp attached directly above each new entry.
