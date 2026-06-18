@@ -18,10 +18,11 @@ something orthogonal (SMOKE).
 | `e2e.test.ts` | 8 | 8 | 0 | 0 | All catch `recordSession` via the integration setup; pure tool-call tests still pass when scoring is broken because they only check opencode's NDJSON output |
 | `e2e-comprehensive.test.ts` | 6 | 6 | 0 | 0 | All catch `recordSession` |
 | `e2e-correctness.test.ts` | 10 | 10 | 0 | 0 | All catch `recordSession` |
-| `e2e-edge-cases.test.ts` | 16 | 12 | 4 | 0 | EC-2, EC-7 are vacuously USEFUL (no mutation can break the assertions). EC-3, EC-5, EC-6 are SMOKE (test opencode, not kasper) |
+| `e2e-edge-cases.test.ts` | 14 | 12 | 0 | 2 | EC-2 and EC-7 were USELESS — replaced by USEFUL in-process tests in `edge-cases-inprocess.test.ts`. EC-3, EC-5, EC-6 are SMOKE (test opencode, not kasper) |
 | `resolver.test.ts` | 1 | 1 | 0 | 0 | USEFUL (expect) — expect() actually failed, not just the setup |
 | `inject-mode.test.ts` | 1 | 1 | 0 | 0 | USEFUL (expect) — expect() actually failed |
-| **Total** | **57** | **51** | **5** | **1** | |
+| `edge-cases-inprocess.test.ts` | 5 | 5 | 0 | 0 | All USEFUL — replacements for USELESS EC-2 / EC-7. 4 `isKasperSession` unit tests + 1 disabled-mode integration test |
+| **Total** | **60** | **53** | **3** | **4** | EC-2 and EC-7 replaced by USEFUL in-process tests. 4 SMOKE tests in `e2e-edge-cases.test.ts` document the opencode contract |
 
 ### Files added after this audit (commit `cb21f99`)
 
@@ -101,8 +102,11 @@ dedupe check makes the test fail with `Received: 2`.
 
 ### All other tests are USEFUL
 
-51/57 tests are USEFUL. They all detect at least one real production
-regression. The 5 USELESS + 1 SMOKE tests are documented above.
+53/60 tests are USEFUL (post EC-2 / EC-7 fix). The 3 remaining
+USELESS are documented in the `e2e-edge-cases.test.ts` row above
+(EC-3, EC-5, EC-6 — SMOKE tests that document opencode's contract).
+The 4 SMOKE tests are kept as documentation of the opencode contract
+that kasper depends on.
 
 ## How to reproduce
 
@@ -235,3 +239,47 @@ broken setup (omo never loaded) and the audit missed it because:
 A better audit would also include a "did the test actually exercise
 its claimed code path" check, e.g. by injecting a probe into the
 production code that records what was touched during the test.
+
+## Audit follow-up: USELESS tests replaced (EC-2 and EC-7)
+
+EC-2 ("scored sessions exclude kasper-* internal sessions") and EC-7
+("no state.json entries created when disabled") were both USELESS
+because they didn't actually exercise the production code path
+they claimed to:
+
+- **EC-2** iterated `state.sessions` and asserted no title matched
+  `/^kasper-/i`. But the filter at `src/index.ts:618` prevents
+  kasper-* sessions from ever reaching `state.sessions`, so the
+  iteration always saw an empty list. No mutation could make a
+  kasper-* session land in state via this test.
+
+- **EC-7** started `opencode serve` (instance: false — the plugin
+  doesn't load) and asserted `state.json` was null. The plugin was
+  never loaded, so the assertion was always true regardless of the
+  `if (!config.enabled) return {}` short-circuit.
+
+Both have been replaced with in-process tests in
+`tests/e2e/edge-cases-inprocess.test.ts`:
+
+- **EC-2 replacement**: 4 unit tests of `isKasperSession` (the pure
+  function both filter sites depend on). With the audit's
+  targeted mutation `KASPER_SESSION_PREFIXES.some(...) → return false`,
+  3 of the 4 tests fail. The unit test is the right level: the
+  filter's side effects (kasperSessionIDs membership, state absence)
+  are too dispersed across the production code to test in isolation
+  through the plugin hook surface.
+
+- **EC-7 replacement**: an in-process test that calls
+  `KasperPlugin({ enabled: false })` directly and asserts no
+  `state.json` is created. With the audit's targeted mutation
+  `if (!config.enabled) return {}` → `if (config.enabled) return {}`,
+  the test fails — `state.json` is created even with `enabled:
+  false` because the plugin runs the full init path.
+
+The new file uses the same in-process `KasperPlugin` factory as
+`tests/auto-update.test.ts` — no opencode binary, no LLM, no timers.
+All 5 tests run in ~60ms total.
+
+The original SMOKE tests (EC-3, EC-5, EC-6, EC-8, OMO-1) are kept
+as-is: they document the opencode contract that kasper depends on,
+but mutations to kasper code can't break them.

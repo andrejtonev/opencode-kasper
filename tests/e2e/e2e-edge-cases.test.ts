@@ -72,7 +72,10 @@ describe("plugin lifecycle edge cases", () => {
       SERVE_PORT_EDGE,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -168,32 +171,12 @@ describe("plugin lifecycle edge cases", () => {
     )
   })
 
-  test("scored sessions exclude kasper-* internal sessions", async () => {
-    if (!ENABLED) {
-      log("(skip) not enabled")
-      return
-    }
-    expect(isServeRunning(servePort)).toBe(true)
-
-    // HARD assert: state must exist (kasper ran).
-    const state = readKasperState(projectDir)
-    expect(state).toBeTruthy()
-    const sessions = state!.sessions as
-      | Record<string, Record<string, unknown>>
-      | undefined
-    expect(sessions).toBeTruthy()
-
-    // No scored session should have a title starting with "kasper-" or "Kasper"
-    for (const [_id, s] of Object.entries(sessions!)) {
-      const title = (s.title as string) ?? ""
-      expect(title).not.toMatch(/^kasper-/i)
-      expect(title).not.toMatch(/^Kasper/i)
-    }
-
-    log(
-      `verified ${Object.keys(sessions!).length} sessions — no kasper-* entries`,
-    )
-  })
+  // (test removed: was USELESS — see tests/e2e/MUTATION-AUDIT.md
+  // "scored sessions exclude kasper-* internal sessions". The filter
+  // at src/index.ts:618 prevented kasper-* sessions from ever reaching
+  // state, so iteration over state.sessions always saw an empty list.
+  // The replacement is in tests/e2e/edge-cases-inprocess.test.ts
+  // under "kasper session filter (isKasperSession unit test)".)
 
   test("API /api/session returns valid JSON with session IDs", async () => {
     if (!ENABLED) {
@@ -328,20 +311,13 @@ describe("disabled mode (kasper.enabled=false)", () => {
     expect(r.sessionID).toBeTruthy()
   })
 
-  test("no state.json entries created when disabled", async () => {
-    if (!ENABLED) {
-      log("(skip) not enabled")
-      return
-    }
-
-    // When enabled=false, the plugin must NOT create state.json.
-    // The previous version used `if (!state) { log warn; return }`
-    // which masked whether state.json was actually absent or whether
-    // kasper had failed to load. We now hard-assert absence.
-    const state = readKasperState(projectDir)
-    expect(state).toBeNull()
-    log("disabled mode: no state.json — correct")
-  })
+  // (test removed: was USELESS — see tests/e2e/MUTATION-AUDIT.md
+  // "no state.json entries created when disabled". The e2e harness
+  // never actually triggered a per-project instance, so the plugin
+  // was never loaded and state.json was never going to exist
+  // regardless of the disabled check. The replacement is in
+  // tests/e2e/edge-cases-inprocess.test.ts under
+  // "disabled mode (in-process)".)
 })
 
 // ══════════════════════════════════════════════════════════════════════
@@ -385,7 +361,10 @@ describe("no AGENTS.md", () => {
       18793,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -500,7 +479,10 @@ describe("already-evaluated skip", () => {
       18792,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -586,7 +568,10 @@ describe("re-evaluation on new messages", () => {
       18791,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
