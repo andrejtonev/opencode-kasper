@@ -44,7 +44,11 @@ describe("AgentsMdManager", () => {
     testDir = tmpDir()
     projectRoot = testDir
     stateDir = join(testDir, ".opencode", "kasper")
-    manager = new AgentsMdManager(projectRoot, stateDir, 5)
+    // The manager now takes a resolved path (the file itself), not a
+    // project root. We still default to the historical `<root>/AGENTS.md`
+    // for the existing tests, mirroring what the resolver would return
+    // when no `agents_md_paths` is configured and no walk-up hit.
+    manager = new AgentsMdManager(join(projectRoot, "AGENTS.md"), stateDir, 5)
     await manager.init()
   })
 
@@ -323,6 +327,44 @@ describe("AgentsMdManager", () => {
   describe("sectionHeader", () => {
     test("returns markdown header", () => {
       expect(manager.sectionHeader("Test")).toBe("## Test")
+    })
+  })
+
+  describe("dynamic resolved path", () => {
+    test("writes to and reads from a non-canonical path passed at construction", async () => {
+      // The resolver can land the rules file anywhere — the manager
+      // must write where the caller points it. We use a file in a
+      // sibling directory to confirm the path is taken verbatim.
+      const customPath = join(testDir, "shared-rules", "AGENTS.md")
+      const customManager = new AgentsMdManager(
+        customPath,
+        join(testDir, "kasper-state"),
+        5,
+      )
+      await customManager.init()
+      await customManager.write("# Shared rules\nBe helpful.\n")
+      expect(await customManager.read()).toBe("# Shared rules\nBe helpful.\n")
+    })
+
+    test("backup dir is namespaced per resolved path so collisions are impossible", async () => {
+      const pathA = join(testDir, "rules-a", "AGENTS.md")
+      const pathB = join(testDir, "rules-b", "AGENTS.md")
+      const stateDir = join(testDir, "kasper-state")
+      const mgrA = new AgentsMdManager(pathA, stateDir, 5)
+      const mgrB = new AgentsMdManager(pathB, stateDir, 5)
+      await mgrA.init()
+      await mgrB.init()
+      await mgrA.write("A1")
+      await mgrA.backup("a-1")
+      await mgrB.write("B1")
+      await mgrB.backup("b-1")
+      const aBackups = await mgrA.listBackups()
+      const bBackups = await mgrB.listBackups()
+      expect(aBackups.length).toBe(1)
+      expect(bBackups.length).toBe(1)
+      // Each manager only sees its own backups (different backup dirs).
+      expect(aBackups[0].path).toContain("rules-a")
+      expect(bBackups[0].path).toContain("rules-b")
     })
   })
 })

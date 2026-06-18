@@ -24,8 +24,23 @@ export const TOP_STRENGTHS_COUNT = 5
 // Hardcoded internal values (previously configurable, now fixed for simplicity)
 export const BACKUP_ENABLED = true
 export const BACKUP_MAX_VERSIONS = 20
-export const LOG_MAX_LINES = 300
+// 5000 lines is large enough to retain the full scoring lifecycle for a few
+// dozen consecutive evaluations (a typical one-shot evaluation logs ~50-80
+// entries including the diagnostic test in debug mode). 300 was too small:
+// the trim would discard the early lifecycle events (run_eval_start,
+// scoring_session_created, scoring_prompt_sending) and the e2e tests that
+// assert those events were logged would intermittently fail. 5000 still
+// bounds the log so a long-lived session doesn't grow without limit.
+export const LOG_MAX_LINES = 5000
 export const MAX_HISTORY = 100
+
+// Default for the configurable `min_observations_for_update` field
+// (KasperConfig / DEFAULT_CONFIG in src/types.ts). Exported for
+// symmetry with the other tunable defaults, but the runtime gate at
+// src/evaluate.ts:1679 reads `config.min_observations_for_update`,
+// NOT this constant. Tests reference this name in comments but the
+// import site is zero. Kept here so a future "reset to default" path
+// has a single source of truth.
 export const MIN_OBSERVATIONS_FOR_UPDATE = 2
 
 // Built-in opencode agent names per https://opencode.ai/docs/agents.

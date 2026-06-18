@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto"
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { backupDirNameFor } from "../src/agents-md-resolver.js"
 import KasperPlugin from "../src/index.js"
 import { flushKasperState } from "../src/registry.js"
 
@@ -201,7 +202,9 @@ describe("auto-update integration", () => {
     expect(state.improvements_applied[0].target).toBe("agents_md")
 
     // Verify backup was created
-    const backupsDir = join(dir, ".opencode", "kasper", "backups", "AGENTS.md")
+    const resolvedPath = join(dir, "AGENTS.md")
+    const backupDir = backupDirNameFor(resolvedPath)
+    const backupsDir = join(dir, ".opencode", "kasper", "backups", backupDir)
     const { readdir } = await import("node:fs/promises")
     const backupFiles = await readdir(backupsDir)
     const backupContent = await readFile(
