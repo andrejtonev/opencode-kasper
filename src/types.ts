@@ -25,6 +25,28 @@ export interface KasperConfig {
   min_observations_for_update: number
   strict_sanitize: boolean
   agent_prompt_inject_mode: "section" | "inline"
+  /**
+   * Additional directories kasper will scan for agent prompt markdown
+   * files. Each entry may be an absolute path, a path relative to the
+   * project root, or a `~/...` path. For each directory, kasper looks
+   * for `<dir>/agent/<name>.md` (singular, backcompat) and
+   * `<dir>/agents/<name>.md` (plural, canonical). Default: `[]`.
+   */
+  prompt_paths?: string[]
+  /**
+   * Additional directories kasper will consult, in priority order, when
+   * locating the project's rules file (AGENTS.md or CLAUDE.md). Each
+   * entry may be an absolute path, a path relative to the project root,
+   * or a `~/...` path. For each directory, kasper looks for
+   * `<dir>/AGENTS.md` and `<dir>/CLAUDE.md` (AGENTS.md wins per
+   * opencode's rules precedence). The first entry whose AGENTS.md or
+   * CLAUDE.md exists becomes the write target; if no entry has an
+   * existing file, the first entry's AGENTS.md is created on first
+   * write. If this field is empty, kasper falls back to the standard
+   * opencode resolution: local walk-up, then global, then Claude Code
+   * global, then `<projectRoot>/AGENTS.md`. Default: `[]`.
+   */
+  agents_md_paths?: string[]
   config_version?: number
 }
 

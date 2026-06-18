@@ -22,6 +22,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { disableKasperPlugin, enableKasperPlugin } from "./harness.js"
 
 const ENABLED =
   process.env.OPENCODE_E2E === "1" &&
@@ -39,6 +40,7 @@ describe.skipIf(!ENABLED)(
   () => {
     let projectDir: string
     let targetPath: string
+    let pluginEnabled = false
     const realPromptOriginal = [
       "# Real Reviewer",
       "",
@@ -47,6 +49,12 @@ describe.skipIf(!ENABLED)(
     ].join("\n")
 
     beforeAll(() => {
+      // Enable the kasper plugin symlink so `opencode run` below
+      // actually loads it. Without this, the plugin is .disabled
+      // and the test passes vacuously (no scoring, no write).
+      enableKasperPlugin()
+      pluginEnabled = true
+
       projectDir = mkdtempSync(join(tmpdir(), "kasper-e2e-resolver-"))
       targetPath = join(projectDir, "real-prompt.md")
       writeFileSync(targetPath, realPromptOriginal, "utf-8")
@@ -79,6 +87,10 @@ describe.skipIf(!ENABLED)(
 
     afterAll(() => {
       if (projectDir) rmSync(projectDir, { recursive: true, force: true })
+      if (pluginEnabled) {
+        disableKasperPlugin()
+        pluginEnabled = false
+      }
     })
 
     test(
@@ -155,17 +167,14 @@ describe.skipIf(!ENABLED)(
           expect(stubbed_isMeaningful(stripped)).toBe(true)
         }
 
-        // Soft assertion: if injection happened, log it; if it didn't,
-        // skip silently — the absence of the bug-stub is the critical
-        // signal here.
-        if (injectedToReal) {
-          console.log("✓ Kasper injected into the {file:...} target")
-        } else {
-          console.log(
-            "ℹ No injection observed within timeout — verifying the " +
-              "bug-stub did not appear is the primary signal",
-          )
-        }
+        // HARD assertion: with scoring_threshold=0.0,
+        // min_observations_for_update=1, and a clearly-shoddy
+        // (zero-context) user message, kasper MUST produce a card and
+        // inject into the {file:...} target. The previous version
+        // logged "No injection observed" and passed, which masked
+        // the disabled-plugin bug.
+        expect(injectedToReal).toBe(true)
+        console.log("✓ Kasper injected into the {file:...} target")
       },
       { timeout: 180_000 },
     )

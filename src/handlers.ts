@@ -828,6 +828,13 @@ export function describeAgentPromptSource(source: AgentPromptSource): string {
       return `global file: ${source.path}`
     case "inline":
       return `inline string in ${source.configPath} (${source.prompt.length} chars)`
+    case "plugin_override": {
+      if (source.target === "file" || source.target === "file_uri") {
+        return `${source.target === "file" ? "{file:...}" : "file://"} redirect → ${source.path}\n  declared in: ${source.configPath} (${source.promptField})`
+      }
+      const len = (source.value ?? "").length
+      return `plugin override (${source.promptField}) in ${source.configPath} (${len} chars)`
+    }
     case "missing":
       return `no prompt source found for this agent`
   }

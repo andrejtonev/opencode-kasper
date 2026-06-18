@@ -290,6 +290,54 @@ export class Scorer {
     input: ScorerInput,
     sessionClient: OpencodeSessionClient,
   ): Promise<ScoreCard> {
+    // Test-only override: KASPER_E2E_SCORE_OVERRIDE=<float> returns a
+    // synthetic low-score card without calling the LLM. This makes the
+    // e2e write-path test deterministic — the LLM judge is too lenient
+    // to reliably score a refusal prompt below threshold, so the test
+    // would otherwise depend on the model's cooperation. Production
+    // users never set this env var; it is read at the top of evaluate()
+    // so the override applies before any LLM call.
+    const overrideRaw = process.env.KASPER_E2E_SCORE_OVERRIDE
+    if (overrideRaw !== undefined && overrideRaw !== "") {
+      const overrideScore = Number.parseFloat(overrideRaw)
+      if (
+        Number.isFinite(overrideScore) &&
+        overrideScore >= 0 &&
+        overrideScore <= 1
+      ) {
+        this.logger?.log("scoring_e2e_override", {
+          sessionID: input.sessionID,
+          score: overrideScore,
+        })
+        return {
+          session_id: input.sessionID,
+          message_id: input.messageID,
+          timestamp: Date.now(),
+          overall_score: overrideScore,
+          categories: {
+            instruction_following: overrideScore,
+            completeness: overrideScore,
+            proactiveness: overrideScore,
+            code_quality: overrideScore,
+            communication: overrideScore,
+          },
+          strengths: [],
+          weaknesses: ["e2e override: provoked by KASPER_E2E_SCORE_OVERRIDE"],
+          // Drive the deprecated fallback path so the test exercises the
+          // same code that runs in production when an LLM judge returns
+          // suggested_agent_prompt_update. weakness_suggestions is also
+          // populated so the modern path fires too.
+          suggested_agent_prompt_update: "E2E override: write this rule.",
+          weakness_suggestions: [
+            {
+              weakness: "e2e override: provoked by KASPER_E2E_SCORE_OVERRIDE",
+              suggested_fix: "E2E override: write this rule.",
+              target: "agent_prompt",
+            },
+          ],
+        }
+      }
+    }
     const maxRetries = this.config.scoring_retries
     const attempts: Array<{
       attempt: number

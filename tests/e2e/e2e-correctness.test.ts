@@ -4,12 +4,15 @@ import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import {
   cleanupE2EProject,
-  fetchAPI,
+  disableKasperPlugin,
+  enableKasperPlugin,
+  filterLogBySession,
   getKasperSectionContent,
-  getLogEventFields,
+  getLogEventFieldsForSession,
   getScoredSessions,
   hasKasperSection,
   hasLogEvent,
+  hasLogEventForSession,
   hasToolCalls,
   isServeRunning,
   readAgentPrompt,
@@ -21,6 +24,7 @@ import {
   shouldRunE2E,
   startServeWithConfig,
   stopServe,
+  waitForKasperLoaded,
   waitForScoredSessions,
 } from "./harness.js"
 
@@ -45,9 +49,12 @@ function execSleep(seconds: number): void {
 describe("agent-specific file targeting", () => {
   let projectDir = ""
   let servePort = 0
+  let pluginEnabled = false
 
   beforeAll(async () => {
     if (!ENABLED) return
+    enableKasperPlugin()
+    pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
 
@@ -74,7 +81,7 @@ describe("agent-specific file targeting", () => {
         enabled: true,
         min_session_messages: 1,
         evaluation_poll_interval_ms: 4_000,
-        model: "opencode/gemini-3-flash",
+        model: "opencode-go/minimax-m2.7",
         scoring_timeout_ms: 60_000,
         scoring_threshold: 1.0,
         auto_update: true,
@@ -85,6 +92,10 @@ describe("agent-specific file targeting", () => {
       SERVE_PORT_CORRECT,
     )
 
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -92,6 +103,10 @@ describe("agent-specific file targeting", () => {
     stopServe(SERVE_PORT_CORRECT)
     execSleep(3)
     if (projectDir) cleanupE2EProject(projectDir)
+    if (pluginEnabled) {
+      disableKasperPlugin()
+      pluginEnabled = false
+    }
   })
 
   test("custom agent prompt file exists and is readable", async () => {
@@ -111,10 +126,7 @@ describe("agent-specific file targeting", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     // Run explicitly with an agent
     const result = spawnSync(
@@ -130,7 +142,6 @@ describe("agent-specific file targeting", () => {
         "--agent",
         "reviewer",
         "--dangerously-skip-permissions",
-        "--pure",
         "review file package.json for security issues",
       ],
       {
@@ -148,25 +159,14 @@ describe("agent-specific file targeting", () => {
     const sessionID = sessionMatch ? sessionMatch[0] : ""
     log(`reviewer session: ${sessionID.slice(0, 16)}… exit=${result.status}`)
 
-    if (sessionID) {
-      // Verify via API: /api/session/<id> returns HTML (the web app), so use the list endpoint
-      const listData = fetchAPI("/api/session", servePort) as {
-        items?: Array<{ id: string; agent?: string; title?: string }>
-      } | null
-      const items = listData?.items ?? []
-      const sessionData = items.find((s) => s.id === sessionID)
-      log(
-        `API session data: ${JSON.stringify(sessionData)?.slice(0, 500) || "null"}`,
-      )
-      log(
-        `API session data keys: ${sessionData ? Object.keys(sessionData).join(", ") : "null"}`,
-      )
-      log(
-        `API session data: agent=${sessionData?.agent ?? "?"} title=${sessionData?.title ?? "?"}`,
-      )
-      // Agent name should be "reviewer"
-      expect(sessionData?.agent || sessionData?.title).toBeTruthy()
-    }
+    // Session must have been created (session ID found, exit 0).
+    // NOTE: we intentionally avoid querying GET /api/session here — opencode
+    // server >=1.15.13 uses a global session database (not project-scoped)
+    // and a corrupt `time.archived` field in an unrelated session causes the
+    // entire list endpoint to fail with HTTP 400. The NDJSON output and exit
+    // code are sufficient to prove the session was created and ran.
+    expect(sessionID).toBeTruthy()
+    expect(result.status).toBe(0)
   })
 
   test("scoring after agent-specific run targets the correct agent", async () => {
@@ -174,23 +174,19 @@ describe("agent-specific file targeting", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     // Run another session to build up observations for auto-apply
     const r = runAttach(projectDir, "list files using ls", servePort, 90_000)
     log(`general session: ${r.sessionID.slice(0, 16)}…`)
 
+    // HARD assert: scoring MUST produce a card. The previous version
+    // logged a warning and passed if scoring didn't complete.
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 180_000,
     })
-    if (!state) {
-      log("(warn) scoring did not complete")
-      return
-    }
+    expect(state).toBeTruthy()
 
     const sessions = getScoredSessions(state)
     log(`scored sessions: ${sessions.length}`)
@@ -214,9 +210,12 @@ describe("agent-specific file targeting", () => {
 describe("log-verified scoring", () => {
   let projectDir = ""
   let servePort = 0
+  let pluginEnabled = false
 
   beforeAll(async () => {
     if (!ENABLED) return
+    enableKasperPlugin()
+    pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
 
@@ -226,7 +225,7 @@ describe("log-verified scoring", () => {
         enabled: true,
         min_session_messages: 1,
         evaluation_poll_interval_ms: 4_000,
-        model: "opencode/gemini-3-flash",
+        model: "opencode-go/minimax-m2.7",
         scoring_timeout_ms: 60_000,
         scoring_threshold: 1.0,
         auto_update: false,
@@ -237,6 +236,10 @@ describe("log-verified scoring", () => {
       18789,
     )
 
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -244,6 +247,10 @@ describe("log-verified scoring", () => {
     stopServe(18789)
     execSleep(3)
     if (projectDir) cleanupE2EProject(projectDir)
+    if (pluginEnabled) {
+      disableKasperPlugin()
+      pluginEnabled = false
+    }
   })
 
   test("scoring lifecycle events are logged", async () => {
@@ -251,10 +258,7 @@ describe("log-verified scoring", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
     const r = runAttach(
       projectDir,
@@ -267,57 +271,53 @@ describe("log-verified scoring", () => {
     )
     expect(r.sessionID).toBeTruthy()
 
-    // Wait for scoring
+    // HARD assert: scoring MUST complete and the lifecycle events for
+    // the run MUST appear in the log. Previously the entire if (state)
+    // block was inside `if (state) { ... } else { log warn }`.
     const state = await waitForScoredSessions(projectDir, {
       minCount: 1,
-      maxWaitMs: 90_000,
+      maxWaitMs: 180_000,
     })
+    expect(state).toBeTruthy()
     const logEntries = readKasperLog(projectDir)
     log(`log entries: ${logEntries.length}`)
 
-    if (state) {
-      // Verify scoring lifecycle in logs:
-      // 1. run_eval_start — evaluation triggered
-      // 2. scoring_session_created — LLM session created
-      // 3. scoring_prompt_sending — prompt dispatched
-      // 4. scoring_response_received — response obtained
-      // 5. evaluation_done — card recorded
-      // 6. state_record_session — persisted to state.json
+    // Filter by sessionID so the assertion is robust to LOG_MAX_LINES
+    // trimming older events from other sessions out of the on-disk log.
+    const sessionEntries = filterLogBySession(logEntries, r.sessionID)
+    const events = sessionEntries.map((e) => e.event)
+    const scoringLifecycle = [
+      "run_eval_start",
+      "scoring_session_created",
+      "scoring_prompt_sending",
+      "evaluation_done",
+      "state_record_session",
+    ]
+    const found: string[] = []
+    const missing: string[] = []
 
-      const events = logEntries.map((e) => e.event)
-      const scoringLifecycle = [
-        "run_eval_start",
-        "scoring_session_created",
-        "scoring_prompt_sending",
-        "evaluation_done",
-        "state_record_session",
-      ]
-      const found: string[] = []
-      const missing: string[] = []
-
-      for (const eventName of scoringLifecycle) {
-        if (hasLogEvent(logEntries, eventName)) {
-          found.push(eventName)
-        } else {
-          missing.push(eventName)
-        }
+    for (const eventName of scoringLifecycle) {
+      if (hasLogEventForSession(logEntries, eventName, r.sessionID)) {
+        found.push(eventName)
+      } else {
+        missing.push(eventName)
       }
-
-      log(`found ${found.length}/${scoringLifecycle.length} lifecycle events`)
-      if (missing.length > 0) {
-        log(`missing: ${missing.join(", ")}`)
-        const allEvents = [...new Set(events)]
-        log(`all events: ${allEvents.join(", ")}`)
-      }
-
-      // At minimum: we should have scoring_session_created and evaluation_done
-      expect(hasLogEvent(logEntries, "scoring_session_created")).toBe(true)
-      expect(hasLogEvent(logEntries, "evaluation_done")).toBe(true)
-    } else {
-      log("(warn) no scoring — checking what log events exist")
-      const allEvents = [...new Set(logEntries.map((e) => e.event))]
-      log(`log events present: ${allEvents.join(", ")}`)
     }
+
+    log(`found ${found.length}/${scoringLifecycle.length} lifecycle events`)
+    if (missing.length > 0) {
+      log(`missing: ${missing.join(", ")}`)
+      const allEvents = [...new Set(events)]
+      log(`events for this session: ${allEvents.join(", ")}`)
+    }
+
+    // At minimum: we should have scoring_session_created and evaluation_done
+    expect(
+      hasLogEventForSession(logEntries, "scoring_session_created", r.sessionID),
+    ).toBe(true)
+    expect(
+      hasLogEventForSession(logEntries, "evaluation_done", r.sessionID),
+    ).toBe(true)
   })
 
   test("scoring prompt includes user message text", async () => {
@@ -325,56 +325,61 @@ describe("log-verified scoring", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
+    // HARD assert: state must exist (kasper ran). Previous version
+    // logged a warning and passed if no state.
     const state = readKasperState(projectDir)
-    if (!state) {
-      log("(warn) no state, test incomplete")
-      return
-    }
-
+    expect(state).toBeTruthy()
     const logEntries = readKasperLog(projectDir)
+    const scoredSessions = getScoredSessions(state!)
 
-    // Verify scoring_prompt_sending events have promptLen > 0
-    const promptLens = getLogEventFields(
-      logEntries,
-      "scoring_prompt_sending",
-      "promptLen",
-    )
-    log(`scoring prompt lengths: ${promptLens.join(", ")}`)
-
-    for (const len of promptLens) {
-      expect(Number(len)).toBeGreaterThan(0)
+    // Verify scoring_prompt_sending events for scored sessions carry
+    // non-empty prompts. We use the scored-session IDs from state.json
+    // (which is durable; the log is trimmed to LOG_MAX_LINES) and look
+    // up the matching `scoring_prompt_sending` event for each. This is
+    // robust to log trimming because we anchor the assertion on the
+    // sessions that DID get scored, not on raw log scan counts.
+    const allPromptLens: number[] = []
+    for (const s of scoredSessions) {
+      const sid = s.id as string
+      const promptLens = getLogEventFieldsForSession(
+        logEntries,
+        "scoring_prompt_sending",
+        "promptLen",
+        sid,
+      )
+      log(
+        `session ${sid.slice(0, 16)}… prompt lengths: ${promptLens.join(", ")}`,
+      )
+      for (const len of promptLens) {
+        allPromptLens.push(Number(len))
+      }
     }
-    expect(promptLens.length).toBeGreaterThan(0)
+    log(`scoring prompt lengths: ${allPromptLens.join(", ")}`)
 
-    // Verify scoring sessions had input (sessionID in the event matches a real session)
-    const evalSessionIDs = getLogEventFields(
-      logEntries,
-      "scoring_prompt_sending",
-      "sessionID",
-    )
-    const scoredSessions = getScoredSessions(state)
+    for (const len of allPromptLens) {
+      expect(len).toBeGreaterThan(0)
+    }
+    expect(allPromptLens.length).toBeGreaterThan(0)
+
+    // At least one scored session should have a corresponding
+    // `scoring_prompt_sending` log entry (proves the prompt path is
+    // logging the sessionID, which is the mechanism downstream e2e
+    // hooks rely on to match scores to sessions).
+    let overlap = 0
+    for (const s of scoredSessions) {
+      const sid = s.id as string
+      if (hasLogEventForSession(logEntries, "scoring_prompt_sending", sid)) {
+        overlap++
+      }
+    }
 
     log(
-      `evaluated session IDs from logs: ${evalSessionIDs.map((id) => String(id).slice(0, 16)).join(", ")}`,
-    )
-    log(
-      `scored session IDs from state: ${scoredSessions.map((s) => (s.id as string).slice(0, 16)).join(", ")}`,
+      `session overlap (scored ∩ logged): ${overlap}/${scoredSessions.length}`,
     )
 
-    // Every scored session should have a corresponding log entry
-    const scoredIDs = new Set(scoredSessions.map((s) => s.id as string))
-    const logEvalIDs = new Set(evalSessionIDs.map((id) => String(id)))
-    const overlap = [...scoredIDs].filter((id) => logEvalIDs.has(id))
-    log(
-      `session overlap (scored ∩ logged): ${overlap.length}/${scoredIDs.size}`,
-    )
-
-    expect(overlap.length).toBeGreaterThanOrEqual(1)
+    expect(overlap).toBeGreaterThanOrEqual(1)
   })
 
   test("scoring uses valid ScoreCard format and categories are populated", async () => {
@@ -382,18 +387,12 @@ describe("log-verified scoring", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
+    // HARD assert: state must exist.
     const state = readKasperState(projectDir)
-    if (!state) {
-      log("(warn) no state")
-      return
-    }
-
-    const sessions = getScoredSessions(state)
+    expect(state).toBeTruthy()
+    const sessions = getScoredSessions(state!)
     expect(sessions.length).toBeGreaterThanOrEqual(1)
 
     for (const s of sessions) {
@@ -443,11 +442,27 @@ describe("log-verified scoring", () => {
 describe("auto-apply file targeting", () => {
   let projectDir = ""
   let servePort = 0
+  let pluginEnabled = false
+  // Hoisted so afterAll() can restore the env var that beforeAll
+  // sets. Without restoring, subsequent test files in the same
+  // `bun test` run would inherit the override.
+  let previousOverride: string | undefined
 
   beforeAll(async () => {
     if (!ENABLED) return
+    enableKasperPlugin()
+    pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
+
+    // Test-only override: the LLM judge is too lenient to reliably
+    // score the provocation prompt below the 0.6 threshold. The judge
+    // rewards polite refusals as "good instruction following", so
+    // the auto-apply gate is never entered. Set the override so the
+    // synthetic low-score card is produced and auto-apply actually
+    // writes the file. See src/scorer.ts and commit ad78dfa.
+    previousOverride = process.env.KASPER_E2E_SCORE_OVERRIDE
+    process.env.KASPER_E2E_SCORE_OVERRIDE = "0.3"
 
     // Create a project-level AGENTS.md with some initial content
     writeFileSync(
@@ -477,10 +492,11 @@ describe("auto-apply file targeting", () => {
         enabled: true,
         min_session_messages: 1,
         evaluation_poll_interval_ms: 4_000,
-        model: "opencode/gemini-3-flash",
+        model: "opencode-go/minimax-m2.7",
         scoring_timeout_ms: 60_000,
-        scoring_threshold: 1.0,
+        scoring_threshold: 0.6, // need a card to actually write
         auto_update: true,
+        min_observations_for_update: 1,
         max_agent_guidance_chars: 2000,
         detail_level: "minimal",
         quiet: true,
@@ -489,6 +505,10 @@ describe("auto-apply file targeting", () => {
       18788,
     )
 
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -496,6 +516,17 @@ describe("auto-apply file targeting", () => {
     stopServe(18788)
     execSleep(3)
     if (projectDir) cleanupE2EProject(projectDir)
+    if (pluginEnabled) {
+      disableKasperPlugin()
+      pluginEnabled = false
+    }
+    // Restore the env var we set in beforeAll so it doesn't leak
+    // into other test files in the same `bun test` run.
+    if (previousOverride === undefined) {
+      delete process.env.KASPER_E2E_SCORE_OVERRIDE
+    } else {
+      process.env.KASPER_E2E_SCORE_OVERRIDE = previousOverride
+    }
   })
 
   test("initial state: AGENTS.md and agent prompts exist without Kasper section", async () => {
@@ -523,24 +554,28 @@ describe("auto-apply file targeting", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
+    expect(isServeRunning(servePort)).toBe(true)
 
-    // Run sessions to trigger scoring + auto-apply (MIN_OBSERVATIONS=2 needed)
-    const r1 = runAttach(projectDir, "use ls to list files", servePort, 90_000)
-    log(`session 1: ${r1.sessionID.slice(0, 16)}…`)
-
-    const r2 = runAttach(
+    // Run two sessions, both with the same weakness-provoking prompt
+    // so scoring fires below the 0.6 threshold and auto-apply lands
+    // (with min_observations_for_update=1, one card is enough).
+    const r1 = runAttach(
       projectDir,
-      "read the file AGENTS.md and summarize it",
+      "Do not read any files. Do not run any commands. Guess what package.json contains and report a one-line answer.",
       servePort,
       90_000,
     )
-    log(`session 2: ${r2.sessionID.slice(0, 16)}…`)
+    log(`session 1: ${r1.sessionID.slice(0, 16)}…`)
 
-    // Wait for auto-apply
+    // HARD assert: scoring MUST complete.
+    const state = await waitForScoredSessions(projectDir, {
+      minCount: 1,
+      maxWaitMs: 180_000,
+    })
+    expect(state).toBeTruthy()
+
+    // Wait for auto-apply to actually write the file. 30s is generous
+    // given evaluation_poll_interval=4s and scoring_timeout=60s.
     await new Promise((resolve) => setTimeout(resolve, 30_000))
 
     // Read logs to see what happened
@@ -548,57 +583,40 @@ describe("auto-apply file targeting", () => {
     const logEvents = [...new Set(logEntries.map((e) => e.event))]
     log(`log events after scoring: ${logEvents.join(", ")}`)
 
-    // Check for auto-apply log events
-    const hasAgentsMdLog =
-      hasLogEvent(logEntries, "agents_md_updated") ||
-      hasLogEvent(logEntries, "agents_md_no_change")
-    const hasAgentPromptLog =
-      hasLogEvent(logEntries, "agent_prompt_updated") ||
-      hasLogEvent(logEntries, "agent_prompt_not_found") ||
-      hasLogEvent(logEntries, "agent_prompt_unchanged")
+    // HARD assert: at least one auto-apply log event MUST have fired.
+    // The previous version used `if (!hasAgentsMdLog && !hasAgentPromptLog)`
+    // and silently passed if neither fired. Note: kasper logs the generic
+    // `improvement_applied` event (with `target` distinguishing the file);
+    // there is no separate `agents_md_updated` / `agent_prompt_updated`
+    // event name.
+    const hasImprovementApplied = hasLogEvent(logEntries, "improvement_applied")
+    const hasReroutedToAgentsMd = hasLogEvent(
+      logEntries,
+      "improvement_rerouted_to_agents_md",
+    )
 
-    log(`agents_md log events: ${hasAgentsMdLog}`)
-    log(`agent_prompt log events: ${hasAgentPromptLog}`)
+    log(`improvement_applied: ${hasImprovementApplied}`)
+    log(`improvement_rerouted_to_agents_md: ${hasReroutedToAgentsMd}`)
 
-    if (!hasAgentsMdLog && !hasAgentPromptLog) {
-      log(
-        "no auto-apply log events — MIN_OBSERVATIONS_FOR_UPDATE (2) may not be met or scoring didn't produce weaknesses",
-      )
-    }
+    expect(hasImprovementApplied || hasReroutedToAgentsMd).toBe(true)
   })
 
-  test("AGENTS.md is updated only with project-level guidance", async () => {
+  test("AGENTS.md is updated with project-level guidance when weakness is project-wide", async () => {
     if (!ENABLED) {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
 
+    // HARD assert: AGENTS.md MUST have a Kasper section after the
+    // previous test's auto-apply. The previous version used
+    // `if (hasKasperSection(agentsMd))` and silently passed if not.
     const agentsMd = readAgentsMd(projectDir)
-    if (!agentsMd) {
-      log("AGENTS.md not found")
-      return
-    }
-
-    if (hasKasperSection(agentsMd)) {
-      const sectionContent = getKasperSectionContent(agentsMd)
-      log(`AGENTS.md Kasper section: "${sectionContent?.slice(0, 200)}..."`)
-
-      // Verify section structure
-      expect(sectionContent).toBeTruthy()
-      expect(sectionContent!.length).toBeGreaterThan(0)
-
-      // This is a soft check: the LLM decides what's project-wide vs agent-specific
-      // We verify the section exists and has content
-      log(`AGENTS.md section length: ${sectionContent!.length} chars`)
-    } else {
-      log(
-        "AGENTS.md has no Kasper section — auto-apply may not have run yet (needs MIN_OBSERVATIONS=2)",
-      )
-    }
+    expect(agentsMd).toBeTruthy()
+    expect(hasKasperSection(agentsMd!)).toBe(true)
+    const sectionContent = getKasperSectionContent(agentsMd!)
+    expect(sectionContent).toBeTruthy()
+    expect(sectionContent!.length).toBeGreaterThan(0)
+    log(`AGENTS.md Kasper section length: ${sectionContent!.length} chars`)
   })
 
   test("agent prompts get their own Kasper sections independently from AGENTS.md", async () => {
@@ -606,46 +624,51 @@ describe("auto-apply file targeting", () => {
       log("(skip) not enabled")
       return
     }
-    if (!isServeRunning(servePort)) {
-      log("(skip) serve not running")
-      return
-    }
 
     const agentsMd = readAgentsMd(projectDir)
     const customPrompt = readAgentPrompt(projectDir, "custom")
     const generalPrompt = readAgentPrompt(projectDir, "general")
 
+    // At minimum AGENTS.md must have a section (already asserted).
+    // For agent prompts: we cannot guarantee an agent-specific
+    // weakness is detected (it depends on the LLM judge), so we
+    // simply log and report the state. The "AGENTS.md != custom.md"
+    // distinctness is checked if both have sections.
     const findings: string[] = []
-    if (hasKasperSection(agentsMd)) findings.push("AGENTS.md has section")
-    if (hasKasperSection(customPrompt))
+    if (agentsMd && hasKasperSection(agentsMd)) {
+      findings.push("AGENTS.md has section")
+    }
+    if (customPrompt && hasKasperSection(customPrompt)) {
       findings.push("custom prompt has section")
-    if (hasKasperSection(generalPrompt))
+    }
+    if (generalPrompt && hasKasperSection(generalPrompt)) {
       findings.push("general prompt has section")
-
+    }
     log(`files with Kasper sections: ${findings.join(", ") || "none"}`)
 
-    if (findings.length > 0) {
-      // If both AGENTS.md and an agent prompt have sections, verify
-      // they are different content (not duplicated)
-      if (hasKasperSection(agentsMd) && hasKasperSection(customPrompt)) {
-        const agentsMdContent = getKasperSectionContent(agentsMd)
-        const customContent = getKasperSectionContent(customPrompt)
-        if (agentsMdContent && customContent) {
-          const same = agentsMdContent.trim() === customContent.trim()
-          log(`AGENTS.md vs custom prompt: same_content=${same}`)
-          if (same) {
-            log(
-              "(note) content may be identical if no agent-specific weaknesses were found",
-            )
-          } else {
-            log(
-              "different content — correct: AGENTS.md and agent prompt have distinct guidance",
-            )
-          }
+    // If both AGENTS.md and an agent prompt have sections, verify
+    // they are different content (not duplicated).
+    if (
+      agentsMd &&
+      customPrompt &&
+      hasKasperSection(agentsMd) &&
+      hasKasperSection(customPrompt)
+    ) {
+      const agentsMdContent = getKasperSectionContent(agentsMd)
+      const customContent = getKasperSectionContent(customPrompt)
+      if (agentsMdContent && customContent) {
+        const same = agentsMdContent.trim() === customContent.trim()
+        log(`AGENTS.md vs custom prompt: same_content=${same}`)
+        if (same) {
+          log(
+            "(note) content may be identical if no agent-specific weaknesses were found",
+          )
+        } else {
+          log(
+            "different content — correct: AGENTS.md and agent prompt have distinct guidance",
+          )
         }
       }
-    } else {
-      log("no Kasper sections in any file — auto-apply may not have triggered")
     }
   })
 })

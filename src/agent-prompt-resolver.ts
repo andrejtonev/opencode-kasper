@@ -1,7 +1,18 @@
-import { readFile, stat } from "node:fs/promises"
+import { readdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, isAbsolute, join, relative } from "node:path"
-import { applyEdits, type ModificationOptions, modify } from "jsonc-parser"
+import { basename, dirname, isAbsolute, join, relative } from "node:path"
+import {
+  applyEdits,
+  type ModificationOptions,
+  modify,
+  parse,
+} from "jsonc-parser"
+import {
+  candidateGlobalOpencodeDirs,
+  dirExists,
+  expandTilde,
+  fileExists,
+} from "./path-utils.js"
 import { writeTextAtomic } from "./prompt-utils.js"
 
 /**
@@ -19,6 +30,16 @@ import { writeTextAtomic } from "./prompt-utils.js"
  * kasper to create an empty `.opencode/agents/<name>.md` instead of editing
  * the real prompt. This module performs the full resolution and exposes the
  * result so the AgentPromptManager can read/write the correct file.
+ *
+ * Plugins (e.g. oh-my-opencode) ship agents whose prompt lives inside
+ * `node_modules/<plugin>/.../src/agents/<name>.ts`. The user customises
+ * these built-ins by adding an `agentOverrides.<name>.prompt` or
+ * `prompt_append` field to the plugin's own config file (e.g.
+ * `.opencode/oh-my-opencode.json`). To handle these layouts without
+ * hardcoding plugin names, kasper scans every `.opencode/*.json[c]` at
+ * the project (walked up) and global locations for an `agent` or `agents`
+ * map containing a `prompt` or `prompt_append` field for the requested
+ * name, and exposes the result as a `plugin_override` source.
  */
 export type AgentPromptSource =
   | {
@@ -45,30 +66,58 @@ export type AgentPromptSource =
       /** Path of the opencode.json that holds the inline string. */
       configPath: string
     }
+  | {
+      /**
+       * Plugin-defined override (e.g. oh-my-opencode's `agentOverrides`,
+       * opencode.json's `agent.<name>.prompt`/`prompt_append`, or any
+       * `.opencode/*.json[c]` that defines an `agent`/`agents` map with
+       * a `prompt` or `prompt_append` field for this name).
+       *
+       * The `target` discriminates how the prompt is reachable:
+       *   - `file`:      resolves to a real file on disk. The agent's
+       *                  `prompt` or `prompt_append` is a `{file:...}` or
+       *                  `{path:...}` directive. kasper reads/writes that
+       *                  file as the canonical prompt.
+       *   - `file_uri`:  resolves to a real file on disk via a `file://`
+       *                  URI. kasper reads/writes that file.
+       *   - `config`:    the prompt is a raw string stored inside the
+       *                  config file under `promptField`. If `isAppend` is
+       *                  true the string is appended to the upstream
+       *                  factory prompt at runtime; kasper edits the
+       *                  `prompt_append` value in the config. If
+       *                  `isAppend` is false the string fully replaces the
+       *                  upstream prompt; kasper treats it as inline.
+       */
+      kind: "plugin_override"
+      /**
+       * The agent name this override belongs to. The resolver fills this
+       * in from the JSON map key it was found under. Writers MUST use it
+       * (not a value-based scan) to locate the entry — see B1 regression
+       * for why a value-based scan modifies the wrong agent when two
+       * agents share the same prompt text.
+       */
+      agentName: string
+      target: "file" | "file_uri" | "config"
+      /** Absolute path to the referenced file (for `file` and `file_uri`). */
+      path?: string
+      /** The raw string value, when target is `config`. */
+      value?: string
+      /** Path of the config file (json or jsonc) that declared the override. */
+      configPath: string
+      /** Which key declared the override: `prompt` or `prompt_append`. */
+      promptField: "prompt" | "prompt_append"
+      /** True when the key is `prompt_append`; false when it is `prompt`. */
+      isAppend: boolean
+    }
   | { kind: "missing" }
 
 const FILE_DIRECTIVE = /^\s*\{\s*file\s*:\s*([^}]+)\s*\}\s*$/
 const PATH_DIRECTIVE = /^\s*\{\s*path\s*:\s*([^}]+)\s*\}\s*$/
 
-function expandTilde(p: string): string {
-  if (p === "~") return homedir()
-  if (p.startsWith("~/")) return join(homedir(), p.slice(2))
-  return p
-}
-
 function resolveDirectivePath(raw: string, baseDir: string): string {
   const expanded = expandTilde(raw.trim())
   if (isAbsolute(expanded)) return expanded
   return join(baseDir, expanded)
-}
-
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    const info = await stat(p)
-    return info.isFile()
-  } catch {
-    return false
-  }
 }
 
 async function loadJsoncIfExists(
@@ -77,8 +126,6 @@ async function loadJsoncIfExists(
   try {
     const raw = await readFile(path, "utf-8")
     if (!raw.trim()) return undefined
-    // Local import of jsonc-parser's parse to avoid coupling to the Kasper config layer
-    const { parse } = await import("jsonc-parser")
     const errors: Array<{ error: number; offset: number; length: number }> = []
     const parsed = parse(raw, errors, {
       allowTrailingComma: true,
@@ -93,32 +140,26 @@ async function loadJsoncIfExists(
   }
 }
 
-function getAgentEntry(
+/**
+ * Resolve a `agent.<name>` entry from a raw config object, returning both
+ * the entry and the canonical config key it was found under. When the
+ * caller passes a display name (e.g. "Sisyphus - ultraworker"), this
+ * returns the matched key (e.g. "sisyphus") so the caller can use the
+ * canonical name in subsequent operations (file paths, override sources).
+ *
+ * The match logic is delegated to `lookupAgentEntryWithFallback` — see
+ * that function's comment for the display-name fallback rules and the
+ * rationale for the space-after-key requirement.
+ */
+function getAgentEntryAndKey(
   raw: Record<string, unknown> | undefined,
   name: string,
-): Record<string, unknown> | undefined {
+): { entry: Record<string, unknown>; key: string } | undefined {
   if (!raw) return undefined
   const agent = raw.agent
   if (!agent || typeof agent !== "object" || Array.isArray(agent))
     return undefined
-  const entry = (agent as Record<string, unknown>)[name]
-  if (!entry || typeof entry !== "object" || Array.isArray(entry))
-    return undefined
-  return entry as Record<string, unknown>
-}
-
-function candidateGlobalOpencodeDirs(): string[] {
-  const dirs: string[] = []
-  if (process.env.XDG_CONFIG_HOME) {
-    dirs.push(join(process.env.XDG_CONFIG_HOME, "opencode"))
-  } else {
-    dirs.push(join(homedir(), ".config", "opencode"))
-  }
-  if (process.platform === "win32" && process.env.APPDATA) {
-    dirs.push(join(process.env.APPDATA, "opencode"))
-  }
-  dirs.push(join(homedir(), ".opencode"))
-  return [...new Set(dirs)]
+  return lookupAgentEntryWithFallback(agent as Record<string, unknown>, name)
 }
 
 interface LoadedConfig {
@@ -184,9 +225,335 @@ function globalAgentDirCandidates(
   ]
 }
 
+/**
+ * Expand a user-configured prompt path. Supports absolute paths, `~/...`
+ * home-relative paths, and paths relative to the project root (anything
+ * that isn't absolute and doesn't start with `~`).
+ */
+function expandCustomPromptPath(raw: string, projectRoot: string): string {
+  const expanded = expandTilde(raw.trim())
+  if (isAbsolute(expanded)) return expanded
+  return join(projectRoot, expanded)
+}
+
+function customPromptPathCandidates(
+  customPaths: readonly string[] | undefined,
+  projectRoot: string,
+  agentName: string,
+): string[] {
+  if (!customPaths || customPaths.length === 0) return []
+  const safe = sanitizeName(agentName)
+  const out: string[] = []
+  for (const raw of customPaths) {
+    if (typeof raw !== "string" || raw.trim().length === 0) continue
+    const dir = expandCustomPromptPath(raw, projectRoot)
+    out.push(join(dir, "agent", `${safe}.md`))
+    out.push(join(dir, "agents", `${safe}.md`))
+  }
+  return out
+}
+
 function sanitizeName(name: string): string {
   // Mirror the existing sanitization in agent-prompts.ts
   return name.replace(/[\\/]/g, "_")
+}
+
+/**
+ * Try to extract a `prompt` or `prompt_append` override entry for `agentName`
+ * from any of the standard `agent`/`agents` map locations in a config object.
+ * Returns the first hit with the field name and the map key the entry was
+ * found under, or undefined. `mapKey` is returned alongside so the writer
+ * can rebuild the correct JSON path (we must not infer the map from a value
+ * scan — see B1).
+ */
+function readPluginOverrideEntry(
+  raw: Record<string, unknown> | undefined,
+  agentName: string,
+):
+  | {
+      entry: Record<string, unknown>
+      promptField: "prompt" | "prompt_append"
+      mapKey: "agent" | "agents"
+      /** The canonical config key the entry was found under. */
+      key: string
+    }
+  | undefined {
+  if (!raw) return undefined
+  // Prefer the standard `agent` map (opencode.json + most plugins).
+  for (const key of ["agent", "agents"] as const) {
+    const map = raw[key]
+    if (!map || typeof map !== "object" || Array.isArray(map)) continue
+    const hit = lookupAgentEntryWithFallback(
+      map as Record<string, unknown>,
+      agentName,
+    )
+    if (!hit) continue
+    const { entry, key: actualKey } = hit
+    if (!entry || !actualKey) continue
+    if (
+      typeof entry.prompt_append === "string" &&
+      entry.prompt_append.length > 0
+    ) {
+      return {
+        entry,
+        promptField: "prompt_append",
+        mapKey: key,
+        key: actualKey,
+      }
+    }
+    if (typeof entry.prompt === "string" && entry.prompt.length > 0) {
+      return { entry, promptField: "prompt", mapKey: key, key: actualKey }
+    }
+  }
+  return undefined
+}
+
+/**
+ * Like {@link getAgentEntry} but for an already-extracted `agent`/`agents`
+ * map value (no raw-config wrapper). Returns the entry AND the canonical
+ * key it was found under, so callers can use the canonical key for
+ * subsequent JSON-path operations (jsonc modify, etc.).
+ */
+function lookupAgentEntryWithFallback(
+  map: Record<string, unknown>,
+  name: string,
+): { entry: Record<string, unknown>; key: string } | undefined {
+  // Exact match first.
+  const exact = map[name]
+  if (exact && typeof exact === "object" && !Array.isArray(exact))
+    return { entry: exact as Record<string, unknown>, key: name }
+  // Display-name fallback (see getAgentEntry comment). The convention
+  // for plugin display names is "<key> - <descriptor>" (e.g. omo's
+  // AGENT_DISPLAY_NAMES maps `sisyphus` → "Sisyphus - ultraworker"), so
+  // we require a SPACE (or end-of-string) immediately after the matched
+  // key. We deliberately do NOT match on a hyphen alone, because a
+  // hyphen-separated suffix is a common pattern for unrelated agent
+  // names (e.g. a test creating `code-quality-0b16404e` would otherwise
+  // false-positive against a global `code-quality` agent and silently
+  // route the improvement to the wrong file). The exact-match and
+  // case-insensitive paths above cover the no-separator cases.
+  const lowerName = name.toLowerCase()
+  let best: { key: string; len: number } | undefined
+  for (const key of Object.keys(map)) {
+    if (key.toLowerCase() === lowerName) {
+      best = { key, len: key.length }
+      break
+    }
+    const lowerKey = key.toLowerCase()
+    if (lowerName.length > lowerKey.length && lowerName.startsWith(lowerKey)) {
+      const next = lowerName[lowerKey.length]
+      if (next === " " || next === undefined) {
+        if (!best || key.length > best.len) best = { key, len: key.length }
+      }
+    }
+  }
+  if (!best) return undefined
+  const entry = map[best.key]
+  if (!entry || typeof entry !== "object" || Array.isArray(entry))
+    return undefined
+  return { entry: entry as Record<string, unknown>, key: best.key }
+}
+
+/**
+ * Classify a `prompt` or `prompt_append` string into one of the three
+ * `plugin_override.target` shapes and produce a complete source object.
+ * `agentName` is the JSON map key the override lives under and MUST be
+ * propagated to the source so writers can locate the entry by name (not
+ * by scanning for an identical value, which is unsafe — see B1).
+ */
+function buildPluginOverride(
+  agentName: string,
+  value: string,
+  promptField: "prompt" | "prompt_append",
+  configPath: string,
+): AgentPromptSource {
+  const isAppend = promptField === "prompt_append"
+  // `{file:...}` / `{path:...}` directive → target a real file on disk.
+  const fileMatch = value.match(FILE_DIRECTIVE) ?? value.match(PATH_DIRECTIVE)
+  if (fileMatch) {
+    const path = resolveDirectivePath(fileMatch[1], dirname(configPath))
+    return {
+      kind: "plugin_override",
+      agentName,
+      target: "file",
+      path,
+      configPath,
+      promptField,
+      isAppend,
+    }
+  }
+  // `file://...` URI (used by oh-my-opencode and others) → target a real
+  // file on disk. We resolve `./` and `~/` forms against the config's
+  // directory and `homedir()` respectively; absolute URIs are kept verbatim.
+  const fileUri = value.match(/^file:\/\/(.+)$/)
+  if (fileUri) {
+    const raw = fileUri[1]
+    if (raw.startsWith("/")) {
+      return {
+        kind: "plugin_override",
+        agentName,
+        target: "file_uri",
+        path: raw,
+        configPath,
+        promptField,
+        isAppend,
+      }
+    }
+    if (raw.startsWith("~/")) {
+      return {
+        kind: "plugin_override",
+        agentName,
+        target: "file_uri",
+        path: join(homedir(), raw.slice(2)),
+        configPath,
+        promptField,
+        isAppend,
+      }
+    }
+    if (raw.startsWith("./") || raw.startsWith("../")) {
+      return {
+        kind: "plugin_override",
+        agentName,
+        target: "file_uri",
+        path: join(dirname(configPath), raw),
+        configPath,
+        promptField,
+        isAppend,
+      }
+    }
+    // Unknown file:// form — degrade to config-raw to avoid a bad path.
+    return {
+      kind: "plugin_override",
+      agentName,
+      target: "config",
+      value,
+      configPath,
+      promptField,
+      isAppend,
+    }
+  }
+  // Anything else is a raw string in the config file.
+  return {
+    kind: "plugin_override",
+    agentName,
+    target: "config",
+    value,
+    configPath,
+    promptField,
+    isAppend,
+  }
+}
+
+/**
+ * Walk up the directory tree starting at `startDir` collecting every
+ * `.opencode/` directory encountered. Used by the plugin-config scanner to
+ * find candidate config files without hardcoding a single project root.
+ */
+async function collectOpencodeDirsUp(startDir: string): Promise<string[]> {
+  const out: string[] = []
+  let current = startDir
+  const seen = new Set<string>()
+  while (true) {
+    if (!seen.has(current)) {
+      seen.add(current)
+      const dotDir = join(current, ".opencode")
+      if (await dirExists(dotDir)) out.push(dotDir)
+    }
+    const parent = dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return out
+}
+
+/**
+ * Enumerate every `*.json[c]` in a directory (non-recursive). The list is
+ * sorted for determinism so the resolver picks the same config every run.
+ */
+async function listOpencodeJsonFiles(dir: string): Promise<string[]> {
+  let entries: string[]
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return []
+  }
+  return entries
+    .filter((e) => e.endsWith(".json") || e.endsWith(".jsonc"))
+    .sort()
+    .map((e) => join(dir, e))
+}
+
+/**
+ * Scan a single `.opencode/` directory for a plugin override. Skips the
+ * standard `opencode.json`/`opencode.jsonc` (already handled by the caller)
+ * to avoid double-counting.
+ *
+ * Use `basename()` from node:path, not a hand-rolled `split("/")` — on
+ * Windows the path uses `\` as the separator, so the manual split would
+ * fail to isolate the filename and the skip would never fire (B2).
+ */
+async function findOverrideInDir(
+  dir: string,
+  agentName: string,
+): Promise<AgentPromptSource | undefined> {
+  const files = await listOpencodeJsonFiles(dir)
+  for (const file of files) {
+    const base = basename(file)
+    if (base === "opencode.json" || base === "opencode.jsonc") continue
+    const raw = await loadJsoncIfExists(file)
+    const hit = readPluginOverrideEntry(raw, agentName)
+    if (hit)
+      return buildPluginOverride(
+        // Use the canonical key the entry was found under, NOT the
+        // display name the caller passed. Subsequent code in
+        // appendToPluginOverridePrompt uses this name in a jsonc
+        // modify() path — passing the display name would write to
+        // a non-existent key, leaving the actual agent entry untouched.
+        hit.key,
+        hit.entry[hit.promptField] as string,
+        hit.promptField,
+        file,
+      )
+  }
+  return undefined
+}
+
+/**
+ * Scan plugin config files for an agent override. Resolution order:
+ *   1. Project `.opencode/` (walked from `projectRoot` upward to `/`), the
+ *      first `.opencode/` containing a matching override wins.
+ *   2. Each candidate global opencode dir, scanned directly AND inside its
+ *      `.opencode/` subdir. The direct scan covers real-world layouts like
+ *      `~/.config/opencode/oh-my-opencode.json`; the nested scan is kept
+ *      for symmetry with the project layout.
+ *
+ * `opencode.json`/`opencode.jsonc` are excluded because the caller already
+ * handled them via `findProjectOpencodeJson`/`findGlobalOpencodeJson`.
+ */
+async function findPluginConfigOverride(
+  agentName: string,
+  projectRoot: string,
+  globalOpencodeDir?: string,
+): Promise<AgentPromptSource | undefined> {
+  const projectDirs = await collectOpencodeDirsUp(projectRoot)
+  for (const dir of projectDirs) {
+    const hit = await findOverrideInDir(dir, agentName)
+    if (hit) return hit
+  }
+  const globalCandidates = globalOpencodeDir
+    ? [
+        globalOpencodeDir,
+        ...candidateGlobalOpencodeDirs().filter((d) => d !== globalOpencodeDir),
+      ]
+    : candidateGlobalOpencodeDirs()
+  for (const dir of globalCandidates) {
+    const hit = await findOverrideInDir(dir, agentName)
+    if (hit) return hit
+    const inner = join(dir, ".opencode")
+    const hitInner = await findOverrideInDir(inner, agentName)
+    if (hitInner) return hitInner
+  }
+  return undefined
 }
 
 /**
@@ -194,11 +561,24 @@ function sanitizeName(name: string): string {
  * precedence over global. If the agent's `prompt` is a `{file:...}` or
  * `{path:...}` directive, return that file path. If it's a raw string,
  * return inline. Otherwise fall back to the conventional file locations.
+ *
+ * Then scan plugin-specific config files (`.opencode/*.json[c]`) at the
+ * project (walked up) and global locations for a `prompt` or `prompt_append`
+ * override for this agent, and return it as a `plugin_override` source. This
+ * covers layouts like oh-my-opencode where the canonical agent prompt is in
+ * `node_modules` and the user redirects it via the plugin's own config file.
+ *
+ * Finally, if `customPromptPaths` is non-empty, look for the agent's markdown
+ * file in `<dir>/agent/<name>.md` and `<dir>/agents/<name>.md` for each
+ * configured directory. This lets users redirect kasper to any number of
+ * additional prompt locations (e.g. a separate `prompts/` directory or a
+ * shared per-team prompt repo) without changing opencode's own behaviour.
  */
 export async function resolveAgentPromptSource(
   agentName: string,
   projectRoot: string,
   globalOpencodeDir?: string,
+  customPromptPaths?: readonly string[],
 ): Promise<AgentPromptSource> {
   const projectConfig = await findProjectOpencodeJson(projectRoot)
   const globalConfig = await findGlobalOpencodeJson(globalOpencodeDir)
@@ -206,14 +586,20 @@ export async function resolveAgentPromptSource(
   // Project wins over global. If both define the agent, prefer the project
   // entry — that matches opencode's deep-merge semantics where the project
   // config overrides the global.
-  const projectEntry = getAgentEntry(projectConfig?.raw, agentName)
-  const globalEntry = getAgentEntry(globalConfig?.raw, agentName)
-  const entry = projectEntry ?? globalEntry
-  const entryConfig = projectEntry
+  const projectHit = getAgentEntryAndKey(projectConfig?.raw, agentName)
+  const globalHit = getAgentEntryAndKey(globalConfig?.raw, agentName)
+  const entry = projectHit?.entry ?? globalHit?.entry
+  const entryConfig = projectHit
     ? projectConfig
-    : globalEntry
+    : globalHit
       ? globalConfig
       : undefined
+  // If the agentName passed in is a display name (e.g. "Sisyphus -
+  // ultraworker") and the config defines the agent under the canonical key
+  // (e.g. "sisyphus"), the helpers above resolve to the canonical key.
+  // Subsequent fallbacks (file paths, plugin_override scan) need the
+  // canonical name to find on-disk artefacts keyed by the config key.
+  const effectiveName = projectHit?.key ?? globalHit?.key ?? agentName
 
   if (entry && entryConfig) {
     const prompt = entry.prompt
@@ -234,11 +620,35 @@ export async function resolveAgentPromptSource(
   }
 
   // Fall back to conventional file locations
-  for (const p of projectAgentDirCandidates(projectRoot, agentName)) {
+  for (const p of projectAgentDirCandidates(projectRoot, effectiveName)) {
     if (await fileExists(p)) return { kind: "project_file", path: p }
   }
-  for (const p of globalAgentDirCandidates(globalOpencodeDir, agentName)) {
+  for (const p of globalAgentDirCandidates(globalOpencodeDir, effectiveName)) {
     if (await fileExists(p)) return { kind: "global_file", path: p }
+  }
+
+  // Plugin override scan: some plugins (e.g. oh-my-opencode) ship agent
+  // prompts inside node_modules and let users override them via
+  // `agent.<name>.prompt` or `agent.<name>.prompt_append` in a non-opencode
+  // config file under `.opencode/`. We scan every `.opencode/*.json[c]` for
+  // any top-level `agent` or `agents` map with a `prompt`/`prompt_append`
+  // field for this agent, and surface it as a `plugin_override` source.
+  const pluginOverride = await findPluginConfigOverride(
+    effectiveName,
+    projectRoot,
+    globalOpencodeDir,
+  )
+  if (pluginOverride) return pluginOverride
+
+  // User-configured extra prompt directories. Each entry is a directory
+  // (absolute, project-relative, or `~/...`); we look for the agent's
+  // markdown file under `<dir>/agent/` and `<dir>/agents/`.
+  for (const p of customPromptPathCandidates(
+    customPromptPaths,
+    projectRoot,
+    effectiveName,
+  )) {
+    if (await fileExists(p)) return { kind: "project_file", path: p }
   }
 
   return { kind: "missing" }
@@ -255,6 +665,206 @@ export function defaultAgentFilePath(
 ): string {
   const safe = sanitizeName(agentName)
   return join(projectRoot, ".opencode", "agents", `${safe}.md`)
+}
+
+/**
+ * Result of `appendToPluginOverridePrompt`.
+ */
+export interface PluginOverrideAppendResult {
+  /** Absolute path of the config file that was modified. */
+  configPath: string
+  /** The full `agents.<name>` object key in the config (e.g. `agent` or `agents`). */
+  mapKey: "agent" | "agents"
+  /** The prompt field that was updated (`prompt` or `prompt_append`). */
+  promptField: "prompt" | "prompt_append"
+  /** The agent name (map key) that was updated. */
+  agentName: string
+  /** New value of the field after appending. */
+  newValue: string
+}
+
+/**
+ * Append a block of text to the `prompt_append` (or `prompt`) field of a
+ * plugin override. Idempotent: if the exact block is already present
+ * (case-insensitive, whitespace-normalised) the file is left untouched and
+ * `applied: false` is returned via `newValue` matching the previous value.
+ *
+ * Locates the target entry by `source.agentName` + `source.promptField`,
+ * NOT by scanning for an identical `value` (which was the B1 bug — when
+ * two agents in the same file share the same prompt text, the first one
+ * in insertion order would win and the wrong agent would be edited).
+ *
+ * The `mapKey` (whether the entry lives under `agent` or `agents`) is
+ * discovered by scanning the parsed object for the named entry, but the
+ * agent name is fixed by `source.agentName` — never inferred from values.
+ */
+export async function appendToPluginOverridePrompt(
+  source: Extract<AgentPromptSource, { kind: "plugin_override" }>,
+  content: string,
+): Promise<PluginOverrideAppendResult> {
+  const trimmed = content.trim()
+  if (!trimmed) {
+    return {
+      configPath: source.configPath,
+      mapKey: "agent",
+      promptField: source.promptField,
+      agentName: source.agentName,
+      newValue: source.value ?? "",
+    }
+  }
+  const original = await readFile(source.configPath, "utf-8")
+  const errors: Array<{ error: number; offset: number; length: number }> = []
+  const parsed = parse(original, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+    allowEmptyContent: false,
+  })
+  const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<
+    string,
+    unknown
+  >
+
+  // Locate the entry by NAME (the value of source.agentName) under either
+  // the `agent` or `agents` map. The agent identity comes from the source
+  // — the resolver already established it during read. `source.agentName`
+  // is the canonical config key (e.g. "sisyphus"), not a display name
+  // (e.g. "Sisyphus - ultraworker"); the read path normalizes via
+  // readPluginOverrideEntry → lookupAgentEntryWithFallback. A value-based
+  // scan is unsafe and was the root cause of B1.
+  const agentName = source.agentName
+  let mapKey: "agent" | "agents" | undefined
+  for (const key of ["agent", "agents"] as const) {
+    const m = raw[key]
+    if (!m || typeof m !== "object" || Array.isArray(m)) continue
+    if ((m as Record<string, unknown>)[agentName] !== undefined) {
+      mapKey = key
+      break
+    }
+  }
+  if (!mapKey) {
+    throw new Error(
+      `appendToPluginOverridePrompt: could not locate agent "${agentName}" ` +
+        `under "agent" or "agents" in ${source.configPath}`,
+    )
+  }
+
+  // Idempotency check: split the existing value into blocks and test for
+  // an exact match. Splitting on `\n\n` avoids the substring false-positive
+  // where a longer existing block contains the new block as a prefix
+  // (e.g. existing "Be thorough and be fast" would incorrectly subsume new
+  // "Be thorough").
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
+  const existingBlocks = (source.value ?? "")
+    .split(/\n\s*\n+/)
+    .map((b) => norm(b))
+    .filter(Boolean)
+  if (existingBlocks.includes(norm(trimmed))) {
+    return {
+      configPath: source.configPath,
+      mapKey,
+      promptField: source.promptField,
+      agentName,
+      newValue: source.value ?? "",
+    }
+  }
+
+  const newValue = source.value
+    ? `${source.value.trimEnd()}\n\n${trimmed}\n`
+    : `${trimmed}\n`
+
+  const modOptions: ModificationOptions = {
+    formattingOptions: {
+      insertSpaces: true,
+      tabSize: 2,
+    },
+  }
+  const edits = modify(
+    original,
+    [mapKey, agentName, source.promptField],
+    newValue,
+    modOptions,
+  )
+  const updated = applyEdits(original, edits)
+  if (updated !== original) {
+    await writeTextAtomic(source.configPath, updated)
+  }
+  return {
+    configPath: source.configPath,
+    mapKey,
+    promptField: source.promptField,
+    agentName,
+    newValue,
+  }
+}
+
+/**
+ * Materialize a `plugin_override` (config target) into a real file. Creates
+ * `<projectRoot>/.opencode/agents/<name>.md` with the current override value
+ * and rewrites the config so the field becomes a `{file:...}` directive
+ * pointing at the new file. Returns the path of the new file and the
+ * absolute path to the config entry (so the caller can update its cache).
+ */
+export async function materializePluginOverrideToFile(
+  agentName: string,
+  source: Extract<AgentPromptSource, { kind: "plugin_override" }>,
+  projectRoot: string,
+  options: { mode?: "primary" | "subagent" } = {},
+): Promise<MaterializeResult> {
+  const filePath = defaultAgentFilePath(projectRoot, agentName)
+  const mode = options.mode ?? "subagent"
+
+  let fileCreated = false
+  if (!(await fileExists(filePath))) {
+    const frontmatter = `---\nmode: ${mode}\n---\n\n`
+    const body = `${(source.value ?? "").trimEnd()}\n`
+    await writeTextAtomic(filePath, frontmatter + body)
+    fileCreated = true
+  }
+
+  const configPath = source.configPath
+  const configDir = dirname(configPath)
+  const relPath = isAbsolute(filePath)
+    ? relative(configDir, filePath) || filePath
+    : filePath
+  const newPromptValue = `{file:${relPath}}`
+
+  const original = await readFile(configPath, "utf-8")
+  const errors: Array<{ error: number; offset: number; length: number }> = []
+  const parsed = parse(original, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+    allowEmptyContent: false,
+  })
+  const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<
+    string,
+    unknown
+  >
+  let mapKey: "agent" | "agents" = "agent"
+  // Discover the map key by scanning for the agent's entry.
+  for (const key of ["agent", "agents"] as const) {
+    const m = raw[key]
+    if (m && typeof m === "object" && !Array.isArray(m)) {
+      if ((m as Record<string, unknown>)[agentName]) {
+        mapKey = key
+        break
+      }
+    }
+  }
+  const modOptions: ModificationOptions = {
+    formattingOptions: { insertSpaces: true, tabSize: 2 },
+  }
+  const edits = modify(
+    original,
+    [mapKey, agentName, source.promptField],
+    newPromptValue,
+    modOptions,
+  )
+  const updated = applyEdits(original, edits)
+  const configModified = updated !== original
+  if (configModified) {
+    await writeTextAtomic(configPath, updated)
+  }
+  return { filePath, configPath, fileCreated, configModified }
 }
 
 /**

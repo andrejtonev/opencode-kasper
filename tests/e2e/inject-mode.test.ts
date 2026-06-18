@@ -25,6 +25,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { disableKasperPlugin, enableKasperPlugin } from "./harness.js"
 
 const ENABLED =
   process.env.OPENCODE_E2E === "1" &&
@@ -42,6 +43,7 @@ describe.skipIf(!ENABLED)(
   () => {
     let projectDir: string
     let targetPath: string
+    let pluginEnabled = false
     const realPromptOriginal = [
       "# Inline Test Agent",
       "",
@@ -50,6 +52,12 @@ describe.skipIf(!ENABLED)(
     ].join("\n")
 
     beforeAll(() => {
+      // Enable the kasper plugin symlink so `opencode run` below
+      // actually loads it. Without this, the plugin is .disabled
+      // and the test passes vacuously.
+      enableKasperPlugin()
+      pluginEnabled = true
+
       projectDir = mkdtempSync(join(tmpdir(), "kasper-e2e-inject-mode-"))
       targetPath = join(projectDir, "inline-prompt.md")
       writeFileSync(targetPath, realPromptOriginal, "utf-8")
@@ -83,6 +91,10 @@ describe.skipIf(!ENABLED)(
 
     afterAll(() => {
       if (projectDir) rmSync(projectDir, { recursive: true, force: true })
+      if (pluginEnabled) {
+        disableKasperPlugin()
+        pluginEnabled = false
+      }
     })
 
     test(
@@ -129,21 +141,19 @@ describe.skipIf(!ENABLED)(
         expect(finalContent).toContain("# Inline Test Agent")
         expect(finalContent).toContain("Be helpful.")
 
-        if (!observedInline) {
-          console.log(
-            "ℹ No inline injection observed within timeout — " +
-              "asserting only that no `## Kasper Inferred Instructions` " +
-              "section header was added (the regression signal)",
-          )
-        } else {
-          // The critical regression: section mode would have added a
-          // visible `## Kasper Inferred Instructions` heading. Inline
-          // mode must NOT do that.
-          expect(finalContent).not.toContain("## Kasper Inferred Instructions")
-          // And inline mode DID add its marker.
-          expect(finalContent).toContain("<!-- kasper-injected:begin -->")
-          expect(finalContent).toContain("<!-- kasper-injected:end -->")
-        }
+        // HARD assertion: with scoring_threshold=0.0 and
+        // min_observations_for_update=1, kasper MUST produce a card
+        // and inject inline markers. The previous version logged
+        // "No inline injection observed" and passed, which masked
+        // the disabled-plugin bug.
+        expect(observedInline).toBe(true)
+        // The critical regression: section mode would have added a
+        // visible `## Kasper Inferred Instructions` heading. Inline
+        // mode must NOT do that.
+        expect(finalContent).not.toContain("## Kasper Inferred Instructions")
+        // And inline mode DID add its marker.
+        expect(finalContent).toContain("<!-- kasper-injected:begin -->")
+        expect(finalContent).toContain("<!-- kasper-injected:end -->")
 
         // Even if no injection happened, the stub file must not have
         // been created at the conventional project path (resolver
