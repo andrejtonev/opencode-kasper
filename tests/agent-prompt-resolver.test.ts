@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto"
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
 import { join, relative } from "node:path"
+import { pathToFileURL } from "node:url"
 import {
   defaultAgentFilePath,
   materializeInlinePrompt,
@@ -366,7 +367,10 @@ describe("resolveAgentPromptSource — plugin_override", () => {
     await writeJsonc(
       join(projectRoot, ".opencode", "oh-my-opencode.json"),
       JSON.stringify({
-        agent: { foo: { prompt: `file://${target}` } },
+        // pathToFileURL produces `file:///abs/path` on POSIX and
+        // `file:///C:/path` on Windows. Plain `file://${target}` is a
+        // malformed URI on Windows (only 2 slashes, backslashes).
+        agent: { foo: { prompt: pathToFileURL(target).href } },
       }),
     )
     const source = await resolveAgentPromptSource("foo", projectRoot, globalDir)
@@ -375,6 +379,32 @@ describe("resolveAgentPromptSource — plugin_override", () => {
     }
     expect(source.target).toBe("file_uri")
     expect(source.path).toBe(target)
+  })
+
+  test("malformed `file://` URI degrades to `config` target", async () => {
+    // Regression for the Windows CI failure: a `file://` URI that
+    // isn't a well-formed URL used to be mis-routed by the manual
+    // `match` + `startsWith("/")` ladder. The URL-based parser now
+    // catches malformed input and degrades to the `config` target —
+    // the value is left verbatim in `source.value` and no
+    // `file_uri` claim is made.
+    // (`file://[invalid` is a malformed URL on every platform because
+    // `[` is a reserved host-delimiter character. `file://C:\\...`
+    // also fails on Windows but is leniently accepted on POSIX where
+    // Linux's URL parser treats `C` as a hostname; the `[invalid`
+    // form is portable.)
+    await writeJsonc(
+      join(projectRoot, ".opencode", "oh-my-opencode.json"),
+      JSON.stringify({
+        agent: { foo: { prompt: "file://[invalid" } },
+      }),
+    )
+    const source = await resolveAgentPromptSource("foo", projectRoot, globalDir)
+    if (source.kind !== "plugin_override") {
+      throw new Error(`expected plugin_override, got ${source.kind}`)
+    }
+    expect(source.target).toBe("config")
+    expect(source.value).toBe("file://[invalid")
   })
 
   test("`file://~/...` URI expands tilde to the home directory", async () => {

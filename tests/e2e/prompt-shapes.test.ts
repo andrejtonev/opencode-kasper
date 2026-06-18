@@ -37,8 +37,9 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
+import { pathToFileURL } from "node:url"
 import {
   materializeInlinePrompt,
   resolveAgentPromptSource,
@@ -242,6 +243,12 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
   let kasperStateDir: string
   let pluginConfigPath: string
   let promptFilePath: string
+  // Cross-platform `file://` URI for `promptFilePath`. Plain
+  // `file://${path}` template strings break on Windows because the
+  // result has only 2 slashes and backslashes (`file://C:\...`) —
+  // a malformed URI. `pathToFileURL` produces the canonical form
+  // (`file:///C:/...` on Windows, `file:///tmp/...` on POSIX).
+  let promptFileUri: string
 
   beforeEach(() => {
     const p = setupTmpProject("file-uri")
@@ -252,6 +259,7 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
     pluginConfigPath = join(projectDir, ".opencode", "oh-my-openagent.json")
     // The referenced prompt file lives somewhere on disk.
     promptFilePath = join(projectDir, "external-prompts", "uri-agent.md")
+    promptFileUri = pathToFileURL(promptFilePath).href
     mkdirSync(join(projectDir, "external-prompts"), { recursive: true })
     writeFileSync(
       promptFilePath,
@@ -268,7 +276,7 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
     writeFileSync(
       pluginConfigPath,
       JSON.stringify({
-        agent: { "uri-agent": { prompt_append: `file://${promptFilePath}` } },
+        agent: { "uri-agent": { prompt_append: promptFileUri } },
       }),
       "utf-8",
     )
@@ -300,7 +308,7 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
     writeFileSync(
       pluginConfigPath,
       JSON.stringify({
-        agent: { "uri-agent": { prompt_append: `file://${promptFilePath}` } },
+        agent: { "uri-agent": { prompt_append: promptFileUri } },
       }),
       "utf-8",
     )
@@ -322,7 +330,7 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
       writeFileSync(
         pluginConfigPath,
         JSON.stringify({
-          agent: { "uri-agent": { prompt_append: `file://${promptFilePath}` } },
+          agent: { "uri-agent": { prompt_append: promptFileUri } },
         }),
         "utf-8",
       )
@@ -347,18 +355,13 @@ describe("prompt source shape: file:// URI in a plugin override file", () => {
 
       // The plugin config is untouched — the URI is still the same.
       const configAfter = JSON.parse(readFileSync(pluginConfigPath, "utf-8"))
-      expect(configAfter.agent["uri-agent"].prompt_append).toBe(
-        `file://${promptFilePath}`,
-      )
+      expect(configAfter.agent["uri-agent"].prompt_append).toBe(promptFileUri)
     },
   )
 
   test("file:// URI with a ~/... path resolves to $HOME", async () => {
     const homeRel = `file://~/kasper-e2e-uri-home-test-${Date.now()}.md`
-    const expandedPath = join(
-      process.env.HOME ?? "/home/user",
-      homeRel.replace(/^file:\/\/~\//, ""),
-    )
+    const expandedPath = join(homedir(), homeRel.replace(/^file:\/\/~\//, ""))
     writeFileSync(
       expandedPath,
       "# Home URI Agent\n\nFrom the home directory.\n",

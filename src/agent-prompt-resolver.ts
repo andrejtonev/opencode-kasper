@@ -1,6 +1,7 @@
 import { readdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   applyEdits,
   type ModificationOptions,
@@ -385,43 +386,97 @@ function buildPluginOverride(
   // `file://...` URI (used by oh-my-opencode and others) → target a real
   // file on disk. We resolve `./` and `~/` forms against the config's
   // directory and `homedir()` respectively; absolute URIs are kept verbatim.
-  const fileUri = value.match(/^file:\/\/(.+)$/)
-  if (fileUri) {
-    const raw = fileUri[1]
-    if (raw.startsWith("/")) {
+  //
+  // Cross-platform: a `file:` URI is properly parsed via WHATWG URL. On
+  // Linux/macOS, `file:///abs/path` has three slashes (host="") and the
+  // pathname is the absolute path. On Windows, `file:///C:/path` has the
+  // drive letter as the first path segment; `fileURLToPath` handles the
+  // drive-letter round-trip correctly. We deliberately do NOT do
+  // `value.startsWith("file://")` + `match(/^file:\/\/(.+)$/)` because
+  // that breaks on Windows paths like `file://C:\Users\foo\x.md`
+  // (only two slashes, backslashes — a malformed URI that
+  // `new URL()` rejects, and that the manual `startsWith("/")` /
+  // `startsWith("~/")` / `startsWith("./")` ladder misclassifies).
+  if (value.startsWith("file://") || value.startsWith("file:///")) {
+    // Form A: `file://./...` and `file://../...` — relative to the
+    // config file's directory. The host is empty; the pathname is the
+    // raw `./...` or `../...` string. Detect this case BEFORE trying
+    // `new URL()`, which would otherwise resolve `./` against the
+    // current working directory on some platforms.
+    const relMatch = value.match(/^file:\/\/(\.\.?\/.*)$/)
+    if (relMatch) {
       return {
         kind: "plugin_override",
         agentName,
         target: "file_uri",
-        path: raw,
+        path: join(dirname(configPath), relMatch[1]),
         configPath,
         promptField,
         isAppend,
       }
     }
-    if (raw.startsWith("~/")) {
+
+    // Form B: `file://~/...` — tilde is a convention, not a URL standard.
+    // Handle it explicitly so the resolver doesn't reject it on platforms
+    // where `~` would not round-trip through `fileURLToPath`.
+    if (value.startsWith("file://~/")) {
       return {
         kind: "plugin_override",
         agentName,
         target: "file_uri",
-        path: join(homedir(), raw.slice(2)),
+        path: join(homedir(), value.slice("file://~/".length)),
         configPath,
         promptField,
         isAppend,
       }
     }
-    if (raw.startsWith("./") || raw.startsWith("../")) {
+
+    // Form C: a real file URI. `new URL()` accepts both `file:///abs/path`
+    // (three slashes, host="") on POSIX and `file:///C:/path` on Windows.
+    // We require three slashes so we don't accidentally classify a
+    // user-supplied value like `file://example.com/foo` (a host-based
+    // URI with no path) as a local file reference.
+    let parsedUrl: URL
+    try {
+      parsedUrl = new URL(value)
+    } catch {
+      // Malformed URI — degrade to config-raw to avoid a bad path.
       return {
         kind: "plugin_override",
         agentName,
-        target: "file_uri",
-        path: join(dirname(configPath), raw),
+        target: "config",
+        value,
         configPath,
         promptField,
         isAppend,
       }
     }
-    // Unknown file:// form — degrade to config-raw to avoid a bad path.
+    if (parsedUrl.protocol === "file:") {
+      let absPath: string
+      try {
+        absPath = fileURLToPath(parsedUrl)
+      } catch {
+        return {
+          kind: "plugin_override",
+          agentName,
+          target: "config",
+          value,
+          configPath,
+          promptField,
+          isAppend,
+        }
+      }
+      return {
+        kind: "plugin_override",
+        agentName,
+        target: "file_uri",
+        path: absPath,
+        configPath,
+        promptField,
+        isAppend,
+      }
+    }
+    // Some other scheme we don't recognise — degrade to config-raw.
     return {
       kind: "plugin_override",
       agentName,
