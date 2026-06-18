@@ -14,19 +14,26 @@ describe("expandTilde", () => {
   })
 
   test("expands '~/...' against the supplied home", () => {
-    expect(expandTilde("~/work/team.md", "/home/x")).toBe(
-      "/home/x/work/team.md",
+    // The implementation uses `path.join`, so the result uses the
+    // platform's native separator. Use `homedir()` for the home
+    // argument so the assertion is portable: both sides of the
+    // comparison are produced by the same `path.join` call. (Earlier
+    // revisions used `posix.join` here, but that only matches on POSIX
+    // — on Windows `path.join("/home/x", "...")` returns
+    // `\home\x\...`, not the forward-slash form.)
+    expect(expandTilde("~/work/team.md", homedir())).toBe(
+      join(homedir(), "work/team.md"),
     )
   })
 
   test("returns absolute paths unchanged", () => {
-    expect(expandTilde("/etc/opencode/AGENTS.md", "/home/x")).toBe(
+    expect(expandTilde("/etc/opencode/AGENTS.md", homedir())).toBe(
       "/etc/opencode/AGENTS.md",
     )
   })
 
   test("returns relative paths unchanged", () => {
-    expect(expandTilde("./prompts", "/home/x")).toBe("./prompts")
+    expect(expandTilde("./prompts", homedir())).toBe("./prompts")
   })
 
   test("defaults to os.homedir() when no home is supplied", () => {
@@ -99,7 +106,12 @@ describe("candidateGlobalOpencodeDirs", () => {
     process.env.XDG_CONFIG_HOME = "/custom/xdg"
     try {
       const dirs = candidateGlobalOpencodeDirs()
-      expect(dirs[0]).toBe("/custom/xdg/opencode")
+      // The implementation does `join(process.env.XDG_CONFIG_HOME,
+      // "opencode")`. Assert with the same `path.join` call so the
+      // comparison uses the platform-native separator on Windows
+      // (where `join("/custom/xdg", "opencode")` returns
+      // `\custom\xdg\opencode`).
+      expect(dirs[0]).toBe(join("/custom/xdg", "opencode"))
       // Always ends with ~/.opencode as the fallback.
       expect(dirs[dirs.length - 1]).toBe(join(homedir(), ".opencode"))
     } finally {
