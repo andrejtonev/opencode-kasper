@@ -142,6 +142,16 @@ describe.skipIf(!ENABLED)(
 
     afterAll(() => {
       if (install?.projectDir) {
+        // Diagnostic hook: keep the project dir on disk so callers
+        // can inspect .opencode/oh-my-opencode.json. Default is
+        // still to clean up.
+        if (process.env.KASPER_E2E_KEEP_TMP === "1") {
+          // biome-ignore lint/suspicious/noConsole: diagnostic
+          console.log(
+            `(info) KASPER_E2E_KEEP_TMP=1 — leaving ${install.projectDir} on disk`,
+          )
+          return
+        }
         rmSync(install.projectDir, { recursive: true, force: true })
       }
     })

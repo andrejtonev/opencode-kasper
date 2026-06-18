@@ -106,6 +106,15 @@ export function setupE2EProject(): E2EProject {
 }
 
 export function cleanupE2EProject(dir: string): void {
+  // Diagnostic hook: keep the project dir on disk so callers can
+  // inspect .opencode/oh-my-opencode.json, the kasper state, and
+  // any other durable artifacts the test produced. Default is still
+  // to clean up.
+  if (process.env.KASPER_E2E_KEEP_TMP === "1") {
+    // biome-ignore lint/suspicious/noConsole: diagnostic
+    console.log(`(info) KASPER_E2E_KEEP_TMP=1 — leaving ${dir} on disk`)
+    return
+  }
   try {
     rmSync(dir, { recursive: true, force: true })
   } catch {

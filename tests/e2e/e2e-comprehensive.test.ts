@@ -67,6 +67,10 @@ describe("auto mode (polling + auto-apply)", () => {
   let projectDir = ""
   let servePort = 0
   let pluginEnabled = false
+  // Hoisted so afterAll() can restore the env var that beforeAll
+  // sets. Without restoring, subsequent test files in the same
+  // `bun test` run would inherit the override.
+  let previousOverride: string | undefined
 
   beforeAll(async () => {
     if (!ENABLED) return
@@ -74,6 +78,15 @@ describe("auto mode (polling + auto-apply)", () => {
     pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
+
+    // Test-only override: the LLM judge is too lenient to reliably
+    // score the provocation prompt below the 0.6 threshold. The
+    // judge rewards polite refusals as "good instruction following",
+    // so the auto-apply gate is never entered. Set the override so
+    // the synthetic low-score card is produced and auto-apply
+    // actually writes the file. See src/scorer.ts and commit ad78dfa.
+    previousOverride = process.env.KASPER_E2E_SCORE_OVERRIDE
+    process.env.KASPER_E2E_SCORE_OVERRIDE = "0.3"
 
     // Low poll interval, auto_update on, threshold 0.6 (low — first
     // session triggers considerImprovement), min_observations=1
@@ -97,7 +110,10 @@ describe("auto mode (polling + auto-apply)", () => {
       SERVE_PORT_AUTO,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -108,6 +124,13 @@ describe("auto mode (polling + auto-apply)", () => {
     if (pluginEnabled) {
       disableKasperPlugin()
       pluginEnabled = false
+    }
+    // Restore the env var we set in beforeAll so it doesn't leak
+    // into other test files in the same `bun test` run.
+    if (previousOverride === undefined) {
+      delete process.env.KASPER_E2E_SCORE_OVERRIDE
+    } else {
+      process.env.KASPER_E2E_SCORE_OVERRIDE = previousOverride
     }
   })
 
@@ -291,6 +314,10 @@ describe("manual mode (explicit scoring + manual apply)", () => {
   let servePort = 0
   const sessionIDs: string[] = []
   let pluginEnabled = false
+  // Hoisted so afterAll() can restore the env var that beforeAll
+  // sets. Without restoring, subsequent test files in the same
+  // `bun test` run would inherit the override.
+  let previousOverride: string | undefined
 
   beforeAll(async () => {
     if (!ENABLED) return
@@ -298,6 +325,13 @@ describe("manual mode (explicit scoring + manual apply)", () => {
     pluginEnabled = true
     const p = setupE2EProject()
     projectDir = p.dir
+
+    // Test-only override: same rationale as the auto-mode block.
+    // The manual `f. manual apply updates files` test depends on a
+    // low score so /kasper apply has an improvement to apply. See
+    // src/scorer.ts and commit ad78dfa.
+    previousOverride = process.env.KASPER_E2E_SCORE_OVERRIDE
+    process.env.KASPER_E2E_SCORE_OVERRIDE = "0.3"
 
     // Long poll interval to disable auto; auto_update off
     servePort = await startServeWithConfig(
@@ -318,7 +352,10 @@ describe("manual mode (explicit scoring + manual apply)", () => {
       SERVE_PORT_MANUAL,
     )
 
-    await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+    await waitForKasperLoaded(projectDir, {
+      maxWaitMs: 30_000,
+      port: servePort,
+    })
     log(`serve started on port ${servePort}`)
   })
 
@@ -329,6 +366,13 @@ describe("manual mode (explicit scoring + manual apply)", () => {
     if (pluginEnabled) {
       disableKasperPlugin()
       pluginEnabled = false
+    }
+    // Restore the env var we set in beforeAll so it doesn't leak
+    // into other test files in the same `bun test` run.
+    if (previousOverride === undefined) {
+      delete process.env.KASPER_E2E_SCORE_OVERRIDE
+    } else {
+      process.env.KASPER_E2E_SCORE_OVERRIDE = previousOverride
     }
   })
 
