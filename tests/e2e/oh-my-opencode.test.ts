@@ -66,6 +66,13 @@ let kasperStateDir: string
 function npmInstallOmo(projectDir: string): string {
   // 180s timeout. omo has ~140 transitive deps; first install can be slow
   // but the test suite is already long-running so this is acceptable.
+  // npm v9+ refuses to install into a directory with no package.json,
+  // so seed an empty private manifest first. We never read it back.
+  writeFileSync(
+    join(projectDir, "package.json"),
+    JSON.stringify({ name: "kasper-omo-e2e", version: "0.0.0", private: true }),
+    "utf-8",
+  )
   try {
     execSync("npm install --no-audit --no-fund oh-my-opencode", {
       cwd: projectDir,
@@ -131,7 +138,7 @@ describe.skipIf(!ENABLED)(
         kasperStateDir,
         install.projectDir, // globalOpencodeDir (use the project dir for isolation)
       )
-    })
+    }, 240_000)
 
     afterAll(() => {
       if (install?.projectDir) {

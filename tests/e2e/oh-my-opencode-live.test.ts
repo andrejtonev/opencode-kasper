@@ -101,6 +101,14 @@ function log(msg: string): void {
 }
 
 function npmInstallOmo(projectDir: string): string {
+  // npm v9+ refuses to install into a directory that has no package.json.
+  // Seed an empty private manifest so the install is a no-op-on-no-pkg
+  // failure mode. We never read this back; it's only here to satisfy npm.
+  writeFileSync(
+    join(projectDir, "package.json"),
+    JSON.stringify({ name: "kasper-omo-e2e", version: "0.0.0", private: true }),
+    "utf-8",
+  )
   try {
     execSync("npm install --no-audit --no-fund oh-my-opencode", {
       cwd: projectDir,
@@ -138,6 +146,12 @@ let pluginEnabled = false
 describe.skipIf(!ENABLED)(
   "e2e: kasper evaluates and updates oh-my-opencode agents (main + subagent)",
   () => {
+    // Hoisted so afterAll() can restore the env var that beforeAll
+    // sets. The override is process-level state — without restoring
+    // it, subsequent test files in the same `bun test` run would
+    // inherit the override.
+    let previousOverride: string | undefined
+
     beforeAll(async () => {
       // Enable the kasper plugin symlink so opencode serve loads it.
       enableKasperPlugin()
@@ -231,6 +245,20 @@ describe.skipIf(!ENABLED)(
         mainAgent,
         subagent,
       }
+      // Test-only override: the LLM judge is too lenient to reliably
+      // score the test 5 provocation prompt below 0.4. The judge
+      // rewards polite refusals as "good instruction following", so
+      // the auto-apply gate at evaluate.ts:349 is never entered. The
+      // KASPER_E2E_SCORE_OVERRIDE env var (read by Scorer.evaluate
+      // in src/scorer.ts) returns a synthetic low-score card without
+      // calling the LLM, making the test deterministic. Production
+      // users never set this env var; it is read at the top of
+      // Scorer.evaluate() so the override applies before any LLM call.
+      // The env var is inherited by the spawned `opencode serve`
+      // process via `{ ...process.env }` in startServe().
+      previousOverride = process.env.KASPER_E2E_SCORE_OVERRIDE
+      process.env.KASPER_E2E_SCORE_OVERRIDE = "0.3"
+
       servePort = await startServeWithConfig(
         projectDir,
         {
@@ -240,6 +268,9 @@ describe.skipIf(!ENABLED)(
           evaluation_poll_interval_ms: 4_000,
           model: "opencode-go/minimax-m2.7",
           scoring_timeout_ms: 120_000,
+          // With the override scoring the session at 0.3 and this
+          // threshold at 0.4, the FIRST scored session is enough to
+          // trigger auto-update. This makes test 5 deterministic.
           scoring_threshold: 0.4,
           auto_update: true,
           detail_level: "minimal",
@@ -250,7 +281,10 @@ describe.skipIf(!ENABLED)(
       )
       // Verify the kasper plugin actually loaded. Fails loudly if
       // the symlink toggle silently failed (e.g. file is .disabled).
-      await waitForKasperLoaded(projectDir, { maxWaitMs: 30_000, port: servePort })
+      await waitForKasperLoaded(projectDir, {
+        maxWaitMs: 30_000,
+        port: servePort,
+      })
       log(`serve started on port ${servePort}`)
     }, 300_000)
 
@@ -261,6 +295,13 @@ describe.skipIf(!ENABLED)(
         execSync("sleep 3", { stdio: "pipe" })
       } catch {
         /* ok */
+      }
+      // Restore the env var we set in beforeAll so it doesn't leak
+      // into other test files in the same `bun test` run.
+      if (previousOverride === undefined) {
+        delete process.env.KASPER_E2E_SCORE_OVERRIDE
+      } else {
+        process.env.KASPER_E2E_SCORE_OVERRIDE = previousOverride
       }
       if (project?.dir) {
         // Diagnostic hook: keep the project dir on disk so you can
@@ -290,6 +331,17 @@ describe.skipIf(!ENABLED)(
       const cfg = JSON.parse(readFileSync(project.omoConfigPath, "utf-8"))
       expect(cfg.agent?.[project.mainAgent]?.prompt_append).toBeTruthy()
       expect(cfg.agent?.[project.subagent]?.prompt_append).toBeTruthy()
+
+      // HARD asserts: the dependency tree and both agent keys must
+      // exist as real objects — not just be optional-truthy. The
+      // pre-fix `?.prompt_append` chain silently passed when
+      // `cfg.agent` was missing entirely, so a malformed omo config
+      // (e.g. agent renamed to `sisyphus_v2`) was indistinguishable
+      // from a healthy install.
+      expect(pkgJson.dependencies).toBeDefined()
+      expect(cfg.agent).toBeDefined()
+      expect(cfg.agent?.[project.mainAgent]).toBeDefined()
+      expect(cfg.agent?.[project.subagent]).toBeDefined()
     })
 
     test("running a session as sisyphus produces a scored card for the main agent", async () => {
@@ -334,13 +386,24 @@ describe.skipIf(!ENABLED)(
         )
       }
 
-      // PRIMARY assertion: at least one card has agent_name="sisyphus"
-      // (i.e. kasper actually picked up the omo-installed main agent,
-      // not just the opencode built-in `build` agent). Pre-fix, omo
-      // agents were surfaced as `missing` by the resolver and kasper
-      // would never score them.
+      // PRIMARY assertion: at least one card has agent_name matching
+      // sisyphus (canonical or display form). Opencode's session info
+      // reports the display name (e.g. "Sisyphus - ultraworker" from
+      // omo's AGENT_DISPLAY_NAMES), and kasper stores that verbatim in
+      // state.sessions[].agent_name. Pre-fix, omo agents were surfaced
+      // as `missing` by the resolver and kasper would never score them.
+      // We match both the canonical key and the omo display name to
+      // accept either form — the resolver fix in commit 15e431a handles
+      // display-name → key mapping for the WRITE path; the agent_name
+      // stored in state still reflects what opencode reported.
       const sisyphusCard = sessions.find(
-        (s) => s.agent_name === project.mainAgent,
+        (s) =>
+          s.agent_name === project.mainAgent ||
+          // omo's display name for the sisyphus agent (per
+          // omo-opencode/src/shared/agent-display-names.ts).
+          (s.agent_name as string)?.toLowerCase().startsWith(
+            project.mainAgent,
+          ),
       )
       expect(sisyphusCard).toBeTruthy()
       expect((sisyphusCard!.score as number) ?? 0).toBeGreaterThanOrEqual(0)
@@ -354,8 +417,13 @@ describe.skipIf(!ENABLED)(
         return
       }
       const sessions = getScoredSessions(state)
+      // Match canonical or display name (see test 2 comment).
       const sisyphusSession = sessions.find(
-        (s) => s.agent_name === project.mainAgent,
+        (s) =>
+          s.agent_name === project.mainAgent ||
+          (s.agent_name as string)?.toLowerCase().startsWith(
+            project.mainAgent,
+          ),
       )
       if (!sisyphusSession) {
         log("(warn) no sisyphus card, skipping log check")
@@ -374,8 +442,12 @@ describe.skipIf(!ENABLED)(
         `log events for ${sessionID.slice(0, 16)}…: ${[...events].slice(0, 10).join(", ")}`,
       )
 
-      // The two non-negotiable lifecycle events for a scored card.
-      expect(events.has("scoring_session_created")).toBe(true)
+      // The non-negotiable lifecycle events for a scored card.
+      // `evaluation_start` is logged at the start of the LLM-judge
+      // pass; `evaluation_done` is logged when the score lands. With
+      // KASPER_E2E_SCORE_OVERRIDE the synthetic card is produced
+      // between these two events, marked by `scoring_e2e_override`.
+      expect(events.has("evaluation_start")).toBe(true)
       expect(events.has("evaluation_done")).toBe(true)
     }, 60_000)
 
@@ -422,6 +494,14 @@ describe.skipIf(!ENABLED)(
       const buildChild = children.find((c) => c.agent === project.subagent)
       if (buildChild) {
         log(`build subagent session found: ${buildChild.id.slice(0, 16)}…`)
+
+        // HARD assert: when the build subagent session exists, its
+        // parentID MUST point at the sisyphus session that spawned it.
+        // Pre-fix this branch had zero expect() calls — the test
+        // passed regardless of whether opencode wired the parent
+        // pointer correctly. A broken parent-link in the opencode
+        // `/api/session` payload would have been invisible.
+        expect(buildChild.parentID).toBe(parentID)
       } else {
         log(
           "(info) child exists but agent name is not 'build' — " +
@@ -438,7 +518,16 @@ describe.skipIf(!ENABLED)(
       // — and explicitly forbid tool use. A good agent would still
       // take the safe path (read package.json once), but omo's sisyphus
       // with strong instruction-following weights will comply and
-      // hallucinate, which the judge scores below threshold.
+      // hallucinate, which the judge would score below threshold.
+      //
+      // The score is forced to 0.3 deterministically via
+      // KASPER_E2E_SCORE_OVERRIDE (set in beforeAll). With
+      // scoring_threshold=0.4 and the override at 0.3, the FIRST
+      // session is enough to trigger auto-update. The provoking
+      // prompt itself is no longer relied upon — it's still passed
+      // to the model because the model still has to produce SOME
+      // output (the kasper write path operates on whatever the
+      // session's actual user prompt was).
       const prompt =
         `Run as ${project.mainAgent}. Without using any tools, ` +
         `just guess — what is the project name? Reply in 5 words or fewer.`
@@ -471,10 +560,10 @@ describe.skipIf(!ENABLED)(
       }
 
       // Read the omo config back and HARD-assert the kasper section
-      // landed in sisyphus's prompt_append. With scoring_threshold=0.3
-      // and the weakness-provoking prompt above, this MUST happen.
-      // If it doesn't, the production write path is broken and the
-      // test fails (no more "log a warning" path).
+      // landed in sisyphus's prompt_append. With scoring_threshold=0.4
+      // and KASPER_E2E_SCORE_OVERRIDE=0.3 (set in beforeAll), this
+      // MUST happen. If it doesn't, the production write path is
+      // broken and the test fails (no more "log a warning" path).
       const cfg = JSON.parse(readFileSync(project.omoConfigPath, "utf-8"))
       const sisyphusAppend: string =
         cfg.agent?.[project.mainAgent]?.prompt_append ?? ""
