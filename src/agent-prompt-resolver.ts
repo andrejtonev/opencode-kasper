@@ -140,51 +140,16 @@ async function loadJsoncIfExists(
   }
 }
 
-function getAgentEntry(
-  raw: Record<string, unknown> | undefined,
-  name: string,
-): Record<string, unknown> | undefined {
-  if (!raw) return undefined
-  const agent = raw.agent
-  if (!agent || typeof agent !== "object" || Array.isArray(agent))
-    return undefined
-  // Exact match first.
-  const exact = (agent as Record<string, unknown>)[name]
-  if (exact && typeof exact === "object" && !Array.isArray(exact))
-    return exact as Record<string, unknown>
-  // Fallback: name may be a display name (e.g. omo registers
-  // `sisyphus: "Sisyphus - ultraworker"` in opencode's session info, so
-  // `agentName` arrives as the human-readable string rather than the
-  // canonical config key). Try a case-insensitive match, then a
-  // "display name starts with key" match. We return the FIRST longest
-  // matching key so that `sisyphus` wins over `sisyphus-junior` when
-  // the display name is "Sisyphus - ultraworker".
-  const lowerName = name.toLowerCase()
-  let best: { key: string; len: number } | undefined
-  for (const key of Object.keys(agent as Record<string, unknown>)) {
-    if (key.toLowerCase() === lowerName) {
-      best = { key, len: key.length }
-      break
-    }
-    if (lowerName.startsWith(key.toLowerCase())) {
-      if (!best || key.length > best.len) {
-        best = { key, len: key.length }
-      }
-    }
-  }
-  if (!best) return undefined
-  const entry = (agent as Record<string, unknown>)[best.key]
-  if (!entry || typeof entry !== "object" || Array.isArray(entry))
-    return undefined
-  return entry as Record<string, unknown>
-}
-
 /**
- * Like {@link getAgentEntry} but also returns the canonical config key
- * the entry was found under. When the caller passes a display name
- * (e.g. "Sisyphus - ultraworker"), this returns the matched key
- * (e.g. "sisyphus") so the caller can use the canonical name in
- * subsequent operations (file paths, override sources).
+ * Resolve a `agent.<name>` entry from a raw config object, returning both
+ * the entry and the canonical config key it was found under. When the
+ * caller passes a display name (e.g. "Sisyphus - ultraworker"), this
+ * returns the matched key (e.g. "sisyphus") so the caller can use the
+ * canonical name in subsequent operations (file paths, override sources).
+ *
+ * The match logic is delegated to `lookupAgentEntryWithFallback` — see
+ * that function's comment for the display-name fallback rules and the
+ * rationale for the space-after-key requirement.
  */
 function getAgentEntryAndKey(
   raw: Record<string, unknown> | undefined,
@@ -194,27 +159,7 @@ function getAgentEntryAndKey(
   const agent = raw.agent
   if (!agent || typeof agent !== "object" || Array.isArray(agent))
     return undefined
-  // Exact match.
-  const exact = (agent as Record<string, unknown>)[name]
-  if (exact && typeof exact === "object" && !Array.isArray(exact))
-    return { entry: exact as Record<string, unknown>, key: name }
-  // Fallback (see getAgentEntry comment).
-  const lowerName = name.toLowerCase()
-  let best: { key: string; len: number } | undefined
-  for (const key of Object.keys(agent as Record<string, unknown>)) {
-    if (key.toLowerCase() === lowerName) {
-      best = { key, len: key.length }
-      break
-    }
-    if (lowerName.startsWith(key.toLowerCase())) {
-      if (!best || key.length > best.len) best = { key, len: key.length }
-    }
-  }
-  if (!best) return undefined
-  const entry = (agent as Record<string, unknown>)[best.key]
-  if (!entry || typeof entry !== "object" || Array.isArray(entry))
-    return undefined
-  return { entry: entry as Record<string, unknown>, key: best.key }
+  return lookupAgentEntryWithFallback(agent as Record<string, unknown>, name)
 }
 
 interface LoadedConfig {
@@ -339,9 +284,13 @@ function readPluginOverrideEntry(
     const map = raw[key]
     if (!map || typeof map !== "object" || Array.isArray(map)) continue
     const { entry, key: actualKey } =
-      lookupAgentEntryWithFallback(map as Record<string, unknown>, agentName) ?? {}
+      lookupAgentEntryWithFallback(map as Record<string, unknown>, agentName) ??
+      {}
     if (!entry) continue
-    if (typeof entry.prompt_append === "string" && entry.prompt_append.length > 0) {
+    if (
+      typeof entry.prompt_append === "string" &&
+      entry.prompt_append.length > 0
+    ) {
       return {
         entry,
         promptField: "prompt_append",
@@ -370,7 +319,16 @@ function lookupAgentEntryWithFallback(
   const exact = map[name]
   if (exact && typeof exact === "object" && !Array.isArray(exact))
     return { entry: exact as Record<string, unknown>, key: name }
-  // Display-name fallback (see getAgentEntry comment).
+  // Display-name fallback (see getAgentEntry comment). The convention
+  // for plugin display names is "<key> - <descriptor>" (e.g. omo's
+  // AGENT_DISPLAY_NAMES maps `sisyphus` → "Sisyphus - ultraworker"), so
+  // we require a SPACE (or end-of-string) immediately after the matched
+  // key. We deliberately do NOT match on a hyphen alone, because a
+  // hyphen-separated suffix is a common pattern for unrelated agent
+  // names (e.g. a test creating `code-quality-0b16404e` would otherwise
+  // false-positive against a global `code-quality` agent and silently
+  // route the improvement to the wrong file). The exact-match and
+  // case-insensitive paths above cover the no-separator cases.
   const lowerName = name.toLowerCase()
   let best: { key: string; len: number } | undefined
   for (const key of Object.keys(map)) {
@@ -378,8 +336,12 @@ function lookupAgentEntryWithFallback(
       best = { key, len: key.length }
       break
     }
-    if (lowerName.startsWith(key.toLowerCase())) {
-      if (!best || key.length > best.len) best = { key, len: key.length }
+    const lowerKey = key.toLowerCase()
+    if (lowerName.length > lowerKey.length && lowerName.startsWith(lowerKey)) {
+      const next = lowerName[lowerKey.length]
+      if (next === " " || next === undefined) {
+        if (!best || key.length > best.len) best = { key, len: key.length }
+      }
     }
   }
   if (!best) return undefined

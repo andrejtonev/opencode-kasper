@@ -1112,3 +1112,142 @@ describe("materializePluginOverrideToFile", () => {
     expect(newConfig.agents.sisyphus.prompt_append).toMatch(/^\{file:.+\}$/)
   })
 })
+
+describe("display-name fallback: exact / case-insensitive / space-after-key", () => {
+  let projectRoot: string
+  let globalDir: string
+
+  beforeEach(async () => {
+    projectRoot = tmpDir()
+    globalDir = join(projectRoot, "global-opencode")
+    await mkdir(globalDir, { recursive: true })
+    await mkdir(join(projectRoot, ".opencode"), { recursive: true })
+  })
+
+  afterEach(async () => {
+    await rm(projectRoot, { recursive: true, force: true })
+  })
+
+  test("exact match: 'sisyphus' resolves to the sisyphus entry", async () => {
+    await writeJsonc(
+      join(projectRoot, ".opencode", "plugin.json"),
+      JSON.stringify({
+        agent: { sisyphus: { prompt_append: "Override." } },
+      }),
+    )
+    const source = await resolveAgentPromptSource(
+      "sisyphus",
+      projectRoot,
+      globalDir,
+    )
+    if (source.kind !== "plugin_override") {
+      throw new Error(`expected plugin_override, got ${source.kind}`)
+    }
+    expect(source.agentName).toBe("sisyphus")
+  })
+
+  test(
+    "case-insensitive: 'Sisyphus' (capitalised) resolves to 'sisyphus' " +
+      "with the canonical key returned",
+    async () => {
+      await writeJsonc(
+        join(projectRoot, ".opencode", "plugin.json"),
+        JSON.stringify({
+          agent: { sisyphus: { prompt_append: "Override." } },
+        }),
+      )
+      const source = await resolveAgentPromptSource(
+        "Sisyphus",
+        projectRoot,
+        globalDir,
+      )
+      if (source.kind !== "plugin_override") {
+        throw new Error(`expected plugin_override, got ${source.kind}`)
+      }
+      expect(source.agentName).toBe("sisyphus")
+    },
+  )
+
+  test(
+    "display name with space-after-key: 'Sisyphus - ultraworker' resolves " +
+      "to 'sisyphus' (omo's AGENT_DISPLAY_NAMES convention)",
+    async () => {
+      await writeJsonc(
+        join(projectRoot, ".opencode", "plugin.json"),
+        JSON.stringify({
+          agent: { sisyphus: { prompt_append: "Override." } },
+        }),
+      )
+      const source = await resolveAgentPromptSource(
+        "Sisyphus - ultraworker",
+        projectRoot,
+        globalDir,
+      )
+      if (source.kind !== "plugin_override") {
+        throw new Error(`expected plugin_override, got ${source.kind}`)
+      }
+      expect(source.agentName).toBe("sisyphus")
+    },
+  )
+
+  test(
+    "REGRESSION: hyphen-suffix does NOT prefix-match a global agent key. " +
+      "A test creating 'code-quality-0b16404e' must NOT silently route the " +
+      "improvement to the global 'code-quality' agent's prompt file. " +
+      "Before this fix, lookupAgentEntryWithFallback used a bare " +
+      "startsWith match, which false-positived against any " +
+      "key+hyphenated-suffix agent name.",
+    async () => {
+      // Set up a global opencode.json that has a `code-quality` agent
+      // (mirroring the developer's ~/.config/opencode/opencode.json layout
+      // that surfaced this bug in tests/auto-update.test.ts).
+      await writeJsonc(
+        join(globalDir, "opencode.json"),
+        JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+          agent: {
+            "code-quality": {
+              description: "Real code-quality agent",
+              prompt: "REAL code-quality prompt",
+            },
+          },
+        }),
+      )
+      // Create a project-level agent file that the resolver SHOULD find.
+      const projectFile = join(
+        projectRoot,
+        ".opencode",
+        "agents",
+        "code-quality-abc123.md",
+      )
+      await mkdir(join(projectRoot, ".opencode", "agents"), { recursive: true })
+      await writeFile(projectFile, "Test agent file.\n", "utf-8")
+
+      const source = await resolveAgentPromptSource(
+        "code-quality-abc123",
+        projectRoot,
+        globalDir,
+      )
+
+      // The resolver should find the PROJECT-LEVEL markdown file, NOT the
+      // global `code-quality` config entry. Before the fix, it returned
+      // `kind: "inline"` (or `external_file`) pointing at the global
+      // code-quality agent's prompt, silently misrouting the improvement.
+      if (source.kind === "missing") {
+        throw new Error(
+          "expected to find the project markdown file, got missing. " +
+            "The hyphen-suffix regression has resurfaced.",
+        )
+      }
+      if (source.kind !== "project_file") {
+        throw new Error(
+          `expected project_file (the .opencode/agents/<name>.md we ` +
+            `created), got ${source.kind}. The hyphen-suffix regression ` +
+            `has resurfaced — the resolver is matching the global ` +
+            `'code-quality' agent instead of the test's local agent.`,
+        )
+      }
+      expect(source.path).toBe(projectFile)
+    },
+  )
+})
