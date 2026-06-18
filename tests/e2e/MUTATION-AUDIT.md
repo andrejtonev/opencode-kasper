@@ -23,6 +23,18 @@ something orthogonal (SMOKE).
 | `inject-mode.test.ts` | 1 | 1 | 0 | 0 | USEFUL (expect) — expect() actually failed |
 | **Total** | **57** | **51** | **5** | **1** | |
 
+### Files added after this audit (commit `cb21f99`)
+
+- `prompt-shapes.test.ts` — 11 deterministic unit tests for the four
+  prompt-source shapes (inline, `{file:...}`, `{path:...}`, `file://`
+  in plugin override files). Not included in the mutation audit because
+  the tests are in-process against `AgentPromptManager` and
+  `resolveAgentPromptSource` directly — the broad `recordSession`
+  mutation does not apply. The tests still serve as a regression net
+  for the resolver's classification logic, the inline→file promote
+  path (`materializeInlinePrompt`), and the write-path
+  `file_uri`/`external_file` replace semantics.
+
 ## Mutation
 
 The audit ran the **broad** mutation:

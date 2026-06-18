@@ -150,11 +150,15 @@ Kasper follows opencode's own agent resolution rules when deciding **where** to 
    - `~/.config/opencode/agent/<name>.md`
    - `~/.config/opencode/agents/<name>.md`
 
-The `prompt` value is interpreted in three ways:
+The `prompt` value is interpreted in four ways:
 
 - **Raw string** — the prompt is inline. Kasper refuses to edit it; run `/kasper migrate <name>` to extract it to a file.
 - **`{file:/abs/path/to/prompt.md}`** — the prompt is loaded from that file. Kasper reads and writes that exact file. `~` is expanded; relative paths resolve against the config file's directory.
 - **`{path:/abs/path/to/prompt.md}`** — alias for `{file:...}`.
+
+Plugin override files (`.opencode/<plugin>.json`, e.g. `oh-my-openagent.json`) accept one additional form:
+
+- **`file:///abs/path/to/prompt.md`** — a `file://` URI. Kasper reads and writes the file at that path. `~/...` URIs resolve to `$HOME`. This is the form used by [oh-my-opencode](https://github.com/code-yeongyu/oh-my-opencode) and similar plugins that ship agent prompts in `node_modules` and let users redirect them via a plugin-specific config. **Note:** `file://` URIs in `opencode.json` itself (not in a plugin override file) are not classified as a `file_uri` source — they fall through to inline. Put plugin redirects in a plugin override file.
 
 After `migrate`, the source `opencode.json` is rewritten to replace the inline `prompt` with a `{file:...}` directive, with comments and formatting preserved. **Restart opencode** for the new prompt file to take effect.
 
@@ -215,7 +219,7 @@ bun install            # Install dependencies
 bun run build          # Compile TypeScript
 bun run typecheck      # Type-check only
 bun run lint           # Lint with biome
-bun test               # 393 unit tests (387 pass, 6 skip)
+bun test               # ~504 unit tests (503 pass, 1 pre-existing fail in auto-update.test.ts)
 bun run test:e2e       # End-to-end tests (requires OPENCODE_E2E=1 and the opencode binary)
 ```
 

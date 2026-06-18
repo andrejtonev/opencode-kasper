@@ -27,6 +27,20 @@ For subagent session list verification, tests start `opencode serve` in the
 background and query `GET /api/session` to find child sessions (sessions with
 a `parentID`).
 
+### Unit-level in-process tests (no opencode spawn)
+
+`prompt-shapes.test.ts` exercises the four prompt-source shapes the opencode
+resolver claims to handle — inline string, `{file:...}` directive,
+`{path:...}` directive, and `file://` URI (in plugin override files). These
+tests run in-process against `resolveAgentPromptSource`,
+`AgentPromptManager`, and `materializeInlinePrompt`. No opencode binary
+required, no LLM scoring — deterministic and fast (~40ms total).
+
+Other test files in `tests/e2e/` that may run without the opencode binary:
+
+- `oh-my-opencode.test.ts` — uses `AgentPromptManager` directly for
+  plugin-config scenarios; the omo npm install runs in `beforeAll`.
+
 ## Running
 
 ```bash
