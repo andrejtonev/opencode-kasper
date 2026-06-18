@@ -270,7 +270,21 @@ export async function runEvaluation(
       const { emoji: _scoreEmoji } = formatScore(card.overall_score)
 
       if (card.fallback || card.overall_score <= 0) {
-        ctx.sessionsEvaluated.add(pending.sessionID)
+        // Failure path: do NOT add pending.sessionID to
+        // ctx.sessionsEvaluated or to the persistent
+        // ctx.stateStore.addEvaluatedSession list. Adding it would mark
+        // the primary session as "already evaluated" forever, blocking
+        // any future re-attempt (e.g. after the user fixes the model
+        // config in kasper.jsonc). Scorer errors are transient: the
+        // model may be unavailable right now but become available
+        // later, the user may edit kasper.jsonc, or the user may
+        // restart opencode. The session will be retried on the next
+        // poll cycle (or after restart) when SESSION_DEBOUNCE_MS elapses
+        // — and a fresh scoring attempt produces a fresh card. The
+        // trade-off is some 6s-cycle log noise while the model is
+        // unavailable, but the toast warning already tells the user.
+        // The successful-recording path (below) is the only path that
+        // is allowed to mark a session as evaluated.
         await ctx.logger.log("evaluation_skipped", {
           sessionID: pending.sessionID,
           score: card.overall_score,
