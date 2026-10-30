@@ -15,6 +15,7 @@ import {
 } from "../src/evaluate.js"
 import { AsyncMutex } from "../src/mutex.js"
 import { KasperRuntime } from "../src/runtime.js"
+import { automaticEvaluationOptions } from "../src/server.js"
 import type { KasperContext, PendingEval, ScoreCard } from "../src/types.js"
 import { DEFAULT_CONFIG } from "../src/types.js"
 import { normalizeV2History } from "../src/v2-history.js"
@@ -124,8 +125,18 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
 
 describe("runEvaluation", () => {
   test("historical and current child scoring after reload derives trusted parent metadata and cannot change shared AGENTS", async () => {
-    for (const path of ["historical", "current", "batch"] as const) {
-      const config = { ...DEFAULT_CONFIG, auto_update: true }
+    for (const path of [
+      "historical",
+      "current",
+      "batch",
+      "poll",
+      "primary-poll",
+    ] as const) {
+      const config = {
+        ...DEFAULT_CONFIG,
+        auto_update: true,
+        min_session_messages: 5,
+      }
       const ctx = mockCtx({
         config,
         autoUpdateEnabled: true,
@@ -151,7 +162,7 @@ describe("runEvaluation", () => {
         get: async () => ({
           id: "ses_child",
           agent: "reviewer",
-          parentID: "ses_parent",
+          parentID: path === "primary-poll" ? undefined : "ses_parent",
           location: { directory: process.cwd() },
           time: { created: 1, updated: 3, idle: 3 },
         }),
@@ -160,7 +171,10 @@ describe("runEvaluation", () => {
           status: "ok",
           snapshot: {
             sessionID: "ses_child",
-            coverage: path === "current" ? "current-window" : "archive",
+            coverage:
+              path === "current" || path === "poll" || path === "primary-poll"
+                ? "current-window"
+                : "archive",
             isIdle: true,
             messages: [
               {
@@ -200,9 +214,23 @@ describe("runEvaluation", () => {
                 new Map([["ses_child", "invoking-parent-agent"]]),
               )
             )[0]
-          : await evaluateSession("ses_child", ctx, "invoking-parent-agent", {
-              purpose: path,
-            })
+          : await evaluateSession(
+              "ses_child",
+              ctx,
+              "invoking-parent-agent",
+              path === "poll" || path === "primary-poll"
+                ? automaticEvaluationOptions(
+                    await ctx.historyHost.get("ses_child"),
+                    config,
+                  )
+                : { purpose: path },
+            )
+      if (path === "primary-poll") {
+        expect(result.status).toBe("skipped")
+        expect(judge).not.toHaveBeenCalled()
+        expect(record).not.toHaveBeenCalled()
+        continue
+      }
       expect(result.status).toBe("scored")
       expect(record.mock.calls[0]?.[3]).toBe("reviewer")
       expect(record.mock.calls[0]?.[4]).toBe("subagent")

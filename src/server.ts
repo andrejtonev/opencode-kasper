@@ -15,6 +15,7 @@ import {
 import { renderCompactionFeedback } from "./compaction.js"
 import { normalizeKasperConfig } from "./config.js"
 import { evaluateSession } from "./evaluate.js"
+import type { SessionDescriptor } from "./history-port.js"
 import { createV2Generation } from "./hosts/v2-generation.js"
 import {
   createV2AgentsMd,
@@ -30,7 +31,11 @@ import { _stateStoreRegistry } from "./registry.js"
 import { KasperRuntime } from "./runtime.js"
 import { Scorer } from "./scorer.js"
 import { KasperStateStore } from "./state.js"
-import { DEFAULT_CONFIG, type KasperContext } from "./types.js"
+import {
+  DEFAULT_CONFIG,
+  type KasperConfig,
+  type KasperContext,
+} from "./types.js"
 import { deepEqual } from "./utils.js"
 import {
   createV2HistoryHost,
@@ -38,6 +43,16 @@ import {
   v2NativeHistoryAccess,
 } from "./v2-history.js"
 import { kasperRpc } from "./v2-rpc.js"
+
+export function automaticEvaluationOptions(
+  session: Pick<SessionDescriptor, "parentID">,
+  config: Pick<KasperConfig, "min_session_messages">,
+) {
+  return {
+    purpose: "current" as const,
+    minimumUserMessages: session.parentID ? 1 : config.min_session_messages,
+  }
+}
 
 function pathKey(path: string): string {
   const key = normalize(resolve(path))
@@ -472,10 +487,12 @@ export const KasperServer: Plugin.Plugin = {
                 session.time.busy > session.time.idle)
             )
               continue
-            await evaluateSession(session.id, ctx, session.agent, {
-              purpose: "current",
-              minimumUserMessages: ctx.config.min_session_messages,
-            })
+            await evaluateSession(
+              session.id,
+              ctx,
+              session.agent,
+              automaticEvaluationOptions(session, ctx.config),
+            )
           }
         },
         (error) => {
