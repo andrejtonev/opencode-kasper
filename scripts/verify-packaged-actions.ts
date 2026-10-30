@@ -271,6 +271,85 @@ export async function verifyPackagedActions(
   )
   assert.equal(provider.receipts.length, 5, "reload must not generate")
   evidence.reload = { status: reloaded, newPluginScope: true, providerCalls: 0 }
+  const child = await client.session.create({
+    title: "Historical child after reload",
+    parentID: session.id,
+    agent: Agent.ID.make("build"),
+    model: {
+      id: Model.ID.make("work"),
+      providerID: Provider.ID.make("fixture"),
+    },
+    location: { directory },
+  })
+  assert.equal(
+    child.parentID,
+    session.id,
+    "public child creation must retain exact parent",
+  )
+  provider.respond({ text: "Completed historical child fixture answer." })
+  await client.session.prompt({
+    sessionID: child.id,
+    text: "Return a historical child fixture answer.",
+  })
+  const childDeadline = Date.now() + 15000
+  while (Date.now() < childDeadline) {
+    const active = await client.session.active()
+    if (provider.receipts.length >= 6 && !active[child.id]) break
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  assert.equal(provider.receipts.length, 6, "one child work request expected")
+  await client.location.reload({ signal: AbortSignal.timeout(10000) })
+  provider.respond({
+    text: JSON.stringify({
+      overall_score: 0.8,
+      categories: {
+        instruction_following: 0.8,
+        completeness: 0.8,
+        proactiveness: 0.8,
+        code_quality: 0.8,
+        communication: 0.8,
+      },
+      strengths: [],
+      weaknesses: [],
+    }),
+  })
+  const childScore = await invoke(
+    "historical-child-score",
+    `score session ${child.id}`,
+  )
+  const childState = JSON.parse(
+    await readFile(
+      path.join(directory, ".opencode", "kasper", "state.json"),
+      "utf8",
+    ),
+  )
+  evidence.childAfterReload = {
+    parentSessionID: session.id,
+    childSessionID: child.id,
+    score: childScore,
+    state: childState,
+  }
+  await writeFile(
+    path.join(root, "packaged-actions.json"),
+    JSON.stringify(evidence, null, 2),
+  )
+  assert.equal(childScore.status, "ok", childScore.text)
+  assert.equal(
+    provider.receipts.length,
+    7,
+    "one historical child judge request expected",
+  )
+  const childRecord = childState.sessions[child.id]
+  assert.equal(childRecord.agent_type, "subagent")
+  assert.equal(childRecord.parent_session_id, session.id)
+  assert.equal(childRecord.source_session_id, child.id)
+  assert.equal(childRecord.agent_name, "build")
+  assert.equal(childRecord.score, 0.8)
+  assert.equal(
+    childState.sessions[session.id],
+    undefined,
+    "parent-invoked child scoring must not commit a parent score",
+  )
   await writeFile(
     path.join(root, "packaged-actions.json"),
     JSON.stringify(evidence, null, 2),
