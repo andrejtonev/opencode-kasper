@@ -306,6 +306,7 @@ export interface OpencodeSessionClient {
         parts: Array<{ type: string; text?: string }>
         model?: { providerID: string; modelID: string }
         agent?: string
+        tools?: Record<string, boolean>
         format?: { type: string; schema?: Record<string, unknown> }
       }
     }): Promise<{

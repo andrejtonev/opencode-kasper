@@ -5,8 +5,18 @@ import type {
 import { Plugin, Rpc } from "@opencode/plugin/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Session } from "@opencode/schema/session"
+import type { SessionPromptData } from "@opencode-ai/sdk"
 import { Effect, Schema } from "effect"
 import { createV2Generation } from "../../src/hosts/v2-generation.js"
+
+export const legacyJudgePrompt: SessionPromptData = {
+  url: "/session/{id}/message",
+  path: { id: "ses_auxiliary" },
+  body: {
+    parts: [{ type: "text", text: "Untrusted evidence for evaluation" }],
+    tools: { "*": false },
+  },
+}
 
 export const fixture = Plugin.define({
   id: "kasper.sdk-contract",

@@ -92,6 +92,9 @@ export function createV1Generation(
             path: { id: ownedID },
             body: {
               parts: [{ type: "text", text: request.prompt }],
+              // The public V1 compatibility API converts this wildcard into a session
+              // deny rule, filtering workspace/plugin/MCP tools before model dispatch.
+              tools: { "*": false },
               ...(request.model ? { model: request.model } : {}),
             },
           })
