@@ -1,5 +1,5 @@
 import { mkdir, readdir, rm, stat } from "node:fs/promises"
-import { isAbsolute, join } from "node:path"
+import { isAbsolute, join, normalize, resolve } from "node:path"
 import type { Config, Plugin } from "@opencode-ai/plugin"
 import type { Event, Part, UserMessage } from "@opencode-ai/sdk"
 import { AgentPromptManager } from "./agent-prompts.js"
@@ -428,6 +428,19 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     })
     await ctx.stateStore.destroy()
   }
+  let shutdownPromise: Promise<void> | undefined
+  const close = (): Promise<void> => {
+    shutdownPromise ??= gracefulShutdown(
+      ctx,
+      configReloadTimer,
+      evaluationPollTimer,
+    ).finally(() => {
+      // An old instance must never deregister the replacement instance's store.
+      if (_stateStoreRegistry.get(directory) === stateStore)
+        _stateStoreRegistry.delete(directory)
+    })
+    return shutdownPromise
+  }
 
   const hooks = {
     config: async (opencodeConfig: Config) => {
@@ -480,6 +493,16 @@ Call the matching kasper_* tool:
       }
 
       const properties = evt.properties as Record<string, unknown> | undefined
+      if (name === "server.instance.disposed") {
+        const disposedDirectory = properties?.directory
+        if (typeof disposedDirectory !== "string") return
+        const canonical = (path: string) => {
+          const value = normalize(resolve(path))
+          return process.platform === "win32" ? value.toLowerCase() : value
+        }
+        if (canonical(disposedDirectory) === canonical(cwd)) await close()
+        return
+      }
       const info = properties?.info as Record<string, unknown> | undefined
       const part = properties?.part as Record<string, unknown> | undefined
       const sid = (properties?.sessionID ??
@@ -781,10 +804,7 @@ Call the matching kasper_* tool:
       }
     },
 
-    close: async () => {
-      await gracefulShutdown(ctx, configReloadTimer, evaluationPollTimer)
-      _stateStoreRegistry.delete(directory)
-    },
+    close,
   }
   return hooks
 }

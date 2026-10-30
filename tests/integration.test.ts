@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import KasperPlugin from "../src/index.js"
-import { flushKasperState } from "../src/registry.js"
+import { _stateStoreRegistry, flushKasperState } from "../src/registry.js"
 
 function tmpDir(): string {
   return join(tmpdir(), `kasper-int-${randomBytes(6).toString("hex")}`)
@@ -147,6 +147,54 @@ async function setupTestDir(): Promise<string> {
 }
 
 describe("plugin integration", () => {
+  test("public disposal is location-scoped and idempotently revokes the instance", async () => {
+    const dir = await setupTestDir()
+    const hooks = await KasperPlugin({
+      client: makeClient() as any,
+      directory: dir,
+    })
+    try {
+      await hooks.event({
+        event: {
+          type: "server.instance.disposed",
+          properties: { directory: join(dir, "different") },
+        },
+      })
+      expect(_stateStoreRegistry.has(dir)).toBe(true)
+      await hooks.event({
+        event: {
+          type: "server.instance.disposed",
+          properties: { directory: dir },
+        },
+      })
+      expect(_stateStoreRegistry.has(dir)).toBe(false)
+      const output = { parts: [] } as any
+      await hooks["command.execute.before"](
+        { command: "kasper", sessionID: "s", arguments: "status" },
+        output,
+      )
+      expect(output.message).toContain("unloaded")
+      await hooks.event({
+        event: {
+          type: "server.instance.disposed",
+          properties: { directory: dir },
+        },
+      })
+      await hooks.close()
+      const log = await readFile(
+        join(dir, ".opencode", "kasper", "kasper.log"),
+        "utf-8",
+      )
+      expect(
+        log
+          .split("\n")
+          .filter((line) => line.includes('"event":"plugin_unloaded"')),
+      ).toHaveLength(1)
+    } finally {
+      await hooks.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
   test("public V1 events route creation, message activity and deletion", async () => {
     const dir = await setupTestDir()
     const client = makeClient()

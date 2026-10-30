@@ -232,6 +232,52 @@ describe("KasperStateStore", () => {
     return new KasperStateStore(statePath, backupDir, config)
   }
 
+  test("deleting host identity removes every logical record with that source", async () => {
+    const store = createStore()
+    await store.init()
+    store.recordSession(
+      "host|agent:A|from:first",
+      "first",
+      makeScoreCard(),
+      "A",
+      undefined,
+      undefined,
+      "first",
+      1,
+      "host",
+    )
+    store.recordSession(
+      "independent-logical-key",
+      "second",
+      makeScoreCard(),
+      "B",
+      undefined,
+      undefined,
+      "second",
+      2,
+      "host",
+    )
+    store.recordSession(
+      "unrelated",
+      "other",
+      makeScoreCard(),
+      "A",
+      undefined,
+      undefined,
+      "other",
+      3,
+      "unrelated",
+    )
+    store.addEvaluatedSession("host|agent:A|from:first")
+    store.addEvaluatedSession("independent-logical-key")
+    store.removeSession("host")
+    expect(store.getSession("host|agent:A|from:first")).toBeUndefined()
+    expect(store.getSession("independent-logical-key")).toBeUndefined()
+    expect(store.getAggregate().total_sessions).toBe(1)
+    expect(store.getEvaluatedSessions()).toEqual([])
+    await store.destroy()
+  })
+
   test("weakness merge cannot restore a snapshot after reset", async () => {
     const store = createStore()
     await store.init()
