@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test"
 import type { ScorerInput } from "../src/scorer.js"
 import { parseModelString, Scorer } from "../src/scorer.js"
+import { weaknessMergeInputs } from "../src/scoring-validation.js"
 import type { OpencodeSessionClient } from "../src/types.js"
 import { DEFAULT_CONFIG } from "../src/types.js"
 
@@ -271,7 +272,8 @@ describe("Scorer", () => {
       expect(card.overall_score).toBe(0.5)
       expect(card.categories.instruction_following).toBe(0.5)
       expect(card.strengths).toEqual([])
-      expect(card.weaknesses).toEqual([])
+      expect(card.fallback).toBe(true)
+      expect(card.weaknesses[0]).toContain("invalid judge output schema")
     })
 
     test("returns fallback score card on client error", async () => {
@@ -395,11 +397,12 @@ describe("Scorer", () => {
         mockClient as unknown as OpencodeSessionClient,
       )
 
-      expect(card.overall_score).toBe(0.75)
+      expect(card.overall_score).toBe(0.5)
+      expect(card.fallback).toBe(true)
       expect(card.categories.instruction_following).toBe(0.5)
       expect(card.categories.completeness).toBe(0.5)
-      expect(card.strengths).toEqual(["good"])
-      expect(card.weaknesses).toEqual(["bad"])
+      expect(card.strengths).toEqual([])
+      expect(card.weaknesses[0]).toContain("invalid judge output schema")
     })
 
     test("cleans up scoring session on success", async () => {
@@ -644,29 +647,37 @@ describe("Scorer", () => {
       expect(result).toHaveLength(2)
     })
 
-    test("merges weaknesses from model output", async () => {
+    test("merges stable groups and derives observation counts", async () => {
       const scorer = new Scorer(DEFAULT_CONFIG)
-      const mockClient = makeMockSession(
-        "merge-sess",
-        JSON.stringify({
-          merged_weaknesses: [
-            { pattern: "slow response", count: 5 },
-            { pattern: "missed details", count: 2 },
-          ],
-        }),
-      )
       const weaknesses = [
         { pattern: "slow", count: 2, suggested_fix: "" },
         { pattern: "slow response", count: 3, suggested_fix: "" },
         { pattern: "missed details", count: 2, suggested_fix: "" },
       ]
+      const inputs = weaknessMergeInputs(weaknesses, 20)
+      const mockClient = makeMockSession(
+        "merge-sess",
+        JSON.stringify({
+          groups: [
+            {
+              ids: inputs.slice(0, 2).map((item) => item.id),
+              pattern: "slow response",
+            },
+          ],
+        }),
+      )
       const result = await scorer.mergeWeaknesses(
         weaknesses,
         mockClient as unknown as OpencodeSessionClient,
       )
-      expect(result.length).toBe(2)
+      expect(result).toHaveLength(2)
       expect(result[0].pattern).toBe("slow response")
       expect(result[0].count).toBe(5)
+      expect(result[1]).toEqual(weaknesses[2])
+      const prompt =
+        mockClient.session.prompt.mock.calls[0][0].body.parts[0].text
+      expect(prompt).toContain(inputs[0].id)
+      expect(mockClient.session.delete).toHaveBeenCalledTimes(1)
     })
   })
 })
