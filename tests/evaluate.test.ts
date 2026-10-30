@@ -4,6 +4,7 @@ import {
   buildEvalFromMessages,
   considerImprovement,
   evaluateChildSessions,
+  evaluateSession,
   manualEvaluateSession,
   runEvaluation,
 } from "../src/evaluate.js"
@@ -109,6 +110,7 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
     isMergingWeaknesses: false,
     kasperPaused: false,
     registeredCommands: new Set(),
+    idleSessions: new Set(),
     ...overrides,
   }
 }
@@ -1263,6 +1265,7 @@ describe("batchEvaluateSessions", () => {
   test("evaluates multiple sessions and reports results", async () => {
     const sessions: any[] = []
     const ctx = mockCtx({
+      idleSessions: new Set(["s1", "s2"]),
       config: { ...DEFAULT_CONFIG, min_session_messages: 1 },
       stateStore: {
         getConfig: () => DEFAULT_CONFIG,
@@ -1274,7 +1277,9 @@ describe("batchEvaluateSessions", () => {
             timestamp: Date.now(),
           })
         },
+        mergeAllWeaknesses: async () => {},
         getRecentSessions: () => sessions,
+        getSession: (id: string) => sessions.find((s) => s.id === id),
         getAggregate: () => ({
           total_sessions: sessions.length,
           avg_score:
@@ -1321,6 +1326,7 @@ describe("batchEvaluateSessions", () => {
   test("skips already evaluated sessions", async () => {
     const sessions: any[] = []
     const ctx = mockCtx({
+      idleSessions: new Set(["s1", "s2"]),
       config: { ...DEFAULT_CONFIG, min_session_messages: 1 },
       stateStore: {
         getConfig: () => DEFAULT_CONFIG,
@@ -1332,7 +1338,9 @@ describe("batchEvaluateSessions", () => {
             timestamp: Date.now(),
           })
         },
+        mergeAllWeaknesses: async () => {},
         getRecentSessions: () => sessions,
+        getSession: (id: string) => sessions.find((s) => s.id === id),
         getAggregate: () => ({
           total_sessions: sessions.length,
           avg_score:
@@ -1343,7 +1351,6 @@ describe("batchEvaluateSessions", () => {
           top_strengths: [],
           by_agent: {},
         }),
-        getSession: () => undefined as any,
         addEvaluatedSession: () => {},
       } as any,
       client: {
@@ -1381,6 +1388,7 @@ describe("batchEvaluateSessions", () => {
 
   test("handles sessions with no evaluable content", async () => {
     const ctx = mockCtx({
+      idleSessions: new Set(["s1", "s2"]),
       client: {
         session: {
           messages: mock(() => Promise.resolve({ data: [] })),
@@ -1395,6 +1403,7 @@ describe("batchEvaluateSessions", () => {
 
   test("handles client errors gracefully", async () => {
     const ctx = mockCtx({
+      idleSessions: new Set(["s1", "s2"]),
       client: {
         session: {
           messages: mock(() => Promise.reject("network error")),
@@ -1403,7 +1412,454 @@ describe("batchEvaluateSessions", () => {
     })
 
     const result = await batchEvaluateSessions(["err"], ctx)
-    expect(result).toContain("Skipped")
-    expect(result).toContain("no-content")
+    expect(result).toContain("Errors")
+    expect(result).toContain("Failed to fetch")
+  })
+})
+
+describe("history correctness regressions", () => {
+  const message = (
+    id: string,
+    role: string,
+    text: string,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    info: { id, role, sessionID: "history-session", ...extra },
+    parts: text ? [{ type: "text", text }] : [],
+  })
+  const pair = () => [
+    message("u1", "user", "run tests"),
+    message("a1", "assistant", "done"),
+  ]
+
+  test("retains official V1 tool inputs, outputs and errors", () => {
+    const msgs = pair()
+    msgs[1].parts.push(
+      ...([
+        {
+          type: "tool",
+          callID: "c1",
+          tool: "bash",
+          state: {
+            status: "completed",
+            input: { command: "bun test" },
+            output: "79 passed",
+          },
+        },
+        {
+          type: "tool",
+          callID: "c2",
+          tool: "read",
+          state: {
+            status: "error",
+            input: { filePath: "missing" },
+            error: "ENOENT",
+          },
+        },
+      ] as any),
+    )
+    const pending = buildEvalFromMessages(
+      msgs,
+      "s",
+      "build",
+      1,
+      new Set(),
+      undefined,
+      true,
+    )!
+    expect(pending.toolCalls).toHaveLength(2)
+    expect(pending.toolCalls[0].args).toContain("bun test")
+    expect(pending.toolCalls[0].result).toBe("79 passed")
+    expect(pending.toolCalls[1].result).toContain("ENOENT")
+  })
+
+  test("does not checkpoint an incomplete following turn", () => {
+    const msgs = [
+      ...pair(),
+      message("u2", "user", "next"),
+      message("a2", "assistant", "working"),
+    ]
+    const pending = buildEvalFromMessages(
+      msgs,
+      "s",
+      "build",
+      1,
+      new Set(),
+      undefined,
+      false,
+    )!
+    expect(pending.pairs).toHaveLength(1)
+    expect(pending.lastMessageId).toBe("a1")
+  })
+
+  test("missing checkpoint fails closed rather than replaying counted evidence", () => {
+    expect(
+      buildEvalFromMessages(
+        pair(),
+        "s",
+        "build",
+        1,
+        new Set(),
+        "missing",
+        true,
+      ),
+    ).toBeNull()
+  })
+
+  test("never fabricates a user instruction from assistant or system text", () => {
+    expect(
+      buildEvalFromMessages(
+        [
+          message("a", "assistant", "unprompted"),
+          message("b", "assistant", "more"),
+        ],
+        "s",
+        "build",
+        0,
+        new Set(),
+        undefined,
+        true,
+      ),
+    ).toBeNull()
+  })
+
+  test("running tool blocks checkpoint even if idle observation is stale", () => {
+    const msgs = pair()
+    msgs[1].parts.push({
+      type: "tool",
+      tool: "bash",
+      callID: "c",
+      state: { status: "running", input: { command: "sleep" } },
+    } as any)
+    expect(
+      buildEvalFromMessages(msgs, "s", "build", 1, new Set(), undefined, true),
+    ).toBeNull()
+  })
+
+  test("manual scoring does not treat an active response as idle", async () => {
+    const ctx = mockCtx({
+      client: { session: { messages: async () => ({ data: pair() }) } } as any,
+    })
+    const calls = mock(async () => makeScoreCard())
+    ctx.scorer.evaluate = calls as any
+    const result = await manualEvaluateSession("s", ctx, "build", false)
+    expect(calls).not.toHaveBeenCalled()
+    expect(result).toContain("complete")
+  })
+
+  test("failed judge is reported as failure and is not batch success", async () => {
+    const ctx = mockCtx({
+      idleSessions: new Set(["s"]),
+      client: { session: { messages: async () => ({ data: pair() }) } } as any,
+    })
+    ctx.scorer.evaluate = async () => makeScoreCard({ fallback: true })
+    const result = await batchEvaluateSessions(["s"], ctx)
+    expect(result).toContain("Errors")
+    expect(result).not.toContain("session(s) evaluated")
+    expect(ctx.sessionsEvaluated.has("s")).toBe(false)
+    expect(ctx.sessionMsgCount.has("s")).toBe(false)
+  })
+
+  test("A-B-A work uses distinct ranges and the real preceding user request", async () => {
+    const inputs: any[] = []
+    const msgs = [
+      message("u1", "user", "first request"),
+      message("a1", "assistant", "A first", { agent: "A" }),
+      message("u2", "user", "second request"),
+      message("a2", "assistant", "B work", { agent: "B" }),
+      message("u3", "user", "third request"),
+      message("a3", "assistant", "A last", { agent: "A" }),
+    ]
+    const records = new Map<string, any>()
+    const ctx = mockCtx({
+      idleSessions: new Set(["s"]),
+      config: { ...DEFAULT_CONFIG, min_session_messages: 1 },
+      client: { session: { messages: async () => ({ data: msgs }) } } as any,
+    })
+    ctx.scorer.evaluate = async (input: any) => {
+      inputs.push(input)
+      return makeScoreCard({ session_id: input.sessionID })
+    }
+    ctx.stateStore.recordSession = ((
+      id: string,
+      title: string,
+      card: ScoreCard,
+      agent: string,
+      _type: unknown,
+      _parent: unknown,
+      cursor: string,
+    ) => {
+      records.set(id, {
+        id,
+        title,
+        score: card.overall_score,
+        score_card: card,
+        weaknesses: card.weaknesses,
+        agent_name: agent,
+        last_msg_id: cursor,
+      })
+    }) as any
+    ctx.stateStore.getSession = ((id: string) => records.get(id)) as any
+    ctx.stateStore.getRecentSessions = (() => [...records.values()]) as any
+    const result = await manualEvaluateSession("s", ctx, undefined, false)
+    expect(inputs).toHaveLength(3)
+    expect(new Set(inputs.map((i) => i.sessionID)).size).toBe(3)
+    expect(inputs.map((i) => i.userInstruction)).toEqual([
+      "first request",
+      "second request",
+      "third request",
+    ])
+    expect(inputs.map((i) => i.agentName)).toEqual(["A", "B", "A"])
+    expect(result).toContain("Per-Agent")
+  })
+
+  test("split judge failure consumes none of the pending evidence", async () => {
+    let attempt = 0
+    const ctx = mockCtx({
+      config: { ...DEFAULT_CONFIG, max_score_input_chars: 1 },
+    })
+    ctx.scorer.evaluate = async () => {
+      if (++attempt === 2) throw new Error("second pair failure")
+      return makeScoreCard()
+    }
+    const recorded = mock(() => {})
+    ctx.stateStore.recordSession = recorded as any
+    const pending = makePendingEval({
+      userInstruction: "long input",
+      pairs: [
+        {
+          userInstruction: "one",
+          agentResponse: "done",
+          toolCalls: [],
+          subagentCalls: [],
+        },
+        {
+          userInstruction: "two",
+          agentResponse: "done",
+          toolCalls: [],
+          subagentCalls: [],
+        },
+      ],
+    })
+    expect(await runEvaluation(pending, ctx)).toBe(false)
+    expect(recorded).not.toHaveBeenCalled()
+    expect(ctx.sessionsEvaluated.size).toBe(0)
+  })
+})
+
+describe("evaluation range commits", () => {
+  const message = (id: string, role: string, text: string, agent?: string) => ({
+    info: { id, role, sessionID: "s", agent },
+    parts: [{ type: "text", text }],
+  })
+  function tracked(messages: any[]) {
+    const records = new Map<string, any>()
+    const inputs: any[] = []
+    const ctx = mockCtx({
+      idleSessions: new Set(["s"]),
+      client: {
+        session: { messages: async () => ({ data: messages }) },
+      } as any,
+    })
+    ctx.scorer.evaluate = async (input: any) => {
+      inputs.push(input)
+      return makeScoreCard({ session_id: input.sessionID })
+    }
+    ctx.stateStore.recordSession = ((
+      id: string,
+      title: string,
+      card: ScoreCard,
+      agent: string,
+      _type: unknown,
+      _parent: unknown,
+      cursor: string,
+    ) => {
+      records.set(id, {
+        id,
+        title,
+        score: card.overall_score,
+        score_card: card,
+        weaknesses: card.weaknesses,
+        agent_name: agent,
+        last_msg_id: cursor,
+      })
+    }) as any
+    ctx.stateStore.getSession = ((id: string) => records.get(id)) as any
+    ctx.stateStore.getRecentSessions = (() => [...records.values()]) as any
+    return { ctx, records, inputs }
+  }
+
+  test("single-agent history can become multi-agent without recounting its first range", async () => {
+    const msgs = [
+      message("u1", "user", "first"),
+      message("a1", "assistant", "A", "A"),
+    ]
+    const { ctx, records, inputs } = tracked(msgs)
+    expect((await evaluateSession("s", ctx)).status).toBe("scored")
+    msgs.push(
+      message("u2", "user", "second"),
+      message("a2", "assistant", "B", "B"),
+    )
+    expect((await evaluateSession("s", ctx)).status).toBe("scored")
+    expect(inputs).toHaveLength(2)
+    expect(records.size).toBe(2)
+    expect((await evaluateSession("s", ctx)).status).toBe("skipped")
+    expect(inputs).toHaveLength(2)
+  })
+
+  test("a failed middle range cannot consume later ranges and retries skip accepted prefix", async () => {
+    const msgs = [
+      message("u1", "user", "one"),
+      message("a1", "assistant", "A", "A"),
+      message("u2", "user", "two"),
+      message("a2", "assistant", "B", "B"),
+      message("u3", "user", "three"),
+      message("a3", "assistant", "A again", "A"),
+    ]
+    const { ctx, records, inputs } = tracked(msgs)
+    const original = ctx.scorer.evaluate
+    ctx.scorer.evaluate = async (input: any, client: any) =>
+      input.agentName === "B"
+        ? makeScoreCard({ fallback: true })
+        : original(input, client)
+    expect((await evaluateSession("s", ctx)).status).toBe("failed")
+    expect(records.size).toBe(1)
+    expect(inputs).toHaveLength(1)
+    expect(ctx.sessionsEvaluated.has("s")).toBe(false)
+    ctx.scorer.evaluate = original
+    expect((await evaluateSession("s", ctx)).status).toBe("scored")
+    expect(records.size).toBe(3)
+    expect(inputs).toHaveLength(3)
+  })
+
+  test("concurrent manual requests return a duplicate outcome after one range commits", async () => {
+    const { ctx, inputs } = tracked([
+      message("u1", "user", "first"),
+      message("a1", "assistant", "done"),
+    ])
+    const results = await Promise.all([
+      evaluateSession("s", ctx),
+      evaluateSession("s", ctx),
+    ])
+    expect(results.map((r) => r.status).sort()).toEqual(["scored", "skipped"])
+    expect(inputs).toHaveLength(1)
+  })
+
+  test("a state recording failure cannot mark the session evaluated", async () => {
+    const ctx = mockCtx()
+    ctx.stateStore.recordSession = () => {
+      throw new Error("storage failed")
+    }
+    expect(await runEvaluation(makePendingEval(), ctx)).toBe(false)
+    expect(ctx.sessionsEvaluated.has("test-session")).toBe(false)
+  })
+
+  test("post-record feedback failure does not report an accepted score as a failed job", async () => {
+    const ctx = mockCtx()
+    ctx.logger.log = async (event: string) => {
+      if (event === "run_eval_recorded") throw new Error("logging failed")
+    }
+    expect(await runEvaluation(makePendingEval(), ctx)).toBe(true)
+    expect(ctx.sessionsEvaluated.has("test-session")).toBe(true)
+  })
+
+  test("valid zero scores are scored outcomes, not infrastructure failures", async () => {
+    const ctx = mockCtx()
+    ctx.scorer.evaluate = async () => makeScoreCard({ overall_score: 0 })
+    expect(await runEvaluation(makePendingEval(), ctx)).toBe(true)
+    expect(ctx.sessionsEvaluated.has("test-session")).toBe(true)
+  })
+
+  test("official completed assistant metadata closes historical replies without pretending active sessions are idle", () => {
+    const msgs = [
+      message("u1", "user", "task"),
+      message("a1", "assistant", "done"),
+    ]
+    Object.assign(msgs[1].info, {
+      time: { completed: Date.now() },
+      finish: "stop",
+    })
+    expect(
+      buildEvalFromMessages(msgs, "s", "build", 1, new Set(), undefined, false)
+        ?.lastMessageId,
+    ).toBe("a1")
+    Object.assign(msgs[1].info, { finish: "tool-calls" })
+    expect(
+      buildEvalFromMessages(msgs, "s", "build", 1, new Set(), undefined, false),
+    ).toBeNull()
+  })
+
+  test("tool and agent selection parts do not fabricate delegation", () => {
+    const msgs = [
+      message("u1", "user", "task"),
+      message("a1", "assistant", "done"),
+    ]
+    msgs[1].parts.push({
+      type: "agent",
+      name: "explore",
+      text: "mention",
+      source: { start: 0, end: 7 },
+    } as any)
+    expect(
+      buildEvalFromMessages(msgs, "s", "build", 1, new Set(), undefined, true)
+        ?.subagentCalls,
+    ).toEqual([])
+    msgs[1].parts.push({
+      type: "tool",
+      tool: "task",
+      state: {
+        status: "completed",
+        input: { subagent_type: "explore", prompt: "search code" },
+        output: "found it",
+      },
+    } as any)
+    expect(
+      buildEvalFromMessages(msgs, "s", "build", 1, new Set(), undefined, true)
+        ?.subagentCalls,
+    ).toEqual([{ agent: "explore", input: "search code" }])
+  })
+
+  test("a user agent selection changes attribution without becoming delegation", async () => {
+    const msgs = [
+      message("u1", "user", "one", "A"),
+      message("a1", "assistant", "A response"),
+      message("u2", "user", "two", "B"),
+      message("a2", "assistant", "B response"),
+    ]
+    const { ctx, inputs } = tracked(msgs)
+    expect((await evaluateSession("s", ctx)).status).toBe("scored")
+    expect(inputs.map((i) => i.agentName)).toEqual(["A", "B"])
+    expect(inputs.flatMap((i) => i.subagentCalls)).toEqual([])
+  })
+
+  test("child traversal shares a cycle guard and depth budget", async () => {
+    const { ctx } = tracked([
+      message("u1", "user", "task"),
+      message("a1", "assistant", "done"),
+    ])
+    const fetched: string[] = []
+    ctx.client.session.messages = async (args: any) => {
+      fetched.push(args.path.id)
+      return {
+        data: [
+          message("u1", "user", "task"),
+          {
+            ...message("a1", "assistant", "done"),
+            info: {
+              id: "a1",
+              role: "assistant",
+              sessionID: args.path.id,
+              time: { completed: 1 },
+              finish: "stop",
+            },
+          },
+        ],
+      } as any
+    }
+    ctx.parentToChildren.set("root", new Set(["a"]))
+    ctx.parentToChildren.set("a", new Set(["root", "b"]))
+    ctx.parentToChildren.set("b", new Set(["c"]))
+    await evaluateChildSessions("root", ctx, 0, 2)
+    expect(fetched).toEqual(["a", "b"])
   })
 })

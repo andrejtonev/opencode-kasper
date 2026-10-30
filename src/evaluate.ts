@@ -5,25 +5,28 @@ import {
   isBuiltinAgentName,
   MAX_EVALUATED_SESSION_SET,
   MAX_MESSAGE_CHARS,
-  MAX_MESSAGE_PARTS,
   MAX_PENDING_IMPROVEMENTS,
   MAX_TOOL_CALLS_EVAL,
   MAX_USER_INSTRUCTION_CHARS,
 } from "./constants.js"
+import type { V1HistoryMessage } from "./history.js"
+import {
+  completedHistoryTurns,
+  historySegments,
+  normalizeV1History,
+  pendingFromHistoryTurns,
+} from "./history.js"
 import type { ScorerInput } from "./scorer.js"
 import type {
   KasperConfig,
   KasperContext,
   PendingEval,
   ScoreCard,
-  SubagentCallRecord,
-  ToolCallRecord,
 } from "./types.js"
 import {
   findMatchingWeakness,
   formatScore,
   isKasperSession,
-  isRegisteredCommand,
   isValidGuidanceText,
   sanitizeImprovementText,
   showToast,
@@ -91,6 +94,7 @@ export async function runEvaluation(
   pending: PendingEval,
   ctx: KasperContext,
 ): Promise<boolean> {
+  let scoreRecorded = false
   return ctx.evalMutex
     .runExclusive(async () => {
       if (ctx.sessionsEvaluated.has(pending.sessionID)) {
@@ -204,6 +208,7 @@ export async function runEvaluation(
             const pc = await ctx.scorer.evaluate(pairInput, ctx.client)
             pc.agent_prompt_hash = agentPromptHash
             pc.agents_md_hash = agentsMdHash
+            if (pc.fallback || !Number.isFinite(pc.overall_score)) return false
             pairCards.push(pc)
             await ctx.logger.log("pair_evaluated", {
               sessionID: pending.sessionID,
@@ -216,6 +221,7 @@ export async function runEvaluation(
               pairIndex: i,
               error: String(err),
             })
+            return false
           }
         }
         if (pairCards.length === 0) {
@@ -269,7 +275,7 @@ export async function runEvaluation(
       const scorePct = (card.overall_score * 100).toFixed(0)
       const { emoji: _scoreEmoji } = formatScore(card.overall_score)
 
-      if (card.fallback || card.overall_score <= 0) {
+      if (card.fallback || !Number.isFinite(card.overall_score)) {
         // Failure path: do NOT add pending.sessionID to
         // ctx.sessionsEvaluated or to the persistent
         // ctx.stateStore.addEvaluatedSession list. Adding it would mark
@@ -288,9 +294,7 @@ export async function runEvaluation(
         await ctx.logger.log("evaluation_skipped", {
           sessionID: pending.sessionID,
           score: card.overall_score,
-          reason:
-            card.weaknesses[0] ??
-            (card.overall_score <= 0 ? "zero_score" : "fallback"),
+          reason: card.weaknesses[0] ?? "invalid_score",
         })
         if (card.fallback && !ctx.config.quiet) {
           showToast(
@@ -309,16 +313,6 @@ export async function runEvaluation(
         sessionsEvaluatedSizeBefore: ctx.sessionsEvaluated.size,
       })
 
-      ctx.sessionsEvaluated.add(pending.sessionID)
-      ctx.stateStore.addEvaluatedSession?.(pending.sessionID)
-      if (ctx.sessionsEvaluated.size > MAX_EVALUATED_SESSION_SET) {
-        const toRemove = [...ctx.sessionsEvaluated].slice(
-          0,
-          ctx.sessionsEvaluated.size - MAX_EVALUATED_SESSION_SET,
-        )
-        for (const id of toRemove) ctx.sessionsEvaluated.delete(id)
-      }
-
       ctx.stateStore.recordSession(
         pending.sessionID,
         pending.userInstruction.slice(0, 100),
@@ -329,6 +323,17 @@ export async function runEvaluation(
         pending.lastMessageId,
         Date.now(),
       )
+
+      scoreRecorded = true
+      ctx.sessionsEvaluated.add(pending.sessionID)
+      ctx.stateStore.addEvaluatedSession?.(pending.sessionID)
+      if (ctx.sessionsEvaluated.size > MAX_EVALUATED_SESSION_SET) {
+        const toRemove = [...ctx.sessionsEvaluated].slice(
+          0,
+          ctx.sessionsEvaluated.size - MAX_EVALUATED_SESSION_SET,
+        )
+        for (const id of toRemove) ctx.sessionsEvaluated.delete(id)
+      }
 
       const aggAfterRecording = ctx.stateStore.getAggregate()
       await ctx.logger.log("run_eval_recorded", {
@@ -379,168 +384,20 @@ export async function runEvaluation(
       return true
     })
     .catch(async (err) => {
-      await ctx.logger.log("run_eval_error", {
-        sessionID: pending.sessionID,
-        error: String(err),
-      })
-      return false
+      await ctx.logger
+        .log("run_eval_error", {
+          sessionID: pending.sessionID,
+          error: String(err),
+          scoreRecorded,
+        })
+        .catch(() => {})
+      // Optional merging, feedback and logging failures do not undo an accepted score.
+      return scoreRecorded
     })
 }
 
-interface PartWithMeta extends Record<string, unknown> {
-  data?: { name?: string }
-  content?: { name?: string }
-}
-
-function extractAgentFromPart(p: Record<string, unknown>): string | undefined {
-  if (p.type !== "agent") return undefined
-  if (typeof p.name === "string" && p.name) return p.name
-  const pm = p as PartWithMeta
-  if (typeof pm.data?.name === "string" && pm.data.name) return pm.data.name
-  if (typeof pm.content?.name === "string" && pm.content.name)
-    return pm.content.name
-  return undefined
-}
-
-function extractSubagentCallsFromMessages(
-  msgs: Array<{ parts?: Array<Record<string, unknown>> }>,
-): SubagentCallRecord[] {
-  const calls: SubagentCallRecord[] = []
-  for (const msg of msgs) {
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-    for (const part of parts) {
-      if (part.type === "agent") {
-        const agent = extractAgentFromPart(part)
-        if (agent) {
-          const input =
-            typeof part.input === "string"
-              ? part.input
-              : typeof part.text === "string"
-                ? part.text
-                : ""
-          calls.push({ agent, input })
-        }
-      }
-    }
-  }
-  return calls
-}
-
-function extractAgentFromInfo(info: unknown): string | undefined {
-  if (!info || typeof info !== "object") return undefined
-  const i = info as Record<string, unknown>
-  if (typeof i.agent === "string" && i.agent) return i.agent
-  if (typeof i.agentName === "string" && i.agentName) return i.agentName
-  if (typeof i.subagent_type === "string" && i.subagent_type)
-    return i.subagent_type
-  if (typeof i.agent_type === "string" && i.agent_type) return i.agent_type
-  return undefined
-}
-
-function detectAgentTransitions(
-  msgList: Array<{
-    info?: { id: string; role: string; sessionID: string }
-    parts?: Array<Record<string, unknown>>
-  }>,
-): Array<{
-  agentName: string | undefined
-  msgs: typeof msgList
-}> {
-  const segments: Array<{
-    agentName: string | undefined
-    msgs: typeof msgList
-  }> = []
-  let currentAgent: string | undefined
-  let currentMsgs: typeof msgList = []
-
-  for (const msg of msgList) {
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-
-    let detectedAgent: string | undefined
-    for (const p of parts) {
-      detectedAgent = extractAgentFromPart(p)
-      if (detectedAgent) break
-    }
-    if (!detectedAgent) {
-      detectedAgent = extractAgentFromInfo(msg.info)
-    }
-
-    if (detectedAgent && detectedAgent !== currentAgent) {
-      if (currentMsgs.length > 0) {
-        segments.push({ agentName: currentAgent, msgs: currentMsgs })
-        currentMsgs = []
-      }
-      currentAgent = detectedAgent
-    }
-    currentMsgs.push(msg)
-  }
-  if (currentMsgs.length > 0) {
-    segments.push({ agentName: currentAgent, msgs: currentMsgs })
-  }
-  return segments
-}
-
-interface ToolResultPart extends Record<string, unknown> {
-  tool_use_id?: string
-  content?: string | Array<{ text?: string }>
-}
-
-function extractToolCallsFromMessages(
-  msgs: Array<{
-    info?: { id: string; role: string; sessionID: string }
-    parts?: Array<Record<string, unknown>>
-  }>,
-): ToolCallRecord[] {
-  const toolCalls: ToolCallRecord[] = []
-  for (const msg of msgs) {
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-    for (const part of parts) {
-      if (part.type === "tool_use" && typeof part.name === "string") {
-        const resultPart = parts.find(
-          (p) =>
-            p.type === "tool_result" &&
-            (p as ToolResultPart).tool_use_id === part.id,
-        ) as ToolResultPart | undefined
-        const content = resultPart?.content
-        toolCalls.push({
-          tool: part.name,
-          args: JSON.stringify(part.input ?? {}),
-          result:
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content
-                    .map((c) => (typeof c.text === "string" ? c.text : ""))
-                    .join(" ")
-                : "(empty)",
-        })
-      }
-    }
-  }
-  return toolCalls
-}
-
-function isCompressionOutput(text: string): boolean {
-  if (text.includes("▣ DCP") || text.includes("▣ Compression #")) return true
-  if (text.toLowerCase().includes("the user triggered compression")) return true
-  return false
-}
-
-interface MsgWithRole {
-  info?: { id: string; role: string; sessionID: string }
-  role?: string
-  parts?: Array<Record<string, unknown>>
-}
-
-function getMsgRole(msg: MsgWithRole): string | undefined {
-  return msg.info?.role ?? msg.role
-}
-
 export function buildEvalFromMessages(
-  msgs: Array<{
-    info?: { id: string; role: string; sessionID: string }
-    parts?: Array<Record<string, unknown>>
-  }>,
+  msgs: V1HistoryMessage[],
   evalSessionID: string,
   agentName: string | undefined,
   minUserMessages = 0,
@@ -548,213 +405,241 @@ export function buildEvalFromMessages(
   lastMsgId?: string,
   isIdle?: boolean,
 ): PendingEval | null {
-  if (msgs.length === 0) return null
+  return pendingFromHistoryTurns(
+    completedHistoryTurns(
+      normalizeV1History(msgs),
+      registeredCommands,
+      lastMsgId,
+      isIdle,
+    ),
+    evalSessionID,
+    agentName,
+    minUserMessages,
+  )
+}
 
-  let startIdx = 0
-  if (lastMsgId) {
-    const found = msgs.findIndex((m) => m.info?.id === lastMsgId)
-    if (found !== -1) {
-      startIdx = found + 1
-    }
+export type EvaluationOutcome = {
+  sessionID: string
+  status: "scored" | "skipped" | "failed"
+  reason:
+    | "scored"
+    | "already_evaluated"
+    | "no_content"
+    | "incomplete"
+    | "checkpoint_missing"
+    | "history_unavailable"
+    | "fetch_failed"
+    | "judge_failed"
+    | "owned_session"
+    | "deleted_session"
+  detail: string
+  scoredKeys: string[]
+}
+
+/** Machine-readable outcomes are shared by manual commands, child traversal and batch scoring. */
+export async function evaluateSession(
+  sessionID: string,
+  ctx: KasperContext,
+  agentHint?: string,
+): Promise<EvaluationOutcome> {
+  const outcome = (
+    status: EvaluationOutcome["status"],
+    reason: EvaluationOutcome["reason"],
+    detail: string,
+    scoredKeys: string[] = [],
+  ): EvaluationOutcome => ({ sessionID, status, reason, detail, scoredKeys })
+  if (ctx.deletedSessions.has(sessionID))
+    return outcome(
+      "skipped",
+      "deleted_session",
+      "This session has been deleted.",
+    )
+  if (ctx.kasperSessionIDs.has(sessionID))
+    return outcome(
+      "skipped",
+      "owned_session",
+      "Kasper's own sessions are excluded from evaluation.",
+    )
+  if (!ctx.client.session.messages)
+    return outcome(
+      "failed",
+      "history_unavailable",
+      "Session message history is not available for manual evaluation.",
+    )
+
+  let raw: V1HistoryMessage[]
+  try {
+    const response = await ctx.client.session.messages({
+      path: { id: sessionID },
+    })
+    if (!response.data)
+      return outcome(
+        "failed",
+        "fetch_failed",
+        `Failed to fetch messages for session "${sessionID}".`,
+      )
+    raw = response.data
+  } catch {
+    return outcome(
+      "failed",
+      "fetch_failed",
+      `Failed to fetch messages for session "${sessionID}". The session may not exist or may have been deleted.`,
+    )
   }
-  const filteredMsgs = startIdx > 0 ? msgs.slice(startIdx) : msgs
-  if (filteredMsgs.length === 0) return null
+  if (raw.length === 0)
+    return outcome(
+      "skipped",
+      "no_content",
+      `No messages found for session "${sessionID}".`,
+    )
+  const history = normalizeV1History(raw)
+  const parentRecord = ctx.stateStore.getSession(sessionID)
+  if (
+    parentRecord?.last_msg_id &&
+    !history.some((m) => m.id === parentRecord.last_msg_id)
+  ) {
+    return outcome(
+      "failed",
+      "checkpoint_missing",
+      `The saved checkpoint for session "${sessionID}" is absent from history; evaluation was not replayed.`,
+    )
+  }
+  const isIdle = ctx.idleSessions?.has(sessionID) ?? false
+  const complete = completedHistoryTurns(
+    history,
+    ctx.registeredCommands,
+    undefined,
+    isIdle,
+  )
+  const registry = ctx.agentRegistry.get(sessionID)
+  const segments = historySegments(complete, agentHint ?? registry?.agentName)
+  if (segments.length === 0)
+    return outcome(
+      "skipped",
+      "incomplete",
+      `No complete user/assistant pairs found in session "${sessionID}".`,
+    )
 
-  let currentUserMsg: (typeof msgs)[0] | null = null
-  const keptMsgs: typeof msgs = []
-  let userMessageCount = 0
-  // Tracks whether the last assistant message in filteredMsgs was
-  // immediately followed by a user message (making that pair complete).
-  let lastAssistantFollowedByUser = false
-
-  for (const msg of filteredMsgs) {
-    const role = getMsgRole(msg)
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-    const text = parts
-      .filter((p) => p.type === "text" && typeof p.text === "string")
-      .map((p) => p.text as string)
-      .join(" ")
-
-    if (role === "user") {
-      lastAssistantFollowedByUser = true
-      if (isRegisteredCommand(text, registeredCommands)) {
-        currentUserMsg = null
+  const multiAgent = segments.length > 1
+  const scoredKeys: string[] = []
+  const summaries: string[] = []
+  let failed = false
+  let renewed = false
+  for (const [index, segment] of segments.entries()) {
+    // Stable start IDs distinguish A-B-A and let extensions update the same segment record.
+    if (multiAgent && !segment.firstMessageId)
+      return outcome(
+        "failed",
+        "history_unavailable",
+        "Agent ranges require durable message IDs.",
+      )
+    const key =
+      multiAgent && !(index === 0 && parentRecord)
+        ? `${sessionID}|agent:${encodeURIComponent(segment.agentName ?? "default")}|from:${segment.firstMessageId}`
+        : sessionID
+    const previous = ctx.stateStore.getSession(key)
+    let turns = segment.turns
+    if (previous?.last_msg_id) {
+      const ids = segment.turns.flatMap((t) => t.assistants.map((m) => m.id))
+      const cursor = ids.indexOf(previous.last_msg_id)
+      if (cursor < 0)
+        return outcome(
+          "failed",
+          "checkpoint_missing",
+          `The saved checkpoint for session "${sessionID}" is absent from history; evaluation was not replayed.`,
+        )
+      const remaining = new Set(ids.slice(cursor + 1))
+      turns = segment.turns
+        .map((t) => ({
+          ...t,
+          assistants: t.assistants.filter((m) => remaining.has(m.id)),
+        }))
+        .filter((t) => t.assistants.length > 0)
+      if (turns.length === 0) {
+        const { emoji, pct } = formatScore(previous.score)
+        summaries.push(
+          `**${segment.agentName ?? "default"}**: ${emoji} ${pct}% (already evaluated)`,
+        )
+        if (previous.weaknesses.length)
+          summaries.push(`  - ${previous.weaknesses.slice(0, 3).join(", ")}`)
         continue
       }
-
-      if (currentUserMsg) {
-        const prevIdx = keptMsgs.lastIndexOf(currentUserMsg)
-        if (prevIdx !== -1) {
-          const hasAssistantAfter = keptMsgs
-            .slice(prevIdx + 1)
-            .some((m) => getMsgRole(m) === "assistant")
-          if (!hasAssistantAfter) {
-            keptMsgs.splice(prevIdx, 1)
-            userMessageCount--
-          }
-        }
-      }
-
-      currentUserMsg = msg
-      keptMsgs.push(msg)
-      userMessageCount++
-    } else if (role === "assistant") {
-      lastAssistantFollowedByUser = false
-      if (isCompressionOutput(text)) continue
-
-      if (currentUserMsg) {
-        keptMsgs.push(msg)
-      } else if (text.trim()) {
-        currentUserMsg = msg
-        keptMsgs.push(msg)
-        userMessageCount++
-      }
-    } else {
-      if (currentUserMsg) {
-        keptMsgs.push(msg)
-      } else if (text.trim()) {
-        currentUserMsg = msg
-        keptMsgs.push(msg)
-        userMessageCount++
-      }
+      renewed = true
+    } else if (ctx.sessionsEvaluated.has(key)) {
+      // Historical pre-checkpoint records cannot establish which content was consumed.
+      return outcome(
+        "failed",
+        "checkpoint_missing",
+        `Session "${sessionID}" has an evaluation without a saved checkpoint; evaluation was not replayed.`,
+      )
     }
-  }
-
-  if (
-    currentUserMsg &&
-    keptMsgs.length > 0 &&
-    keptMsgs[keptMsgs.length - 1] === currentUserMsg
-  ) {
-    keptMsgs.pop()
-    userMessageCount--
-  }
-
-  if (keptMsgs.length === 0) return null
-  if (minUserMessages > 0 && userMessageCount < minUserMessages) return null
-
-  // First pass: build all pairs, marking completeness.
-  // A pair is "complete" if the assistant response is followed by another
-  // user message (next turn started) OR if the session is idle (no more
-  // activity expected for the current turn).
-  interface InternalPair {
-    userInstruction: string
-    agentResponse: string
-    toolCalls: ToolCallRecord[]
-    subagentCalls: SubagentCallRecord[]
-    complete: boolean
-  }
-
-  const allPairs: InternalPair[] = []
-  let currentPairUser = ""
-  let currentPairResponse = ""
-  let currentPairToolCalls: ToolCallRecord[] = []
-  let currentPairSubagents: SubagentCallRecord[] = []
-
-  for (const msg of keptMsgs) {
-    const role = getMsgRole(msg)
-    const parts = Array.isArray(msg.parts) ? msg.parts : []
-    const text = parts
-      .filter((p) => p.type === "text" && typeof p.text === "string")
-      .map((p) => p.text as string)
-      .join(" ")
-
-    if (role === "user" || (!currentPairUser && text.trim())) {
+    const pending = pendingFromHistoryTurns(turns, key, segment.agentName, 1)
+    if (!pending) continue
+    pending.agentType = registry?.agentType ?? "primary"
+    pending.parentSessionID = registry?.parentSessionID
+    if (previous?.weaknesses.length)
+      pending.existingWeaknesses = previous.weaknesses
+    ctx.sessionsEvaluated.delete(key)
+    if (!(await runEvaluation(pending, ctx))) {
+      // A concurrent action may have committed this exact range while we waited for the mutex.
+      const concurrent = ctx.stateStore.getSession(key)
       if (
-        currentPairUser &&
-        (currentPairResponse.trim() || currentPairToolCalls.length > 0)
+        concurrent?.last_msg_id === pending.lastMessageId &&
+        ctx.sessionsEvaluated.has(key)
       ) {
-        allPairs.push({
-          userInstruction: currentPairUser,
-          agentResponse: currentPairResponse,
-          toolCalls: currentPairToolCalls,
-          subagentCalls: currentPairSubagents,
-          complete: true,
-        })
+        summaries.push(
+          `**${segment.agentName ?? "default"}**: already evaluated`,
+        )
+        continue
       }
-      currentPairUser = text
-      currentPairResponse = ""
-      currentPairToolCalls = []
-      currentPairSubagents = []
-    } else {
-      if (currentPairResponse) currentPairResponse += "\n"
-      currentPairResponse += text
-      currentPairToolCalls.push(...extractToolCallsFromMessages([msg]))
-      currentPairSubagents.push(...extractSubagentCallsFromMessages([msg]))
+      failed = true
+      summaries.push(`**${segment.agentName ?? "default"}**: evaluation failed`)
+      // Do not run later ranges after a failed range: no checkpoint can skip it.
+      break
     }
+    scoredKeys.push(key)
+    const record =
+      ctx.stateStore.getSession(key) ??
+      ctx.stateStore.getRecentSessions(200).find((s) => s.id === key)
+    const label = record
+      ? `${formatScore(record.score).emoji} ${formatScore(record.score).pct}%`
+      : "scored"
+    summaries.push(`**${segment.agentName ?? "default"}**: ${label}`)
+    if (record?.weaknesses.length)
+      summaries.push(`  - ${record.weaknesses.slice(0, 3).join(", ")}`)
   }
 
-  if (
-    currentPairUser &&
-    (currentPairResponse.trim() ||
-      currentPairToolCalls.length > 0 ||
-      currentPairSubagents.length > 0)
-  ) {
-    allPairs.push({
-      userInstruction: currentPairUser,
-      agentResponse: currentPairResponse,
-      toolCalls: currentPairToolCalls,
-      subagentCalls: currentPairSubagents,
-      complete: lastAssistantFollowedByUser || !!isIdle,
-    })
-  }
-
-  const pairs = allPairs.filter((p) => p.complete)
-  if (pairs.length === 0) return null
-
-  // Rebuild aggregated fields from complete pairs only.
-  let userInstruction = ""
-  const agentResponseParts: string[] = []
-  let hasAssistantResponse = false
-  const keptToolCalls: ToolCallRecord[] = []
-  const keptSubagentCalls: SubagentCallRecord[] = []
-
-  for (const pair of pairs) {
-    if (userInstruction) userInstruction += "\n---\n"
-    userInstruction += pair.userInstruction
-    if (pair.agentResponse.trim()) {
-      agentResponseParts.push(pair.agentResponse.slice(0, MAX_MESSAGE_CHARS))
-      hasAssistantResponse = true
-    }
-    keptToolCalls.push(...pair.toolCalls)
-    keptSubagentCalls.push(...pair.subagentCalls)
-  }
-
-  if (
-    !hasAssistantResponse &&
-    keptToolCalls.length === 0 &&
-    keptSubagentCalls.length === 0
-  )
-    return null
-
-  const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : undefined
-
-  const isCompacted = filteredMsgs.some((m) => {
-    const parts = Array.isArray(m.parts) ? m.parts : []
-    return parts.some(
-      (p: Record<string, unknown>) =>
-        p.type === "text" &&
-        typeof p.text === "string" &&
-        isCompressionOutput(p.text),
+  if (failed)
+    return outcome(
+      "failed",
+      "judge_failed",
+      `Evaluation failed for session "${sessionID}".\n${summaries.join("\n")}`,
+      scoredKeys,
     )
-  })
-
-  return {
-    sessionID: evalSessionID,
-    agentName,
-    userInstruction: userInstruction.slice(-MAX_USER_INSTRUCTION_CHARS),
-    agentResponseParts: agentResponseParts.slice(-MAX_MESSAGE_PARTS),
-    toolCalls: keptToolCalls.slice(-MAX_TOOL_CALLS_EVAL),
-    subagentCalls: keptSubagentCalls,
-    pairs: pairs.map((p) => ({
-      userInstruction: p.userInstruction.slice(-MAX_USER_INSTRUCTION_CHARS),
-      agentResponse: p.agentResponse.slice(0, MAX_MESSAGE_CHARS),
-      toolCalls: p.toolCalls,
-      subagentCalls: p.subagentCalls,
-    })),
-    compacted: isCompacted,
-    createdAt: Date.now(),
-    lastMessageId: lastMsg?.info?.id,
+  if (scoredKeys.length === 0)
+    return outcome(
+      "skipped",
+      "already_evaluated",
+      `This session has already been evaluated.\n${summaries.join("\n")}\n\nUse /kasper status for detailed results.`,
+    )
+  // This count is diagnostic only, never an authority for history completeness.
+  ctx.sessionMsgCount.set(sessionID, raw.length)
+  let detail: string
+  if (multiAgent) {
+    detail = `## Per-Agent Evaluation for Session "${sessionID}"\n\n${summaries.join("\n")}\n\nUse /kasper status for detailed results.`
+  } else {
+    const record =
+      ctx.stateStore.getSession(sessionID) ??
+      ctx.stateStore.getRecentSessions(200).find((s) => s.id === sessionID)
+    const label = record
+      ? `${formatScore(record.score).emoji} ${formatScore(record.score).pct}%`
+      : "scored"
+    detail = `${renewed ? "Re-evaluated" : "Manual evaluation for"} session "${sessionID}": ${label}`
+    if (record?.weaknesses.length)
+      detail += `\n\n**Weaknesses:** ${record.weaknesses.slice(0, 3).join(", ")}`
+    detail += "\n\nUse /kasper status for detailed results."
   }
+  return outcome("scored", "scored", detail, scoredKeys)
 }
 
 export async function manualEvaluateSession(
@@ -763,344 +648,17 @@ export async function manualEvaluateSession(
   agentHint?: string,
   evaluateChildren = true,
 ): Promise<string> {
-  if (!ctx.client.session.messages) {
-    return "Session message history is not available for manual evaluation."
+  const outcome = await evaluateSession(sessionID, ctx, agentHint)
+  let detail = outcome.detail
+  if (
+    evaluateChildren &&
+    (outcome.status === "scored" || outcome.reason === "already_evaluated")
+  ) {
+    const children = await evaluateChildSessions(sessionID, ctx, 0)
+    if (children.length)
+      detail += `\n\n### Subagent Sessions\n${children.map((c) => `- ${c.id}: ${c.result}`).join("\n")}`
   }
-
-  let messages: Awaited<
-    ReturnType<NonNullable<typeof ctx.client.session.messages>>
-  >
-  try {
-    messages = await ctx.client.session.messages({ path: { id: sessionID } })
-  } catch {
-    return `Failed to fetch messages for session "${sessionID}". The session may not exist or may have been deleted.`
-  }
-  const msgList = messages.data ?? []
-  await ctx.logger.log("manual_eval_msgs", {
-    sessionID,
-    msgCount: msgList.length,
-  })
-
-  if (!msgList || msgList.length === 0) {
-    return `No messages found for session "${sessionID}".`
-  }
-
-  let reEvaluated = false
-  let existingWeaknesses: string[] | undefined
-  let lastMsgId: string | undefined
-
-  if (ctx.sessionsEvaluated.has(sessionID)) {
-    const existingRecord = ctx.stateStore.getSession(sessionID)
-    const storedMsgId = existingRecord?.last_msg_id
-
-    if (storedMsgId) {
-      const foundIdx = msgList.findIndex((m) => m.info?.id === storedMsgId)
-      if (foundIdx === msgList.length - 1) {
-        await ctx.logger.log("manual_eval_skip", {
-          sessionID,
-          reason: "no_new_messages",
-        })
-        const { emoji, pct } = formatScore(existingRecord.score)
-        let msg = `This session has already been evaluated: ${emoji} ${pct}%`
-        if (existingRecord.weaknesses.length > 0) {
-          msg += `\n\n**Weaknesses:** ${existingRecord.weaknesses.slice(0, 3).join(", ")}`
-        }
-        msg += `\n\nUse /kasper status for detailed results.`
-        return msg
-      }
-      lastMsgId = storedMsgId
-      existingWeaknesses =
-        existingRecord.weaknesses.length > 0
-          ? existingRecord.weaknesses
-          : undefined
-    } else {
-      const prevCount = ctx.sessionMsgCount.get(sessionID)
-      if (prevCount !== undefined && msgList.length === prevCount) {
-        await ctx.logger.log("manual_eval_skip", {
-          sessionID,
-          reason: "already_in_evaluated_set",
-        })
-        const recent = ctx.stateStore.getRecentSessions(20)
-        const existing = recent.find((s) => s.id === sessionID)
-        if (existing) {
-          const { emoji, pct } = formatScore(existing.score)
-          let msg = `This session has already been evaluated: ${emoji} ${pct}%`
-          if (existing.weaknesses.length > 0) {
-            msg += `\n\n**Weaknesses:** ${existing.weaknesses.slice(0, 3).join(", ")}`
-          }
-          msg += `\n\nUse /kasper status for detailed results.`
-          return msg
-        }
-        return "This session has already been evaluated. Use /kasper status to view results."
-      }
-    }
-    ctx.sessionsEvaluated.delete(sessionID)
-    reEvaluated = true
-    await ctx.logger.log("manual_eval_renew", {
-      sessionID,
-      lastMsgId,
-      newCount: msgList.length,
-    })
-  }
-
-  const segments = detectAgentTransitions(msgList)
-  await ctx.logger.log("manual_eval_segments", {
-    sessionID,
-    segmentCount: segments.length,
-    agents: segments.map((s) => s.agentName),
-  })
-
-  if (segments.length <= 1) {
-    const detectedAgent = segments[0]?.agentName
-    const regAgent = ctx.agentRegistry.get(sessionID)?.agentName
-    const agentName = detectedAgent || agentHint || regAgent
-
-    await ctx.logger.log("manual_eval_build_eval", {
-      sessionID,
-      agentName,
-      detectedAgent,
-      agentHint,
-      regAgent,
-    })
-
-    // diagnose message structure
-    const msgRoles = msgList.map((m, i) => {
-      const role = getMsgRole(m) ?? "unknown"
-      const parts = Array.isArray(m.parts) ? m.parts : []
-      const textTypes = parts.filter(
-        (p) => p.type === "text" && typeof p.text === "string",
-      )
-      const toolUseTypes = parts.filter((p) => p.type === "tool_use")
-      const text = textTypes
-        .map((p) => (p as { text?: string }).text ?? "")
-        .join(" ")
-        .slice(0, 80)
-      return {
-        idx: i,
-        role,
-        parts: parts.length,
-        textTypes: textTypes.length,
-        toolUseTypes: toolUseTypes.length,
-        textPreview: text,
-      }
-    })
-    await ctx.logger.log("manual_eval_msg_diag", {
-      sessionID,
-      msgCount: msgList.length,
-      msgRoles,
-    })
-
-    const agentInfo = ctx.agentRegistry.get(sessionID)
-    const minUserMsgs =
-      agentInfo?.agentType === "subagent" ? 1 : ctx.config.min_session_messages
-
-    const pending = buildEvalFromMessages(
-      msgList,
-      sessionID,
-      agentName,
-      minUserMsgs,
-      ctx.registeredCommands,
-      lastMsgId,
-      true,
-    )
-    if (!pending && minUserMsgs > 1) {
-      // Retry with minUserMsgs=1 so explicit manual eval still scores
-      // sessions that have fewer user messages than the auto-poll threshold.
-      const fallbackPending = buildEvalFromMessages(
-        msgList,
-        sessionID,
-        agentName,
-        1,
-        ctx.registeredCommands,
-        lastMsgId,
-        true,
-      )
-      if (fallbackPending) {
-        await ctx.logger.log("manual_eval_fallback", {
-          sessionID,
-          agentName,
-          originalMin: minUserMsgs,
-          fallbackMin: 1,
-          userMsgCount: fallbackPending.userInstruction ? 1 : 0,
-        })
-        const evalOk = await runEvaluation(fallbackPending, ctx)
-        if (evalOk) {
-          ctx.sessionMsgCount.set(sessionID, msgList.length)
-        }
-        const recent = ctx.stateStore.getRecentSessions(5)
-        const session = recent.find((s) => s.id === sessionID)
-
-        await ctx.logger.log("manual_eval_after_run", {
-          sessionID,
-          foundInRecent: !!session,
-          totalSessionsInStore:
-            typeof ctx.stateStore.getTotalSessions === "function"
-              ? ctx.stateStore.getTotalSessions()
-              : undefined,
-          reEvaluated,
-          fallback: true,
-        })
-
-        if (session) {
-          const { emoji, pct } = formatScore(session.score)
-          let msg = `Session scored: ${emoji} ${pct}%`
-          if (session.weaknesses.length > 0) {
-            msg += `\n\n**Weaknesses:** ${session.weaknesses.slice(0, 3).join(", ")}`
-          }
-          msg += `\n\n*Note: This session only had 1 user message, so the usual threshold (${minUserMsgs}) was bypassed for manual evaluation.*`
-          return msg
-        }
-        return "Session scored successfully."
-      }
-    }
-    if (!pending) {
-      const diag = {
-        sessionID,
-        agentName,
-        msgCount: msgList.length,
-        roles: msgRoles
-          .map(
-            (r) =>
-              `${r.idx}:${r.role}(text=${r.textTypes},tool=${r.toolUseTypes})`,
-          )
-          .join("|"),
-      }
-      await ctx.logger.log("manual_eval_no_pending", diag)
-      return `No user messages found in session "${sessionID}".`
-    }
-    if (existingWeaknesses) {
-      pending.existingWeaknesses = existingWeaknesses
-    }
-
-    if (agentInfo) {
-      pending.agentType = agentInfo.agentType
-      pending.parentSessionID = agentInfo.parentSessionID
-    } else if (!agentName) {
-      pending.agentType = "primary"
-    }
-
-    await ctx.logger.log("manual_eval_pending", {
-      sessionID,
-      agentName,
-      userInstructionLen: pending.userInstruction.length,
-      responseParts: pending.agentResponseParts.length,
-      toolCalls: pending.toolCalls.length,
-      pairs: pending.pairs.length,
-    })
-
-    const evalOk = await runEvaluation(pending, ctx)
-    if (evalOk) {
-      ctx.sessionMsgCount.set(sessionID, msgList.length)
-    }
-    const recent = ctx.stateStore.getRecentSessions(5)
-    const session = recent.find((s) => s.id === sessionID)
-
-    await ctx.logger.log("manual_eval_after_run", {
-      sessionID,
-      foundInRecent: !!session,
-      totalSessionsInStore:
-        typeof ctx.stateStore.getTotalSessions === "function"
-          ? ctx.stateStore.getTotalSessions()
-          : undefined,
-      recentIDs: recent.map((s) => s.id),
-    })
-
-    let msg: string
-    if (session) {
-      const scorePct = (session.score * 100).toFixed(0)
-      const { emoji: scoreEmoji } = formatScore(session.score)
-      msg = `${reEvaluated ? "Re-evaluated" : "Manual evaluation for"} session "${sessionID}": ${scoreEmoji} ${scorePct}%`
-      if (reEvaluated) msg += ` (${msgList.length} messages)`
-      if (session.weaknesses.length > 0) {
-        msg += `\n\n**Weaknesses:** ${session.weaknesses.slice(0, 3).join(", ")}`
-      }
-    } else {
-      msg = `Manual evaluation triggered for session "${sessionID}". Check /kasper status for results.`
-    }
-
-    if (evaluateChildren) {
-      const childResults = await evaluateChildSessions(sessionID, ctx, 0)
-      if (childResults.length > 0) {
-        msg += `\n\n### Subagent Sessions`
-        for (const child of childResults) {
-          msg += `\n- ${child.id.slice(0, 8)}: ${child.result}`
-        }
-      }
-    }
-
-    return msg
-  }
-
-  for (const seg of segments) {
-    const agentName = seg.agentName || "default"
-    const evalKey = `${sessionID}|agent:${agentName}`
-
-    if (ctx.sessionsEvaluated.has(evalKey)) continue
-
-    const agentInfo = ctx.agentRegistry.get(sessionID)
-    const minUserMsgs =
-      agentInfo?.agentType === "subagent" ? 1 : ctx.config.min_session_messages
-
-    const pending = buildEvalFromMessages(
-      seg.msgs,
-      evalKey,
-      seg.agentName,
-      minUserMsgs,
-      ctx.registeredCommands,
-      undefined,
-      true,
-    )
-    if (!pending) continue
-    if (agentInfo) {
-      pending.agentType = agentInfo.agentType
-      pending.parentSessionID = agentInfo.parentSessionID
-    }
-
-    await runEvaluation(pending, ctx)
-  }
-
-  ctx.sessionsEvaluated.add(sessionID)
-  ctx.sessionMsgCount.set(sessionID, msgList.length)
-
-  const allSessions = ctx.stateStore.getRecentSessions(200)
-  const lines: string[] = [
-    reEvaluated
-      ? `## Re-evaluated Session (${msgList.length} messages)`
-      : `## Per-Agent Evaluation for Session`,
-    ``,
-  ]
-  for (const seg of segments) {
-    const agentName = seg.agentName || "default"
-    const evalKey = `${sessionID}|agent:${agentName}`
-    const record = allSessions.find((s) => s.id === evalKey)
-    if (record) {
-      const scorePct = (record.score * 100).toFixed(0)
-      const { emoji: scoreEmoji } = formatScore(record.score)
-      lines.push(
-        `**${seg.agentName || "default"}**: ${scoreEmoji} ${scorePct}%`,
-      )
-      if (record.weaknesses.length > 0) {
-        for (const w of record.weaknesses.slice(0, 2)) {
-          lines.push(`  - ${w}`)
-        }
-      }
-    } else {
-      lines.push(`**${seg.agentName || "default"}**: (not evaluated)`)
-    }
-  }
-  lines.push(``, `Use /kasper status for detailed results.`)
-
-  if (evaluateChildren) {
-    const childResults = await evaluateChildSessions(sessionID, ctx, 0)
-    if (childResults.length > 0) {
-      lines.push(``, `### Subagent Sessions`)
-      for (const child of childResults) {
-        lines.push(`- ${child.id.slice(0, 8)}: ${child.result}`)
-      }
-    }
-  }
-
-  return lines.join("\n")
+  return detail
 }
 
 export async function evaluateChildSessions(
@@ -1108,8 +666,10 @@ export async function evaluateChildSessions(
   ctx: KasperContext,
   depth: number,
   maxDepth = 3,
+  visited = new Set<string>(),
 ): Promise<Array<{ id: string; result: string }>> {
-  if (depth >= maxDepth) return []
+  if (depth >= maxDepth || visited.has(parentID)) return []
+  visited.add(parentID)
 
   const childIDs = new Set<string>()
   const childAgentHints = new Map<string, string>()
@@ -1152,36 +712,27 @@ export async function evaluateChildSessions(
 
   const results: Array<{ id: string; result: string }> = []
   for (const cid of childIDs) {
-    if (ctx.sessionsEvaluated.has(cid)) {
-      results.push({ id: cid, result: "already evaluated" })
-      continue
-    }
+    if (visited.has(cid) || ctx.kasperSessionIDs.has(cid)) continue
     try {
-      const childResult = await manualEvaluateSession(
+      const child = await evaluateSession(cid, ctx, childAgentHints.get(cid))
+      if (child.status === "scored" || child.reason === "already_evaluated") {
+        results.push({
+          id: cid,
+          result: child.detail.split("\n")[0] ?? "scored",
+        })
+      } else if (
+        child.status === "failed" &&
+        child.reason !== "history_unavailable"
+      ) {
+        results.push({ id: cid, result: child.detail })
+      }
+      const deeper = await evaluateChildSessions(
         cid,
         ctx,
-        childAgentHints.get(cid),
+        depth + 1,
+        maxDepth,
+        visited,
       )
-      if (
-        childResult.startsWith("No user messages") ||
-        childResult.startsWith("No messages") ||
-        childResult.startsWith("Session message history") ||
-        childResult.startsWith("Failed to fetch")
-      ) {
-        continue
-      }
-      if (/\b0%/.test(childResult.split("\n")[0] ?? "")) {
-        continue
-      }
-      results.push({
-        id: cid,
-        result:
-          childResult
-            .split("\n")[0]
-            ?.replace(/^Manual evaluation for session "[^"]+": /, "") ??
-          "scored",
-      })
-      const deeper = await evaluateChildSessions(cid, ctx, depth + 1, maxDepth)
       results.push(...deeper)
     } catch {
       results.push({ id: cid, result: "evaluation failed" })
@@ -1195,121 +746,63 @@ export async function batchEvaluateSessions(
   ctx: KasperContext,
   agentHints?: Map<string, string>,
 ): Promise<string> {
-  const results: Array<{ id: string; status: string; detail: string }> = []
-  await ctx.logger.log("batch_evaluate_start", {
-    totalIDs: sessionIDs.length,
-  })
-  let idx = 0
-  for (const id of sessionIDs) {
-    idx++
-    if (idx % 100 === 0 || idx === 1 || idx === sessionIDs.length) {
-      await ctx.logger.log("batch_evaluate_progress", {
-        index: idx,
-        total: sessionIDs.length,
-        sessionID: id,
-      })
-    }
-    let result: string
+  const outcomes: EvaluationOutcome[] = []
+  await ctx.logger.log("batch_evaluate_start", { totalIDs: sessionIDs.length })
+  for (const id of new Set(sessionIDs)) {
     try {
-      result = await manualEvaluateSession(id, ctx, agentHints?.get(id), false)
-    } catch (err) {
-      await ctx.logger.log("batch_eval_error", {
+      outcomes.push(await evaluateSession(id, ctx, agentHints?.get(id)))
+    } catch (error) {
+      outcomes.push({
         sessionID: id,
-        error: String(err),
-      })
-      results.push({ id, status: "error", detail: String(err) })
-      continue
-    }
-    if (result.startsWith("Manual evaluation")) {
-      const scoreMatch = result.match(/(\d+)%/)
-      const score = scoreMatch ? parseInt(scoreMatch[1], 10) : -1
-      if (score <= 0) {
-        results.push({ id, status: "skipped", detail: `empty session (0%)` })
-        await ctx.logger.log("batch_eval_result", {
-          sessionID: id,
-          status: "skipped_empty",
-          result: result.slice(0, 120),
-        })
-      } else {
-        results.push({ id, status: "ok", detail: result })
-        await ctx.logger.log("batch_eval_result", {
-          sessionID: id,
-          status: "ok",
-          score,
-        })
-      }
-    } else if (
-      result.startsWith("Failed to fetch") ||
-      result.startsWith("No messages") ||
-      result.startsWith("No user messages")
-    ) {
-      results.push({ id, status: "skipped", detail: "no evaluable content" })
-      await ctx.logger.log("batch_eval_result", {
-        sessionID: id,
-        status: "skipped_no_content",
-        result: result.slice(0, 120),
-      })
-    } else if (result.startsWith("This session has already")) {
-      results.push({ id, status: "skipped", detail: "already evaluated" })
-      await ctx.logger.log("batch_eval_result", {
-        sessionID: id,
-        status: "skipped_already_eval",
-      })
-    } else {
-      results.push({ id, status: "ok", detail: result })
-      await ctx.logger.log("batch_eval_result", {
-        sessionID: id,
-        status: "ok_fallback",
-        result: result.slice(0, 120),
+        status: "failed",
+        reason: "judge_failed",
+        detail: String(error),
+        scoredKeys: [],
       })
     }
+    const result = outcomes.at(-1)
+    if (!result) continue
+    await ctx.logger.log("batch_eval_result", {
+      sessionID: id,
+      status: result.status,
+      reason: result.reason,
+    })
   }
-
-  const ok = results.filter((r) => r.status === "ok")
-  const skipped = results.filter((r) => r.status === "skipped")
-  const errors = results.filter((r) => r.status === "error")
-
-  const aggAfter = ctx.stateStore.getAggregate()
+  const scored = outcomes.filter((o) => o.status === "scored")
+  const skipped = outcomes.filter((o) => o.status === "skipped")
+  const failed = outcomes.filter((o) => o.status === "failed")
   await ctx.logger.log("batch_evaluate_done", {
     totalInput: sessionIDs.length,
-    ok: ok.length,
+    ok: scored.length,
     skipped: skipped.length,
-    errors: errors.length,
-    sessionsEvaluated: ctx.sessionsEvaluated.size,
-    aggregateTotalSessions: aggAfter.total_sessions,
-    aggregateAvgScore: aggAfter.avg_score,
+    errors: failed.length,
   })
-
   const lines: string[] = []
-  if (ok.length > 0) {
-    lines.push(`## Batch Evaluation — ${ok.length} session(s) evaluated`)
-    for (const r of ok) {
-      lines.push(``, `${r.detail}`)
-    }
-  }
-  if (skipped.length > 0) {
-    const emptyCount = skipped.filter(
-      (r) =>
-        r.detail === "no evaluable content" ||
-        r.detail.startsWith("empty session"),
-    ).length
-    const dupeCount = skipped.filter(
-      (r) => r.detail === "already evaluated",
-    ).length
-    const parts: string[] = []
-    if (emptyCount > 0) parts.push(`${emptyCount} empty/no-content`)
-    if (dupeCount > 0) parts.push(`${dupeCount} already evaluated`)
+  if (scored.length)
     lines.push(
-      ``,
-      `**Skipped**: ${skipped.length} session(s) (${parts.join(", ")})`,
+      `## Batch Evaluation ? ${scored.length} session(s) evaluated`,
+      ...scored.map((o) => `\n${o.detail}`),
+    )
+  if (skipped.length) {
+    const empty = skipped.filter(
+      (o) => o.reason === "no_content" || o.reason === "incomplete",
+    ).length
+    const duplicate = skipped.filter(
+      (o) => o.reason === "already_evaluated",
+    ).length
+    const reasons = [
+      ...(empty ? [`${empty} empty/no-content or incomplete`] : []),
+      ...(duplicate ? [`${duplicate} already evaluated`] : []),
+    ]
+    lines.push(
+      `\n**Skipped**: ${skipped.length} session(s)${reasons.length ? ` (${reasons.join(", ")})` : ""}`,
     )
   }
-  if (errors.length > 0) {
-    lines.push(``, `**Errors**:`)
-    for (const r of errors) {
-      lines.push(`- ${r.id}: ${r.detail}`)
-    }
-  }
+  if (failed.length)
+    lines.push(
+      "\n**Errors**:",
+      ...failed.map((o) => `- ${o.sessionID}: ${o.detail}`),
+    )
   return lines.join("\n")
 }
 

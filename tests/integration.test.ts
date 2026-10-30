@@ -45,7 +45,13 @@ function makeClient(structuredOutput?: Record<string, unknown>) {
               parts: [{ type: "text", text: "original request" }],
             },
             {
-              info: { id: `${sid}-a1`, role: "assistant", sessionID: sid },
+              info: {
+                id: `${sid}-a1`,
+                role: "assistant",
+                sessionID: sid,
+                time: { completed: Date.now() },
+                finish: "stop",
+              },
               parts: [{ type: "text", text: "response" }],
             },
           ],
@@ -1860,7 +1866,13 @@ describe("edge cases", () => {
               parts: [{ type: "text", text: "write feature" }],
             },
             {
-              info: { id: `${sid}-a1`, role: "assistant", sessionID: sid },
+              info: {
+                id: `${sid}-a1`,
+                role: "assistant",
+                sessionID: sid,
+                time: { completed: Date.now() },
+                finish: "stop",
+              },
               parts: [{ type: "text", text: "done" }],
             },
           ],
