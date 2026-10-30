@@ -56,10 +56,12 @@ No force resets, global config rewrites, publication, or title-based deletion of
 | C07 | Integrated | history_scoring | `73df794` (agent `81790fa`); lifecycle/actions/strict commit fences. Combined integrated tests: 575 top-level passed. |
 | C08 | Integrated | history_scoring | `e04dcea` (agent `eeebed8`); 644 offline passed/27 skipped; pinned schemas, archive provenance/pagination and cancellation. |
 | C09 | Integrated | storage_instructions | `b700102` (agent `a54d43a`); 21 focused source tests, 650 offline passed/27 skipped; strict provenance and incomplete-coverage write fences. |
-| C10 | In progress | history_scoring | Native Effect server entry, event/actions/tools and terminal result integration. |
+| C10 | Integrated; native fixup in progress | history_scoring | `55fca50` (agent `5ad57cc`); native setup/dual exports/direct actions/results. Full offline 694 passed/27 skipped; final integration 59 passed. |
 | C11 | In progress | lifecycle_commands | Isolated packaged V1/V2 fixtures; final implementation acceptance follows C10. |
 | C12 | In progress | storage_instructions | Documentation preparation; final support claims follow C11 evidence. |
 
 The baseline review passed 490 offline tests, build and typecheck; lint had two existing unused-suppression warnings. That is the starting baseline, not migration acceptance.
 
 Combined C01-C09 verification: 625 top-level tests passed across 29 files (1,544 assertions); typecheck passed. C06/C08 integration conflicts were additive imports and optional port fields, both preserved. C07 disposal/deletion regression fix is integrated as `16e991d` (agent `414bb34`). Native provider and complete packaged product acceptance remain C11 work.
+
+C04 staging-conflict fix integrated as `ba714ea` (agent `84caa0a`): external-edit overwrite reproduced, then six regression tests; 126 focused passed. After C10 integration, 642 top-level tests passed across 32 files (1,648 assertions), and typecheck/contracts/build passed. C11 actual package probes passed native setup/direct commands/status/result replay without generation, then found cursor/order pagination incompatibility; this is being corrected before final acceptance. SDK fixtures proved dual server classifiers on V1 1.18.23 and native 2.2.2, plus legacy TUI loader acceptance. These fixture results are separate from final packaged Kasper qualification.
