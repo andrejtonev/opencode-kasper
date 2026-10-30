@@ -7,6 +7,7 @@ Verified on Windows on 2026-10-30, against actual OpenCode 1.18.23 and `@opencod
 | Boundary | Result | Evidence |
 |---|---|---|
 | Production package / V1 1.18.23 | Passed: package directory resolves `./server`; dual default selects legacy `server()`; actual tool registry contains `kasper_control` and six compatibility tools | `kasper-sdk-native-xRYz5P/result.json`, `tool-ids.json`, project `kasper.log` |
+| Production V1 judge tool isolation | Passed: installed production port exposes no tools; malicious provider `write` response receives terminal unavailable-tool denial; isolated file remains absent; exact owned judge session is deleted | `kasper-sdk-native-HNb8RR/v1-generation.json`, provider receipts |
 | Production package / V2 2.2.2 | Passed: same package resolves `./server`; Effect setup completes | `kasper-sdk-native-RUKLFE/result.json`, `server.log` |
 | Production native administrative action | Passed: RPC status, same-request replay and native session command produce no provider requests and no durable chat messages | `packaged-actions.json` administrative section |
 | Production native TUI result | Passed: actual native terminal renderer displays `Kasper status` from native command result event | `tui.log`, `packaged-actions.json` tui section |
@@ -27,6 +28,7 @@ All artifact paths below are relative to `%TEMP%`.
 
 - Final production V2: `kasper-sdk-native-RUKLFE/`. Contains `result.json`, `packaged-actions.json`, complete `provider-receipts.json`, raw ANSI `tui.log`, `server.log`, packed archive, installed consumer and isolated project/state.
 - Final production V1: `kasper-sdk-native-xRYz5P/`. Contains `result.json`, actual `tool-ids.json`, server logs, exact packed archive, installed consumer and isolated project/state.
+- Final guarded production V1 generation: `kasper-sdk-native-HNb8RR/`, built with guard commit `88b33c5`. Contains `result.json`, `v1-generation.json`, complete provider receipts, archive and installed consumer.
 - Earlier complete V2 reset/TUI evidence: `kasper-sdk-native-oBzapW/`.
 - Real built-in instruction coverage rejection: `kasper-sdk-native-wal0UA/`.
 - Real initial archive pagination rejection: `kasper-sdk-native-lJTy5e/`; fixed before final acceptance.
@@ -47,6 +49,10 @@ The final delayed provider receipt records:
 Thus native Effect interruption and lifecycle fences prevented the late score from restoring cleared state, while the actual local HTTP provider still completed its delayed response. Neither transport interruption nor these tests prove provider termination, avoided billing, or a spend ceiling. No overlapping retry was dispatched. Unknown outcomes remain conservatively quarantined by the generation port.
 
 The native provider received streaming chat-completion requests without `max_tokens` or `max_completion_tokens`, despite fixture model metadata declaring `limit.output: 512`. The public plugin generation API does not expose an enforced output-token bound. `enforcedOutputLimit: false` remains the accurate capability declaration. Retained output and input evidence are bounded locally; those are not provider token limits.
+
+The separate V1 forced-tool probe imports `createV1Generation` from the **installed archive's** `dist/hosts/v1-generation.js` and supplies the real public V1 SDK client. Both scoring and merging now set the public prompt option `tools: {"*": false}`. Actual host 1.18.23 persists that wildcard denial before execution and removes tools from the outgoing model request. A malicious local provider still emits a `write` call targeting only `project/forbidden-judge-write.txt`. The next request contains the actual terminal tool result: `Model tried to call unavailable tool 'invalid'. Available tools: .`. The final continuation returns the expected 0.8 JSON; the file remains absent and the single owned/released ID `ses_e7397f0c1ffez6GTF1PDI6CQi1` is absent from the subsequent public session listing. Two HTTP requests are expected here: forced tool response plus terminal continuation, with no diagnostic judge call. Automatic polling is set to one hour and uses only the explicitly enabled fixture provider.
+
+This V1 fixture request includes `max_tokens: 512` from its host model metadata, unlike the measured V2 request. That observation does not add a universal per-call generation-port token-limit capability. The immutable V1 source trace and serialized public SDK contract are recorded in `V2-C10-V1-TOOL-ISOLATION.md`.
 
 ## Package and loader facts
 
@@ -72,6 +78,7 @@ Build first: `bun install --frozen-lockfile`, `bun run build`.
 
 ```
 bun scripts/verify-native-sdk.ts <absolute-1.18.23-executable> v1 production
+bun scripts/verify-native-sdk.ts <absolute-1.18.23-executable> v1 v1-generation
 bun scripts/verify-native-sdk.ts <absolute-2.2.2-executable> v2 production tui
 bun scripts/verify-native-sdk.ts <absolute-1.18.23-executable> v1 fixture tui
 bun scripts/verify-native-sdk.ts <absolute-2.2.2-executable> v2 provider tui
@@ -79,4 +86,4 @@ bun scripts/verify-native-sdk.ts <absolute-2.2.2-executable> v2 provider tui
 
 The `tui` modes require a PTY. Child hosts use a whitelisted environment, isolated HOME/XDG/config/data/cache/temp directories, fixture Basic authentication, and hidden supervised processes. The provider listens only on loopback, accepts only explicit fixture credentials/models, never proxies, and records every request. Provider policy denies all non-fixture providers; no external or paid model request is authorized or dispatched. The harness retains artifacts and terminates only its own host children.
 
-Final verification: **702 passed, 27 skipped, 0 failed**, 1717 assertions across 45 files. Frozen install, production build, application typecheck, pinned SDK contract typecheck and strict independent harness/helper typechecks passed. Lint passed with the two pre-existing unused-suppression warnings in e2e files. The opt-in external/model e2e suite remains skipped; native acceptance here uses the deterministic local provider.
+Final verification including the V1 tool guard: **704 passed, 27 skipped, 0 failed**, 1725 assertions across 45 files. Frozen install, production build, application typecheck, pinned SDK contract typecheck and strict independent harness/helper typechecks passed. The focused generation suite additionally passed 14 tests with 59 assertions. Lint passed with the two pre-existing unused-suppression warnings in e2e files. The opt-in external/model e2e suite remains skipped; native acceptance here uses the deterministic local provider.

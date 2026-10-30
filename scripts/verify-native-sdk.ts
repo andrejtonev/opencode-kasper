@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { OpenCode } from "@opencode/client"
 import { nativeProviderFixture } from "./native-provider-fixture.js"
 import { verifyPackagedActions } from "./verify-packaged-actions.js"
+import { verifyV1Generation } from "./verify-v1-generation.js"
 
 let fixture = fileURLToPath(
   new URL("../tests/fixtures/sdk-host", import.meta.url),
@@ -15,12 +16,13 @@ const executable = process.argv[2]
 const generation = process.argv[3]
 const providerTest = process.argv[4] === "provider"
 const legacyFileTest = process.argv[4] === "legacy-file"
-const productionTest = process.argv[4] === "production"
+const v1GenerationTest = process.argv[4] === "v1-generation"
+const productionTest = process.argv[4] === "production" || v1GenerationTest
 const tuiTest = process.argv[5] === "tui"
 if (productionTest) fixture = fileURLToPath(new URL("..", import.meta.url))
 if (!executable || (generation !== "v1" && generation !== "v2")) {
   throw new Error(
-    "Usage: bun scripts/verify-native-sdk.ts <absolute host executable> <v1|v2> [fixture|legacy-file|provider|production] [tui]",
+    "Usage: bun scripts/verify-native-sdk.ts <absolute host executable> <v1|v2> [fixture|legacy-file|provider|production|v1-generation] [tui]",
   )
 }
 if (!path.isAbsolute(executable))
@@ -160,10 +162,23 @@ if (legacyFileTest) {
   )
 }
 const provider =
-  (providerTest || productionTest) && generation === "v2"
+  ((providerTest || productionTest) && generation === "v2") || v1GenerationTest
     ? await nativeProviderFixture()
     : undefined
 if (!productionTest) provider?.respond({ text: "native-local-provider-result" })
+if (v1GenerationTest) {
+  await mkdir(path.join(project, ".opencode"), { recursive: true })
+  await writeFile(
+    path.join(project, ".opencode", "kasper.json"),
+    JSON.stringify({
+      enabled: true,
+      auto_update: false,
+      model: "fixture/judge",
+      evaluation_poll_interval_ms: 3600000,
+      scoring_retries: 0,
+    }),
+  )
+}
 const specification =
   generation === "v2"
     ? {
@@ -240,6 +255,28 @@ const specification =
           : {}),
       }
     : {
+        ...(provider
+          ? {
+              enabled_providers: ["fixture"],
+              provider: {
+                fixture: {
+                  npm: "@ai-sdk/openai-compatible",
+                  name: "fixture",
+                  options: {
+                    baseURL: provider.baseURL,
+                    apiKey: "kasper-local-fixture",
+                  },
+                  models: {
+                    judge: {
+                      name: "judge",
+                      limit: { context: 32768, output: 512 },
+                      cost: { input: 0, output: 0 },
+                    },
+                  },
+                },
+              },
+            }
+          : {}),
         plugin: [
           pathToFileURL(
             productionTest
@@ -281,7 +318,7 @@ let report: Record<string, unknown> | undefined
 let lastResponse = ""
 let lastPayload = ""
 try {
-  const deadline = Date.now() + 30000
+  const deadline = Date.now() + (v1GenerationTest ? 60000 : 30000)
   while (Date.now() < deadline) {
     try {
       // Loading is location-scoped. No session prompt or provider endpoint is called.
@@ -357,6 +394,14 @@ try {
       throw new Error("Packaged V1 control tool was not registered")
     report.toolRegistered = "kasper_control"
     await writeFile(path.join(root, "tool-ids.json"), lastPayload)
+    if (v1GenerationTest && provider)
+      report.generation = await verifyV1Generation(
+        installed,
+        `http://127.0.0.1:${port}`,
+        project,
+        provider,
+        root,
+      )
   }
   if (tuiTest && !productionTest) {
     const terminal = run(
