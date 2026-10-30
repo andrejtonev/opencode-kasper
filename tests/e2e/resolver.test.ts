@@ -12,7 +12,7 @@
  * the bug fix scenario from the original report.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { execSync } from "node:child_process"
+import { execFileSync, execSync } from "node:child_process"
 import {
   existsSync,
   mkdtempSync,
@@ -101,16 +101,9 @@ describe.skipIf(!ENABLED)(
         // generate an improvement and inject it.
         const userMessage =
           "Please review: pretend there is a 5-line PR to review."
-        const cmd = [
-          "opencode",
-          "run",
-          "--agent",
-          "pr-reviewer",
-          "--message",
-          JSON.stringify(userMessage),
-        ].join(" ")
+        const args = ["run", "--agent", "pr-reviewer", "--message", userMessage]
         try {
-          execSync(cmd, {
+          execFileSync("opencode", args, {
             cwd: projectDir,
             stdio: "pipe",
             timeout: 90_000,

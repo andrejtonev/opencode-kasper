@@ -38,20 +38,23 @@ Each agent verified the relevant pinned contracts, implemented its owned surface
 
 | Chunk | Agent | Integrated implementation |
 | --- | --- | --- |
-| C01: history and evaluation correctness | history_scoring | `87aafe3` |
-| C02: scoring validation and grouping | lifecycle_commands | `e8c1176` |
-| C03: persistent state, locks and writes | storage_instructions | `756bc8b` |
-| C04: instruction/config transactions | storage_instructions | `c1af22c`, staging fix `ba714ea` |
-| C05: pinned SDK and loader contracts | lifecycle_commands | `faafa4d` |
-| C06: shared generation and V1 adapter | lifecycle_commands | `4885f53`; final V1 tool guard by history_scoring: `dcc0519` |
-| C07: lifecycle/actions and V1 routing | history_scoring | `73df794`, disposal/deletion fix `16e991d` |
-| C08: V2 history and shared evaluation | history_scoring | `e04dcea` |
-| C09: V2 instruction provenance | storage_instructions | `b700102` |
-| C10: native setup, commands/tools/TUI | history_scoring | `55fca50`, pagination/event supervision `2ea8ce3`, child provenance `0b3a48a`, child threshold `1d9b8b6` |
-| C11: packaged native acceptance | lifecycle_commands | `30a0117`, V1 denial `92d06b2`, child after reload `9c4161f`; runtime evidence in [V2-NATIVE-ACCEPTANCE.md](V2-NATIVE-ACCEPTANCE.md) |
-| C12: installation/support/release docs | storage_instructions | `5bbf228`, final safety clarification `3de4f01` |
+| C01: history and evaluation correctness | history_scoring | `ecd9045` |
+| C02: scoring validation and grouping | lifecycle_commands | `00ae107` |
+| C03: persistent state, locks and writes | storage_instructions | `fcf074c` |
+| C04: instruction/config transactions | storage_instructions | `93062c1`, staging fix `fc05924` |
+| C05: pinned SDK and loader contracts | lifecycle_commands | `ef92e84` |
+| C06: shared generation and V1 adapter | lifecycle_commands | `6c7f2fa`; final V1 tool guard by history_scoring: `21177d2` |
+| C07: lifecycle/actions and V1 routing | history_scoring | `b58429a`, disposal/deletion fix `a962284` |
+| C08: V2 history and shared evaluation | history_scoring | `633ebd9` |
+| C09: V2 instruction provenance | storage_instructions | `93c4044` |
+| C10: native setup, commands/tools/TUI | history_scoring | `b289b96`, pagination/event supervision `52a8157`, child provenance `2bf6a46`, child threshold `45217b6` |
+| C11: packaged native acceptance | lifecycle_commands | `5cf6a56`, V1 denial `b5d966d`, child after reload `815e255`; runtime evidence in [V2-NATIVE-ACCEPTANCE.md](V2-NATIVE-ACCEPTANCE.md) |
+| C12: installation/support/release docs | storage_instructions | `063084a`, final safety clarification `cbf3f99` |
 
-The ledger retains original agent commit IDs and per-chunk tests. Additional source-grounded V1 tool isolation is documented in [V2-C10-V1-TOOL-ISOLATION.md](V2-C10-V1-TOOL-ISOLATION.md).
+The ledger retains sanitized agent and integration commit IDs and per-chunk tests.
+References were refreshed after the identity cleanup so they resolve in the current
+Git history. Additional source-grounded V1 tool isolation is documented in
+[V2-C10-V1-TOOL-ISOLATION.md](V2-C10-V1-TOOL-ISOLATION.md).
 
 ## What the real hosts verified
 

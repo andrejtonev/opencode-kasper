@@ -1,6 +1,6 @@
 # C11 native package acceptance
 
-Verified on Windows on 2026-10-30, against actual OpenCode 1.18.23 and `@opencode/cli@2.2.2`. The package tested was built from C10 commit `5ad57cc` plus instruction staging fix `87e991c` and pagination/lifecycle fix `dbe991d`, then packed and installed into isolated consumers. This is local package and local provider acceptance, not publication or external-provider qualification.
+Verified on Windows on 2026-10-30, against actual OpenCode 1.18.23 and `@opencode/cli@2.2.2`. The package tested was built from C10 commit `9e8f70c` plus instruction staging fix `a014bea` and pagination/lifecycle fix `3bae53d`, then packed and installed into isolated consumers. This is local package and local provider acceptance, not publication or external-provider qualification.
 
 ## Results
 
@@ -28,9 +28,9 @@ Production V1 TUI result delivery is intentionally not a parity claim: its compa
 All artifact paths below are relative to `%TEMP%`.
 
 - Final production V2: `kasper-sdk-native-RUKLFE/`. Contains `result.json`, `packaged-actions.json`, complete `provider-receipts.json`, raw ANSI `tui.log`, `server.log`, packed archive, installed consumer and isolated project/state.
-- Subsequent production V2 child-provenance qualification: `kasper-sdk-native-eiZlgf/`, including trusted child guard `34183bc`. All prior native V2 checks pass, followed by one real child work request and one historical child judge request after another reload.
+- Subsequent production V2 child-provenance qualification: `kasper-sdk-native-eiZlgf/`, including trusted child guard `934f5e1`. All prior native V2 checks pass, followed by one real child work request and one historical child judge request after another reload.
 - Final production V1: `kasper-sdk-native-xRYz5P/`. Contains `result.json`, actual `tool-ids.json`, server logs, exact packed archive, installed consumer and isolated project/state.
-- Final guarded production V1 generation: `kasper-sdk-native-HNb8RR/`, built with guard commit `88b33c5`. Contains `result.json`, `v1-generation.json`, complete provider receipts, archive and installed consumer.
+- Final guarded production V1 generation: `kasper-sdk-native-HNb8RR/`, built with guard commit `449dafe`. Contains `result.json`, `v1-generation.json`, complete provider receipts, archive and installed consumer.
 - Earlier complete V2 reset/TUI evidence: `kasper-sdk-native-oBzapW/`.
 - Real built-in instruction coverage rejection: `kasper-sdk-native-wal0UA/`.
 - Real initial archive pagination rejection: `kasper-sdk-native-lJTy5e/`; fixed before final acceptance.
@@ -92,6 +92,13 @@ neither plugin SDK installed: the optional legacy peer and type-only native
 imports prevent unnecessary runtime dependency installation. The V1 tool factory
 uses the patched local Zod schema with the public identity-factory contract.
 These checks use the local fixture provider and make no paid model requests.
+
+The strengthened V1 generation probe also invokes `kasper_control` through the
+actual native host after the forced-tool denial check. Only that tool is
+advertised; the host converts its patched Zod schema, validates `{action: "status"}`
+and returns `Kasper Status` in the continuation's tool result. Its fixture session
+is deleted afterward. This adds two intentional local provider requests, for
+four requests across the combined denial/control probe.
 
 Build first: `bun install --frozen-lockfile`, `bun run build`.
 

@@ -79,7 +79,7 @@ export async function verifyV1Generation(
     released,
     text,
     error,
-    providerReceipts: provider.receipts,
+    providerReceipts: [...provider.receipts],
   }
   await writeFile(
     path.join(root, "v1-generation.json"),
@@ -120,5 +120,64 @@ export async function verifyV1Generation(
     !sessions.data?.some((session) => owned.includes(session.id)),
     "exact owned judge session must be removed",
   )
-  return evidence
+  // Exercise the patched local Zod factory through the real host's schema
+  // conversion, argument validation and execution, rather than registration only.
+  const controlStart = provider.receipts.length
+  const created = await client.session.create({
+    body: { title: "local-patched-schema-control" },
+  })
+  assert.ok(created.data?.id, "control fixture session must be created")
+  const sessionID = created.data.id
+  try {
+    provider.respond({
+      text: "",
+      toolCalls: [
+        {
+          index: 0,
+          id: "local-control-status",
+          type: "function",
+          function: {
+            name: "kasper_control",
+            arguments: JSON.stringify({ action: "status" }),
+          },
+        },
+      ],
+    })
+    provider.respond({ text: "Patched schema control completed." })
+    const response = await client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        model: { providerID: "fixture", modelID: "judge" },
+        tools: { "*": false, kasper_control: true },
+        parts: [
+          { type: "text", text: "Call kasper_control with action status." },
+        ],
+      },
+      signal: AbortSignal.timeout(15000),
+    })
+    assert.equal(response.error, undefined)
+    const receipts = provider.receipts.slice(controlStart)
+    assert.equal(receipts.length, 2, "control tool plus terminal continuation")
+    const advertised = receipts[0].request.tools as Array<{
+      function: { name: string }
+    }>
+    assert.deepEqual(
+      advertised.map((entry) => entry.function.name),
+      ["kasper_control"],
+    )
+    assert.match(JSON.stringify(receipts[1].request.messages), /Kasper Status/)
+    const control = {
+      sessionID,
+      schemaConverted: true,
+      statusExecuted: true,
+      providerCalls: receipts.length,
+    }
+    await writeFile(
+      path.join(root, "v1-patched-schema-control.json"),
+      JSON.stringify(control, null, 2),
+    )
+    return { ...evidence, control }
+  } finally {
+    await client.session.delete({ path: { id: sessionID } })
+  }
 }

@@ -8,7 +8,7 @@
 
 Recorded: 2026-10-30.
 
-Baseline: `main` at `de180b07bbff177740358163958b41de86ca06be`, Kasper 1.2.0. The repository's default branch is `main`; it is not named `master`.
+Baseline: `main` at `2d9516685670ebebd3c6c811e59460ba883e89d7`, Kasper 1.2.0. The repository's default branch is `main`; it is not named `master`.
 
 This is a source/API assessment, not an implementation or a successful V2 runtime test. The V2 API reference inspected was the `@opencode/plugin` 2.0.8 SDK installed in the STM repository; STM's working native integration also provides implementation examples for OpenCode 2.0.32. Recheck these contracts against the target host version before implementation.
 

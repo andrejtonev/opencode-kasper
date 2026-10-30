@@ -15,7 +15,7 @@
  *   - Re-running kasper does NOT duplicate the block (idempotent dedupe).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
-import { execSync } from "node:child_process"
+import { execFileSync, execSync } from "node:child_process"
 import {
   existsSync,
   mkdtempSync,
@@ -102,16 +102,9 @@ describe.skipIf(!ENABLED)(
       async () => {
         const userMessage =
           "Please complete this tiny task: list one thing in the AGENTS.md file."
-        const cmd = [
-          "opencode",
-          "run",
-          "--agent",
-          "inline-test",
-          "--message",
-          JSON.stringify(userMessage),
-        ].join(" ")
+        const args = ["run", "--agent", "inline-test", "--message", userMessage]
         try {
-          execSync(cmd, {
+          execFileSync("opencode", args, {
             cwd: projectDir,
             stdio: "pipe",
             timeout: 90_000,

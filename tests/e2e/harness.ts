@@ -6,6 +6,7 @@ import {
 } from "node:child_process"
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   renameSync,
@@ -595,7 +596,7 @@ export function writeKasperConfig(
   config: Record<string, unknown>,
 ): void {
   const opencodeDir = join(dir, ".opencode")
-  execSync(`mkdir -p "${opencodeDir}"`, { stdio: "pipe" })
+  mkdirSync(opencodeDir, { recursive: true })
   const entries = Object.entries(config).map(
     ([k, v]) => `"${k}": ${JSON.stringify(v)}`,
   )

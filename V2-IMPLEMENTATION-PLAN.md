@@ -1,6 +1,6 @@
 # V2 migration implementation plan and execution ledger
 
-Recorded: 2026-10-30. Starting commit: `de180b07bbff177740358163958b41de86ca06be`.
+Recorded: 2026-10-30. Starting commit: `2d9516685670ebebd3c6c811e59460ba883e89d7`.
 
 This is the executable breakdown of [V2-DESIGN.md](V2-DESIGN.md). Each chunk is implemented by an agent in its own Git worktree/branch, verified against the reviewed official contracts, tested, reviewed again, and committed. The coordinator integrates the commits in dependency order and checks the combined result. No publication is included.
 
@@ -47,24 +47,24 @@ No force resets, global config rewrites, publication, or title-based deletion of
 
 | Chunk | Status | Agent | Commit/evidence |
 | --- | --- | --- | --- |
-| C01 | Integrated | history_scoring | `87aafe3` (agent `49b60eb`); 19 history regressions; combined C01–C03: 543 top-level tests passed. |
-| C02 | Integrated | lifecycle_commands | `e8c1176` (agent `8686b77`); 56 focused tests, 565 offline passed/27 skipped; build/typecheck. |
-| C03 | Integrated | storage_instructions | `756bc8b` (agent `91cb886`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
-| C04 | Integrated | storage_instructions | `c1af22c` (agent `c5b0a15`); 163 focused tests; combined C01–C04: 559 top-level tests/typecheck passed. |
-| C05 | Integrated | lifecycle_commands | `faafa4d` (agent `ff07140`); exact 2.2.2 compile contracts; native packed `./server` load and Effect interruption passed. |
-| C06 | Integrated | lifecycle_commands; safety follow-up by history_scoring | `4885f53` (agent `5158c07`), tool denial `dcc0519` (agent `88b33c5`); actual V1 forced write denied and exact owned session cleaned. |
-| C07 | Integrated | history_scoring | `73df794` (agent `81790fa`); lifecycle/actions/strict commit fences. Combined integrated tests: 575 top-level passed. |
-| C08 | Integrated | history_scoring | `e04dcea` (agent `eeebed8`); 644 offline passed/27 skipped; pinned schemas, archive provenance/pagination and cancellation. |
-| C09 | Integrated | storage_instructions | `b700102` (agent `a54d43a`); 21 focused source tests, 650 offline passed/27 skipped; strict provenance and incomplete-coverage write fences. |
-| C10 | Integrated | history_scoring | `55fca50` (agent `5ad57cc`); fixes `2ea8ce3` / `dbe991d`, `0b3a48a` / `34183bc`, `1d9b8b6` / `1f6a58f`: cursor/event supervision, target child provenance and automatic child threshold. |
-| C11 | Integrated | lifecycle_commands | `30a0117` (agent `5632139`), V1 denial `92d06b2` (agent `765b71b`), child after reload `9c4161f` (agent `077e5e5`); actual packed V1/V2, native PTY, local judge/reset/reload and child provenance passed. |
-| C12 | Integrated | storage_instructions | `5bbf228` (agent `1fe89f6`), safety clarification `3de4f01` (agent `f50b7ea`); support/install/release docs and 46 links/anchors checked. |
+| C01 | Integrated | history_scoring | `ecd9045` (agent `7de16f4`); 19 history regressions; combined C01–C03: 543 top-level tests passed. |
+| C02 | Integrated | lifecycle_commands | `00ae107` (agent `47df300`); 56 focused tests, 565 offline passed/27 skipped; build/typecheck. |
+| C03 | Integrated | storage_instructions | `fcf074c` (agent `47b1231`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
+| C04 | Integrated | storage_instructions | `93062c1` (agent `be70824`); 163 focused tests; combined C01–C04: 559 top-level tests/typecheck passed. |
+| C05 | Integrated | lifecycle_commands | `ef92e84` (agent `5ac3f54`); exact 2.2.2 compile contracts; native packed `./server` load and Effect interruption passed. |
+| C06 | Integrated | lifecycle_commands; safety follow-up by history_scoring | `6c7f2fa` (agent `ee87947`), tool denial `21177d2` (agent `449dafe`); actual V1 forced write denied and exact owned session cleaned. |
+| C07 | Integrated | history_scoring | `b58429a` (agent `a137cbf`); lifecycle/actions/strict commit fences. Combined integrated tests: 575 top-level passed. |
+| C08 | Integrated | history_scoring | `633ebd9` (agent `bd34bca`); 644 offline passed/27 skipped; pinned schemas, archive provenance/pagination and cancellation. |
+| C09 | Integrated | storage_instructions | `93c4044` (agent `70c7670`); 21 focused source tests, 650 offline passed/27 skipped; strict provenance and incomplete-coverage write fences. |
+| C10 | Integrated | history_scoring | `b289b96` (agent `9e8f70c`); fixes `52a8157` / `3bae53d`, `2bf6a46` / `934f5e1`, `45217b6` / `844a0d4`: cursor/event supervision, target child provenance and automatic child threshold. |
+| C11 | Integrated | lifecycle_commands | `5cf6a56` (agent `b778a3f`), V1 denial `b5d966d` (agent `e3a1c36`), child after reload `815e255` (agent `b8b07fa`); actual packed V1/V2, native PTY, local judge/reset/reload and child provenance passed. |
+| C12 | Integrated | storage_instructions | `063084a` (agent `aa6b0c5`), safety clarification `cbf3f99` (agent `c9536b5`); support/install/release docs and 46 links/anchors checked. |
 
 The baseline review passed 490 offline tests, build and typecheck; lint had two existing unused-suppression warnings. That is the starting baseline, not migration acceptance.
 
-Combined C01-C09 verification: 625 top-level tests passed across 29 files (1,544 assertions); typecheck passed. C06/C08 integration conflicts were additive imports and optional port fields, both preserved. C07 disposal/deletion regression fix is integrated as `16e991d` (agent `414bb34`). At that checkpoint, native provider and complete packaged product acceptance remained C11 work; final evidence is recorded below.
+Combined C01-C09 verification: 625 top-level tests passed across 29 files (1,544 assertions); typecheck passed. C06/C08 integration conflicts were additive imports and optional port fields, both preserved. C07 disposal/deletion regression fix is integrated as `a962284` (agent `86944df`). At that checkpoint, native provider and complete packaged product acceptance remained C11 work; final evidence is recorded below.
 
-C04 staging-conflict fix integrated as `ba714ea` (agent `84caa0a`): external-edit overwrite reproduced, then six regression tests; 126 focused passed. After C10 integration, 642 top-level tests passed across 32 files (1,648 assertions), and typecheck/contracts/build passed. C11 actual package probes passed native setup/direct commands/status/result replay without generation, then found cursor/order pagination incompatibility; this was corrected by the C10 follow-up before final acceptance. SDK fixtures proved dual server classifiers on V1 1.18.23 and native 2.2.2, plus legacy TUI loader acceptance. These fixture results are separate from final packaged Kasper qualification.
+C04 staging-conflict fix integrated as `fc05924` (agent `348cc64`): external-edit overwrite reproduced, then six regression tests; 126 focused passed. After C10 integration, 642 top-level tests passed across 32 files (1,648 assertions), and typecheck/contracts/build passed. C11 actual package probes passed native setup/direct commands/status/result replay without generation, then found cursor/order pagination incompatibility; this was corrected by the C10 follow-up before final acceptance. SDK fixtures proved dual server classifiers on V1 1.18.23 and native 2.2.2, plus legacy TUI loader acceptance. These fixture results are separate from final packaged Kasper qualification.
 
 ## Final coordinator verification
 

@@ -171,7 +171,7 @@ session, skills, MCP or instruction-transform contribution to a model request.
 
 Participating Kasper writes share short locks. Source hashes are checked again
 after staging/fsync, including apply, rollback and migration ([staging follow-up](V2-C04-WRITE-CONFLICT.md),
-agent `84caa0a`, integrated `ba714ea`). External editors and different source files
+agent `348cc64`, integrated `fc05924`). External editors and different source files
 cannot be coordinated into one atomic snapshot; the final read-to-filesystem-call
 window is not a cross-process CAS guarantee. Live or
 unknown lock owners are not reclaimed just because a lease is old. An abandoned

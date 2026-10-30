@@ -33,4 +33,4 @@ Native setup must supply `ctx.historyHost`; automatic scoring must pass `purpose
 - Typecheck, build, lint and diff checks passed; lint retains two existing E2E suppression warnings.
 - New checks cover actual SDK-schema fixtures, tool states/errors/file metadata, terminal executions, A-B-A boundaries, absent archive support, complete pagination, provenance failures, malformed responses, bounds/order/cursor loops, execution changes, native cancellation, and missing old checkpoints in a current window.
 
-The separately committed C07 disposal fixup is `414bb3465ef976df48d90edcc9d839712950d38e`; it is not part of the C08 implementation commit.
+The separately committed C07 disposal fixup is `86944df6aa2bc3977bcdfbaebd5592f71d1dc403`; it is not part of the C08 implementation commit.

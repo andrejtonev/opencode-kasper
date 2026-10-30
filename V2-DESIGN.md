@@ -7,7 +7,7 @@
 > dual server entry supplies the legacy function; explicit compiled-file loading
 > is an alternative. This assessment remains review history.
 
-Reviewed: 2026-10-30. Repository baseline: `de180b07bbff177740358163958b41de86ca06be`, Kasper 1.2.0.
+Reviewed: 2026-10-30. Repository baseline: `2d9516685670ebebd3c6c811e59460ba883e89d7`, Kasper 1.2.0.
 
 ## Decision
 

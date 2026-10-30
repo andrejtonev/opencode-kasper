@@ -32,7 +32,13 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { execSync } from "node:child_process"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { AgentPromptManager } from "../../src/agent-prompts.js"
@@ -94,7 +100,7 @@ describe.skipIf(!ENABLED)(
     beforeAll(() => {
       projectDir = mkdtempSync(join(tmpdir(), "kasper-e2e-accum-"))
       const opencodeDir = join(projectDir, ".opencode", "kasper")
-      execSync(`mkdir -p "${opencodeDir}"`, { stdio: "pipe" })
+      mkdirSync(opencodeDir, { recursive: true })
       writeFileSync(join(projectDir, "AGENTS.md"), realisticAgentsMd, "utf-8")
       agentsMdManager = new AgentsMdManager(
         join(projectDir, "AGENTS.md"),
@@ -176,7 +182,7 @@ describe.skipIf(!ENABLED)(
       // Common case for an agent prompt: starts with YAML frontmatter and
       // a # Title and an intro before the target section.
       const promptDir = join(projectDir, ".opencode", "agents")
-      execSync(`mkdir -p "${promptDir}"`, { stdio: "pipe" })
+      mkdirSync(promptDir, { recursive: true })
 
       const agentName = "build"
       const realisticPrompt = [
@@ -246,7 +252,7 @@ describe.skipIf(!ENABLED)(
       // does not yet exist, we must NOT somehow produce a malformed result.
       const freshDir = mkdtempSync(join(tmpdir(), "kasper-e2e-accum-fresh-"))
       const opencodeDir = join(freshDir, ".opencode", "kasper")
-      execSync(`mkdir -p "${opencodeDir}"`, { stdio: "pipe" })
+      mkdirSync(opencodeDir, { recursive: true })
       writeFileSync(
         join(freshDir, "AGENTS.md"),
         [

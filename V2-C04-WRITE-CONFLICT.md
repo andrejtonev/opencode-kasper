@@ -1,6 +1,6 @@
 # C04 follow-up: staging conflict checks
 
-Baseline at `4e88fce`: a temporary-file probe scheduled an external edit after
+Baseline at `6b34b0b`: a temporary-file probe scheduled an external edit after
 the first lifecycle check. The second check observed that edit at the rename
 boundary, yet final source bytes became `ours`. This reproduced the window
 between the pre-write source read and asynchronous staging/fsync.

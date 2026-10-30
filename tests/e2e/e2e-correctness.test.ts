@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { execSync, spawnSync } from "node:child_process"
-import { writeFileSync } from "node:fs"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import {
   cleanupE2EProject,
@@ -60,7 +60,7 @@ describe("agent-specific file targeting", () => {
 
     // Create a custom agent prompt file (project-level)
     const agentsDir = join(projectDir, ".opencode", "agents")
-    execSync(`mkdir -p "${agentsDir}"`, { stdio: "pipe" })
+    mkdirSync(agentsDir, { recursive: true })
     writeFileSync(
       join(agentsDir, "reviewer.md"),
       [
@@ -473,7 +473,7 @@ describe("auto-apply file targeting", () => {
 
     // Create agent-specific prompts
     const agentsDir = join(projectDir, ".opencode", "agents")
-    execSync(`mkdir -p "${agentsDir}"`, { stdio: "pipe" })
+    mkdirSync(agentsDir, { recursive: true })
     writeFileSync(
       join(agentsDir, "custom.md"),
       [
