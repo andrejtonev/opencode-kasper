@@ -134,8 +134,7 @@ To reproduce stale append without touching user files, execute this with Bun fro
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-const repo = "<repository>";
-const { appendToPluginOverridePrompt } = await import(`${repo}/src/agent-prompt-resolver.ts`);
+const { appendToPluginOverridePrompt } = await import("./src/agent-prompt-resolver.ts");
 const temporary = await mkdtemp(join(tmpdir(), "kasper-review-"));
 try {
   const configPath = join(temporary, "plugin.json");

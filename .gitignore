@@ -7,3 +7,11 @@ AGENTS.md
 REVIEW_FULL.md
 debug-auto.ts
 tests/e2e/debug-*.ts
+
+# Private Azure launchers and security audit artifacts stay local.
+/scripts/start-isolated-v2.ps1
+/scripts/azure-credentials.ps1
+/scripts/isolated-azure.cjs
+/scripts/isolated-azure.test.cjs
+/ISOLATED-AZURE-SETUP.md
+/.local-audit/
