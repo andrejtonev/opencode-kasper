@@ -14,6 +14,8 @@ import {
   pendingFromHistoryTurns,
 } from "./history.js"
 import { generationForContext } from "./hosts/v1-generation.js"
+import type { HistorySnapshot } from "./history-port.js"
+import type { EvaluationRevision } from "./runtime.js"
 import type { ScorerInput } from "./scorer.js"
 import { scoringEvidenceSize } from "./scoring-evidence.js"
 import type {
@@ -477,7 +479,7 @@ export function buildEvalFromMessages(
 
 export type EvaluationOutcome = {
   sessionID: string
-  status: "scored" | "skipped" | "failed" | "cancelled"
+  status: "scored" | "skipped" | "failed" | "cancelled" | "unsupported"
   reason:
     | "scored"
     | "already_evaluated"
@@ -490,6 +492,8 @@ export type EvaluationOutcome = {
     | "owned_session"
     | "deleted_session"
     | "cancelled"
+    | "archive_unavailable"
+    | "provenance_mismatch"
   detail: string
   scoredKeys: string[]
 }
@@ -499,7 +503,10 @@ export async function evaluateSession(
   sessionID: string,
   ctx: KasperContext,
   agentHint?: string,
-  options: { minimumUserMessages?: number } = {},
+  options: {
+    minimumUserMessages?: number
+    purpose?: "historical" | "current"
+  } = {},
 ): Promise<EvaluationOutcome> {
   const revision = ctx.runtime?.capture(sessionID)
   const current = () =>
@@ -524,6 +531,38 @@ export async function evaluateSession(
       "owned_session",
       "Kasper's own sessions are excluded from evaluation.",
     )
+  if (ctx.historyHost) {
+    try {
+      const read = await ctx.historyHost.read(sessionID, {
+        purpose: options.purpose ?? "historical",
+        signal: ctx.runtime?.sessionSignal(sessionID) ?? ctx.lifetimeSignal,
+      })
+      if (!current())
+        return outcome(
+          "cancelled",
+          "cancelled",
+          "Evaluation cancelled by a lifecycle change.",
+        )
+      if (read.status === "unsupported")
+        return outcome("unsupported", read.reason, read.detail)
+      return evaluateHistorySession(sessionID, ctx, read.snapshot, agentHint, {
+        ...options,
+        revision,
+      })
+    } catch (error) {
+      return current()
+        ? outcome(
+            "failed",
+            "fetch_failed",
+            `Failed to read session history: ${String(error)}`,
+          )
+        : outcome(
+            "cancelled",
+            "cancelled",
+            "Evaluation cancelled by a lifecycle change.",
+          )
+    }
+  }
   if (!ctx.client.session.messages)
     return outcome(
       "failed",
@@ -562,7 +601,74 @@ export async function evaluateSession(
       "cancelled",
       "Evaluation cancelled by a lifecycle change.",
     )
-  const history = normalizeV1History(raw)
+  return evaluateHistorySession(
+    sessionID,
+    ctx,
+    {
+      sessionID,
+      coverage: "archive",
+      messages: normalizeV1History(raw),
+      isIdle: ctx.idleSessions?.has(sessionID) ?? false,
+    },
+    agentHint,
+    { ...options, revision },
+  )
+}
+
+/** Both SDK adapters use the same complete-turn and stable agent-range evaluation. */
+export async function evaluateHistorySession(
+  sessionID: string,
+  ctx: KasperContext,
+  snapshot: HistorySnapshot,
+  agentHint?: string,
+  options: {
+    minimumUserMessages?: number
+    purpose?: "historical" | "current"
+    revision?: EvaluationRevision
+  } = {},
+): Promise<EvaluationOutcome> {
+  const revision = options.revision ?? ctx.runtime?.capture(sessionID)
+  const current = () =>
+    !ctx.lifetimeSignal?.aborted &&
+    !ctx.deletedSessions.has(sessionID) &&
+    (!revision || !ctx.runtime || ctx.runtime.isCurrent(sessionID, revision))
+  const outcome = (
+    status: EvaluationOutcome["status"],
+    reason: EvaluationOutcome["reason"],
+    detail: string,
+    scoredKeys: string[] = [],
+  ): EvaluationOutcome => ({ sessionID, status, reason, detail, scoredKeys })
+  if (!current())
+    return outcome(
+      "cancelled",
+      "cancelled",
+      "Evaluation cancelled by a lifecycle change.",
+    )
+  if (ctx.kasperSessionIDs.has(sessionID))
+    return outcome(
+      "skipped",
+      "owned_session",
+      "Kasper's own sessions are excluded from evaluation.",
+    )
+  if (snapshot.sessionID !== sessionID)
+    return outcome(
+      "failed",
+      "provenance_mismatch",
+      "History belongs to a different source session.",
+    )
+  if (snapshot.coverage !== "archive" && options.purpose !== "current")
+    return outcome(
+      "unsupported",
+      "archive_unavailable",
+      "Historical scoring requires complete archive coverage; the current compaction window cannot be used as an archive.",
+    )
+  const history = snapshot.messages
+  if (!history.length)
+    return outcome(
+      "skipped",
+      "no_content",
+      `No messages found for session "${sessionID}".`,
+    )
   const parentRecord = ctx.stateStore.getSession(sessionID)
   if (
     parentRecord?.last_msg_id &&
@@ -574,7 +680,7 @@ export async function evaluateSession(
       `The saved checkpoint for session "${sessionID}" is absent from history; evaluation was not replayed.`,
     )
   }
-  const isIdle = ctx.idleSessions?.has(sessionID) ?? false
+  const isIdle = snapshot.isIdle
   const complete = completedHistoryTurns(
     history,
     ctx.registeredCommands,
@@ -709,7 +815,7 @@ export async function evaluateSession(
       `This session has already been evaluated.\n${summaries.join("\n")}\n\nUse /kasper status for detailed results.`,
     )
   // This count is diagnostic only, never an authority for history completeness.
-  ctx.sessionMsgCount.set(sessionID, raw.length)
+  ctx.sessionMsgCount.set(sessionID, history.length)
   let detail: string
   if (multiAgent) {
     detail = `## Per-Agent Evaluation for Session "${sessionID}"\n\n${summaries.join("\n")}\n\nUse /kasper status for detailed results.`
@@ -767,20 +873,33 @@ export async function evaluateChildSessions(
     }
   }
 
-  if (ctx.client.session.list) {
+  if (ctx.historyHost || ctx.client.session.list) {
     try {
-      const all = await ctx.client.session.list()
+      const list = ctx.client.session.list
+      const all = ctx.historyHost
+        ? {
+            data: await ctx.historyHost.list({
+              parentID,
+              signal:
+                ctx.runtime?.sessionSignal(parentID) ?? ctx.lifetimeSignal,
+            }),
+          }
+        : list
+          ? await list()
+          : { data: [] }
       if (all.data) {
         for (const s of all.data) {
           if (
             s.parentID === parentID &&
-            s.title &&
-            !isKasperSession(s.title) &&
+            (!s.title || !isKasperSession(s.title)) &&
             !ctx.kasperSessionIDs.has(s.id)
           ) {
             if (!ctx.deletedSessions.has(s.id)) {
               childIDs.add(s.id)
-              const agent = s.agent || s.agentName || s.subagent_type
+              const agent =
+                s.agent ||
+                ("agentName" in s ? s.agentName : undefined) ||
+                ("subagent_type" in s ? s.subagent_type : undefined)
               if (agent) childAgentHints.set(s.id, agent)
               if (!ctx.agentRegistry.has(s.id)) {
                 ctx.agentRegistry.set(s.id, {
@@ -827,11 +946,11 @@ export async function evaluateChildSessions(
   return results
 }
 
-export async function batchEvaluateSessions(
+export async function evaluateSessions(
   sessionIDs: string[],
   ctx: KasperContext,
   agentHints?: Map<string, string>,
-): Promise<string> {
+): Promise<EvaluationOutcome[]> {
   const outcomes: EvaluationOutcome[] = []
   await ctx.logger.log("batch_evaluate_start", { totalIDs: sessionIDs.length })
   for (const id of new Set(sessionIDs)) {
@@ -854,10 +973,22 @@ export async function batchEvaluateSessions(
       reason: result.reason,
     })
   }
+  return outcomes
+}
+
+export async function batchEvaluateSessions(
+  sessionIDs: string[],
+  ctx: KasperContext,
+  agentHints?: Map<string, string>,
+): Promise<string> {
+  const outcomes = await evaluateSessions(sessionIDs, ctx, agentHints)
   const scored = outcomes.filter((o) => o.status === "scored")
   const skipped = outcomes.filter((o) => o.status === "skipped")
   const failed = outcomes.filter(
-    (o) => o.status === "failed" || o.status === "cancelled",
+    (o) =>
+      o.status === "failed" ||
+      o.status === "cancelled" ||
+      o.status === "unsupported",
   )
   await ctx.logger.log("batch_evaluate_done", {
     totalInput: sessionIDs.length,

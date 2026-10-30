@@ -1,10 +1,14 @@
 import { describe, expect, mock, test } from "bun:test"
+import { SessionMessage } from "@opencode/schema/session-message"
+import { Schema } from "effect"
 import {
   batchEvaluateSessions,
   buildEvalFromMessages,
   considerImprovement,
   evaluateChildSessions,
+  evaluateHistorySession,
   evaluateSession,
+  evaluateSessions,
   manualEvaluateSession,
   runEvaluation,
 } from "../src/evaluate.js"
@@ -12,6 +16,7 @@ import { AsyncMutex } from "../src/mutex.js"
 import { KasperRuntime } from "../src/runtime.js"
 import type { KasperContext, PendingEval, ScoreCard } from "../src/types.js"
 import { DEFAULT_CONFIG } from "../src/types.js"
+import { normalizeV2History } from "../src/v2-history.js"
 
 function makeScoreCard(overrides: Partial<ScoreCard> = {}): ScoreCard {
   return {
@@ -117,6 +122,73 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
 }
 
 describe("runEvaluation", () => {
+  test("native latest-window scoring never guesses an older missing checkpoint", async () => {
+    const decode = Schema.decodeUnknownSync(SessionMessage.Info)
+    const history = normalizeV2History([
+      decode({
+        type: "compaction",
+        id: "msg_compact",
+        status: "completed",
+        reason: "manual",
+        summary: "summary",
+        time: { created: 1 },
+      }),
+      decode({
+        type: "user",
+        id: "msg_user",
+        text: "new real request",
+        time: { created: 2 },
+      }),
+      decode({
+        type: "assistant",
+        id: "msg_assistant",
+        agent: "reviewer",
+        model: { id: "test", providerID: "test" },
+        content: [{ type: "text", text: "done" }],
+        finish: "stop",
+        time: { created: 3, completed: 4 },
+      }),
+    ])
+    const ctx = mockCtx()
+    ctx.stateStore.getSession = (() => ({
+      last_msg_id: "msg_old_checkpoint",
+    })) as any
+    const judge = mock(async () => makeScoreCard())
+    ctx.scorer.evaluate = judge as any
+    const result = await evaluateHistorySession(
+      "ses_test",
+      ctx,
+      {
+        sessionID: "ses_test",
+        coverage: "current-window",
+        messages: history,
+        isIdle: true,
+      },
+      undefined,
+      { purpose: "current" },
+    )
+    expect(result.reason).toBe("checkpoint_missing")
+    expect(judge).not.toHaveBeenCalled()
+  })
+
+  test("history host supplies normalized records and typed unsupported batch outcomes", async () => {
+    const ctx = mockCtx()
+    ctx.historyHost = {
+      read: async () => ({
+        status: "unsupported",
+        reason: "archive_unavailable",
+        detail: "Complete archive reader unavailable",
+      }),
+      get: async () => {
+        throw new Error("unused")
+      },
+      list: async () => [],
+    }
+    const outcomes = await evaluateSessions(["ses_test", "ses_test"], ctx)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0].status).toBe("unsupported")
+    expect(outcomes[0].reason).toBe("archive_unavailable")
+  })
   test("deleted or reset source cannot commit an in-flight logical range", async () => {
     for (const reset of [false, true]) {
       const runtime = new KasperRuntime()

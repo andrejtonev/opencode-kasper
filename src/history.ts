@@ -224,6 +224,20 @@ export function completedHistoryTurns(
       )
         assistants.push(message)
     }
+    // V2 records the actual execution outcome, including failed/interrupted runs.
+    // The boundary carries no fabricated user request or assistant response.
+    if (i > cursor && message.role === "boundary" && message.terminal) {
+      if (message.text && assistants.length) {
+        const last = assistants.at(-1)
+        if (last)
+          assistants[assistants.length - 1] = {
+            ...last,
+            text: `${last.text}\n${message.text}`,
+          }
+      }
+      close(true)
+      assistants = []
+    }
     if (i > cursor && message.compacted) compacted = true
   }
   close(isIdle || assistants.at(-1)?.terminal === true)

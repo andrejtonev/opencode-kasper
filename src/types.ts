@@ -1,6 +1,7 @@
 import type { AgentPromptManager } from "./agent-prompts.js"
 import type { AgentsMdManager } from "./agents-md.js"
 import type { GenerationPort } from "./generation.js"
+import type { HistoryHost } from "./history-port.js"
 import type { KasperLogger } from "./logging.js"
 import type { AsyncMutex } from "./mutex.js"
 import type { EvaluationRevision, KasperRuntime } from "./runtime.js"
@@ -281,6 +282,8 @@ export interface AgentPromptEntry {
 }
 
 export interface ToolCallRecord {
+  callID?: string
+  status?: "streaming" | "running" | "completed" | "error"
   tool: string
   args: string
   result: string
@@ -444,10 +447,33 @@ export interface KasperUserContext {
 
 export interface KasperClientContext {
   generation?: GenerationPort
+  historyHost?: HistoryHost
   client: OpencodeSessionClient
   logger: KasperLogger
-  agentsMd: AgentsMdManager
-  agentPrompts: AgentPromptManager
+  agentsMd: AgentsMdAccess
+  agentPrompts: AgentPromptAccess
+}
+
+export type AgentsMdAccess = Pick<
+  AgentsMdManager,
+  | "read"
+  | "backup"
+  | "injectSection"
+  | "lockedUpdate"
+  | "applyGuidance"
+  | "rollback"
+  | "setResolvedPath"
+>
+export type AgentPromptAccess = Pick<
+  AgentPromptManager,
+  | "read"
+  | "exists"
+  | "injectSection"
+  | "rollback"
+  | "invalidateSourceCache"
+  | "setResolverInputs"
+> & {
+  resolve(name: string): Promise<{ kind: string }>
 }
 
 export interface KasperContext
