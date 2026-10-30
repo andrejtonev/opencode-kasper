@@ -24,7 +24,7 @@ This is the executable breakdown of [V2-DESIGN.md](V2-DESIGN.md). Each chunk is 
 | C05 | Pinned SDK contract spike, native zero-model fixture and package exports | None | Install exact V2 SDK; inspect cancellation/archive/commands/generation; compile contract tests; isolated packaged load; recorded supported entrypoint/version matrix. |
 | C06 | Shared generation boundary and V1 adapter: generation contracts/adapters and scorer integration | C02, C05 | Shared rubric/parser uses generation port; native V1 ownership/late-create cleanup; bounded attempts/merge; uncertain timeout retains slot; no extra diagnostic model calls. |
 | C07 | Shared lifecycle/scheduler/actions plus V1 event/tools integration | C01, C03 | Public event routing; session-bound actions; queued apply only consumed on success; supervised timers/jobs; no late commit after delete/reset/dispose; compaction pure. Generation cancellation wiring is reconciled with C06 at integration. |
-| C08 | V2 history/native generation adapters and manual scoring | C01, C02, C05, C06 | Pinned real durable records normalized; complete archive pagination; correct location/agent; native sessionless generation/cancellation policy; manual score commits validated boundary. |
+| C08 | V2 history adapter and manual scoring integration | C01, C02, C05 | Pinned real durable records normalized; complete archive pagination; correct location/agent; manual scoring prepares validated boundaries. Native generation from C06 is connected and verified at integration. |
 | C09 | V2 effective instructions and editable-source adapters | C04, C05 | V2 AGENTS sources/system config/nested IDs; no CLAUDE fallback; read-only unknown origins; scoped apply/rollback; reload/activation status honest. |
 | C10 | V2 setup/events/commands/tools/compaction and terminal results | C07, C08, C09 | End-to-end host setup; automatic/manual/batch/child paths; command executes once without chat dispatch; readable correlated output; cleanup/reload. |
 | C11 | Packaged V1/V2 acceptance and regression integration | C10 | Clean temporary installs; real host load/commands/hooks/events/history; deterministic generation fixture; timeout/failure/reset/reload; full test/build/lint results. |
@@ -50,11 +50,11 @@ No force resets, global config rewrites, publication, or title-based deletion of
 | C01 | Integrated | history_scoring | `87aafe3` (agent `49b60eb`); 19 history regressions; combined C01–C03: 543 top-level tests passed. |
 | C02 | Integrated | lifecycle_commands | `e8c1176` (agent `8686b77`); 56 focused tests, 565 offline passed/27 skipped; build/typecheck. |
 | C03 | Integrated | storage_instructions | `756bc8b` (agent `91cb886`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
-| C04 | In progress | storage_instructions | Isolated `migration/c04-instructions`; provenance/receipts/conflict-safe writes. |
+| C04 | Integrated | storage_instructions | `c1af22c` (agent `c5b0a15`); 163 focused tests; combined C01–C04: 559 top-level tests/typecheck passed. |
 | C05 | In progress | lifecycle_commands | Isolated `migration/c05-sdk`; exact 2.2.2 contracts and native fixture. |
 | C06 | Pending | lifecycle_commands | |
 | C07 | In progress | history_scoring | Isolated `migration/c07-runtime`; lifecycle/session/actions and late-result fences. |
-| C08 | Pending | lifecycle_commands | |
+| C08 | Pending | history_scoring | Runs after C07/C05; generation integration follows C06. |
 | C09 | Pending | storage_instructions | |
 | C10 | Pending | history_scoring | |
 | C11 | Pending | lifecycle_commands | |
