@@ -1,10 +1,13 @@
 import { writeFile } from "node:fs/promises"
-// Rpc comes from the public plugin schema, rather than Effect's transport namespace.
-import { Plugin, Rpc as PluginRpc } from "@opencode/plugin/effect"
+import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
 import { Effect, Schema } from "effect"
+// Rpc comes from the public plugin schema, rather than Effect's transport namespace.
+import legacy from "./index.js"
 
-export default Plugin.define({
+export default {
   id: "kasper.sdk-host-fixture",
+  server: legacy,
   effect(context) {
     return Effect.gen(function* () {
       const report = {
@@ -18,17 +21,36 @@ export default Plugin.define({
         directory: context.location.directory,
       })
       report.sessionPage = { size: page.data.length, cursor: page.cursor }
+      if (context.options.provider_test === true) {
+        yield* context.provider.transform((editor) => {
+          for (const record of editor.list())
+            if (record.provider.id !== "fixture")
+              editor.remove(record.provider.id)
+        })
+      }
       let started = false
       let interrupted = false
       let completed = false
-      const definition = PluginRpc.define({
+      const definition = {
         id: "kasper.sdk-host-fixture.wait",
         methods: {
           wait: { input: Schema.Struct({}), output: Schema.Struct({}) },
+          generate: {
+            input: Schema.Struct({ prompt: Schema.String }),
+            output: Schema.Struct({ text: Schema.String }),
+          },
         },
         events: {},
-      })
+      }
       yield* context.rpc.register(definition, {
+        generate: ({ prompt }) =>
+          context.experimental.generate.text({
+            prompt,
+            model: {
+              id: Model.ID.make("judge"),
+              providerID: Provider.ID.make("fixture"),
+            },
+          }),
         wait: () =>
           Effect.callback((resume) => {
             started = true
@@ -62,4 +84,4 @@ export default Plugin.define({
       )
     }).pipe(Effect.orDie)
   },
-})
+}

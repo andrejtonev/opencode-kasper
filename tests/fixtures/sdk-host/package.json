@@ -2,12 +2,17 @@
   "name": "kasper-sdk-host-fixture",
   "version": "0.0.0",
   "type": "module",
+  "dependencies": {
+    "@opencode/schema": "2.2.2"
+  },
   "exports": {
     ".": "./index.js",
-    "./server": "./server.js"
+    "./server": "./server.js",
+    "./tui": "./tui.js"
   },
   "files": [
     "index.js",
-    "server.js"
+    "server.js",
+    "tui.js"
   ]
 }
