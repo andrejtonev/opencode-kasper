@@ -47,13 +47,13 @@ No force resets, global config rewrites, publication, or title-based deletion of
 
 | Chunk | Status | Agent | Commit/evidence |
 | --- | --- | --- | --- |
-| C01 | In progress | history_scoring | Isolated `migration/c01-history` worktree; real tool/checkpoint regressions. |
+| C01 | Integrated | history_scoring | `87aafe3` (agent `49b60eb`); 19 history regressions; combined C01–C03: 543 top-level tests passed. |
 | C02 | Integrated | lifecycle_commands | `e8c1176` (agent `8686b77`); 56 focused tests, 565 offline passed/27 skipped; build/typecheck. |
 | C03 | Integrated | storage_instructions | `756bc8b` (agent `91cb886`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
 | C04 | In progress | storage_instructions | Isolated `migration/c04-instructions`; provenance/receipts/conflict-safe writes. |
 | C05 | In progress | lifecycle_commands | Isolated `migration/c05-sdk`; exact 2.2.2 contracts and native fixture. |
 | C06 | Pending | lifecycle_commands | |
-| C07 | Pending | history_scoring | |
+| C07 | In progress | history_scoring | Isolated `migration/c07-runtime`; lifecycle/session/actions and late-result fences. |
 | C08 | Pending | lifecycle_commands | |
 | C09 | Pending | storage_instructions | |
 | C10 | Pending | history_scoring | |
