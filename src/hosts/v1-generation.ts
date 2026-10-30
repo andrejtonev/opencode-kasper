@@ -181,6 +181,8 @@ export function legacyGeneration(
 const contexts = new WeakMap<KasperContext, GenerationPort>()
 export function generationForContext(context: KasperContext): GenerationPort {
   if (context.generation) return context.generation
+  if (!context.client)
+    throw new GenerationError("No generation host is configured", true, false)
   let port = contexts.get(context)
   if (!port) {
     port = createV1Generation(context.client, {

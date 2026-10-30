@@ -28,6 +28,18 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "types": "./dist/v2-rpc.d.ts",
+      "import": "./dist/v2-rpc.js"
     }
   },
   "files": [
@@ -59,14 +71,14 @@
     "glob": "13.0.5",
     "gray-matter": "4.0.3",
     "jsonc-parser": "^3.3.1",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@opencode/client": "2.2.2",
+    "@opencode/schema": "2.2.2"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.14.0",
     "@opencode/plugin": "2.2.2",
-    "effect": "4.0.6",
-    "@opencode/client": "2.2.2",
-    "@opencode/schema": "2.2.2"
+    "effect": "4.0.6"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.14.25",
@@ -75,21 +87,13 @@
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3",
     "@opencode/plugin": "2.2.2",
-    "effect": "4.0.6",
-    "@opencode/client": "2.2.2",
-    "@opencode/schema": "2.2.2"
+    "effect": "4.0.6"
   },
   "peerDependenciesMeta": {
     "@opencode/plugin": {
       "optional": true
     },
     "effect": {
-      "optional": true
-    },
-    "@opencode/client": {
-      "optional": true
-    },
-    "@opencode/schema": {
       "optional": true
     }
   }

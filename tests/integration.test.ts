@@ -6,6 +6,25 @@ import { join } from "node:path"
 import KasperPlugin from "../src/index.js"
 import { _stateStoreRegistry, flushKasperState } from "../src/registry.js"
 
+async function invokeKasper(
+  hooks: any,
+  input: any,
+  output: any,
+): Promise<void> {
+  const text = input.arguments ?? input.argument ?? "status"
+  const split = text.trim().indexOf(" ")
+  const action = split < 0 ? text.trim() : text.trim().slice(0, split)
+  const arg = split < 0 ? "" : text.trim().slice(split + 1)
+  try {
+    output.message = await hooks.tool.kasper_control.execute(
+      { action, arg },
+      { sessionID: input.sessionID },
+    )
+  } catch (error) {
+    output.message = String(error)
+  }
+}
+
 function tmpDir(): string {
   return join(tmpdir(), `kasper-int-${randomBytes(6).toString("hex")}`)
 }
@@ -122,7 +141,8 @@ async function fullSession(
   await hooks.event({ event: { type: "session.idle", sessionID } })
 
   const scoreOut: any = {}
-  await hooks["command.execute.before"](
+  await invokeKasper(
+    hooks,
     { command: "kasper", argument: `score session ${sessionID}`, sessionID },
     scoreOut,
   )
@@ -169,7 +189,8 @@ describe("plugin integration", () => {
       })
       expect(_stateStoreRegistry.has(dir)).toBe(false)
       const output = { parts: [] } as any
-      await hooks["command.execute.before"](
+      await invokeKasper(
+        hooks,
         { command: "kasper", sessionID: "s", arguments: "status" },
         output,
       )
@@ -209,7 +230,8 @@ describe("plugin integration", () => {
         } as any,
       })
       const output = { parts: [] } as any
-      await hooks["command.execute.before"](
+      await invokeKasper(
+        hooks,
         { command: "kasper", sessionID: "public", arguments: "score session" },
         output,
       )
@@ -229,7 +251,8 @@ describe("plugin integration", () => {
         } as any,
       })
       const deleted = { parts: [] } as any
-      await hooks["command.execute.before"](
+      await invokeKasper(
+        hooks,
         { command: "kasper", sessionID: "public", arguments: "score session" },
         deleted,
       )
@@ -345,7 +368,8 @@ describe("plugin integration", () => {
     await hooks.event({ event: { type: "session.idle", sessionID } })
 
     const scoreOut: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       {
         command: "kasper",
         argument: `score session ${sessionID}`,
@@ -591,7 +615,8 @@ describe("duplicate evaluation guard", () => {
     await fullSession(dir, hooks, sessionID)
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score", sessionID },
       output,
     )
@@ -631,7 +656,8 @@ describe("duplicate evaluation guard", () => {
     )
 
     const scoreOut: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       {
         command: "kasper",
         argument: `score session ${sessionID}`,
@@ -642,7 +668,8 @@ describe("duplicate evaluation guard", () => {
 
     // second call should be deduplicated
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score", sessionID },
       output,
     )
@@ -893,11 +920,12 @@ describe("manual retroactive evaluation", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session retro-1" },
       output,
     )
-    expect(output.stop).toBe(true)
+
     expect(output.message).toContain("Manual evaluation for session")
     expect(output.message).toContain("85%")
 
@@ -925,11 +953,12 @@ describe("manual retroactive evaluation", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session broken-id" },
       output,
     )
-    expect(output.stop).toBe(true)
+
     expect(output.message).toContain("Failed to fetch messages")
 
     await hooks.close()
@@ -949,11 +978,12 @@ describe("manual retroactive evaluation", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session empty-id" },
       output,
     )
-    expect(output.stop).toBe(true)
+
     expect(output.message).toContain("No messages found")
 
     await hooks.close()
@@ -971,11 +1001,12 @@ describe("manual retroactive evaluation", () => {
     await fullSession(dir, hooks, "retro-dedup")
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session retro-dedup" },
       output,
     )
-    expect(output.stop).toBe(true)
+
     expect(output.message).toContain("already been evaluated")
     expect(output.message).toContain("85%")
 
@@ -1103,11 +1134,8 @@ describe("bare /kasper command", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "" },
-      output,
-    )
-    expect(output.stop).toBe(true)
+    await invokeKasper(hooks, { command: "kasper", argument: "" }, output)
+
     expect(output.message).toContain("Kasper")
     expect(output.message).toContain("Average score")
 
@@ -1243,7 +1271,8 @@ describe("kasper score returns data", () => {
     await fullSession(dir, hooks, "score-data-test")
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score", sessionID: "score-data-test" },
       output,
     )
@@ -1287,7 +1316,8 @@ describe("kasper score returns data", () => {
     )
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       {
         command: "kasper",
         argument: "score",
@@ -1311,10 +1341,7 @@ describe("kasper score returns data", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "score" },
-      output,
-    )
+    await invokeKasper(hooks, { command: "kasper", argument: "score" }, output)
     expect(output.message).toContain("No active session found")
 
     await hooks.close()
@@ -1332,11 +1359,8 @@ describe("kasper help", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
-      { command: "kasper", argument: "help" },
-      output,
-    )
-    expect(output.stop).toBe(true)
+    await invokeKasper(hooks, { command: "kasper", argument: "help" }, output)
+
     expect(output.message).toContain("Kasper Commands")
     expect(output.message).toContain("kasper status")
     expect(output.message).toContain("kasper score")
@@ -1404,11 +1428,12 @@ describe("kasper reset", () => {
     })
 
     const resetOutput: any = {}
-    await hooks2["command.execute.before"](
+    await invokeKasper(
+      hooks2,
       { command: "kasper", argument: "reset --force" },
       resetOutput,
     )
-    expect(resetOutput.stop).toBe(true)
+
     expect(resetOutput.message).toContain("Kasper state reset")
     expect(resetOutput.message).toContain("Cleared 1 session")
 
@@ -1453,7 +1478,8 @@ describe("kasper reset", () => {
     await fullSession(dir, hooks, "pre-reset-session")
 
     const resetOutput: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "reset --force" },
       resetOutput,
     )
@@ -1506,7 +1532,8 @@ describe("subagent evaluation guard", () => {
     )
 
     const scoreOut: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session subagent-test" },
       scoreOut,
     )
@@ -1560,11 +1587,12 @@ describe("unknown command", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "nonexistent_command" },
       output,
     )
-    expect(output.stop).toBe(true)
+
     expect(output.message).toContain("Unknown /kasper command")
 
     await hooks.close()
@@ -1575,6 +1603,89 @@ describe("unknown command", () => {
 // [removed] score agent shorthand — agent-as-ID shorthand removed
 
 describe("kasper_improve tool", () => {
+  test("control dry-run and exact migrate flags preserve files and the pending queue", async () => {
+    const dir = await setupTestDir()
+    await writeFile(
+      join(dir, "AGENTS.md"),
+      "# Project instructions\nFollow the request.\n",
+    )
+    const client = makeLowScoreClient({ weaknesses: ["needs documentation"] })
+    const hooks = await KasperPlugin({ client: client as any, directory: dir })
+    try {
+      await fullSession(dir, hooks, "preview-1")
+      await fullSession(dir, hooks, "preview-2")
+      await fullSession(dir, hooks, "preview-3")
+      const agents = join(dir, "AGENTS.md")
+      const before = await readFile(agents, "utf8")
+      const preview = await hooks.tool.kasper_control.execute(
+        { action: "improve", arg: "--dry-run" },
+        { sessionID: "preview-1" },
+      )
+      expect(preview).toContain("Suggested Improvements")
+      const apply = await hooks.tool.kasper_control.execute(
+        { action: "apply", arg: "all" },
+        { sessionID: "preview-1" },
+      )
+      expect(apply).toContain("No pending improvements")
+      expect(await readFile(agents, "utf8")).toBe(before)
+      expect(
+        await hooks.tool.kasper_control.execute(
+          { action: "improve", arg: "--unknown" },
+          { sessionID: "preview-1" },
+        ),
+      ).toContain("Unknown improve flag")
+      await writeFile(
+        join(dir, "opencode.json"),
+        JSON.stringify({
+          agent: { "show-reviewer": { prompt: "original inline instruction" } },
+        }),
+      )
+      const configuration = await readFile(join(dir, "opencode.json"), "utf8")
+      const inspect = await hooks.tool.kasper_control.execute(
+        { action: "migrate", arg: "show-reviewer --show" },
+        { sessionID: "preview-1" },
+      )
+      expect(inspect).toContain("show-reviewer")
+      expect(await readFile(join(dir, "opencode.json"), "utf8")).toBe(
+        configuration,
+      )
+      expect(
+        await hooks.tool.kasper_control.execute(
+          { action: "migrate", arg: "show-reviewer --unknown" },
+          { sessionID: "preview-1" },
+        ),
+      ).toContain("Unknown migrate flag")
+      expect(await readFile(agents, "utf8")).toBe(before)
+    } finally {
+      await hooks.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+  test("V1 before hook never applies an action ahead of the host model/tool continuation", async () => {
+    const dir = await setupTestDir(),
+      client = makeClient()
+    const hooks = await KasperPlugin({ client: client as any, directory: dir })
+    try {
+      await fullSession(dir, hooks, "before-hook")
+      const before = _stateStoreRegistry.get(dir)?.getAggregate().total_sessions
+      const output = { parts: [] }
+      await hooks["command.execute.before"](
+        {
+          command: "kasper",
+          arguments: "reset --force",
+          sessionID: "before-hook",
+        },
+        output,
+      )
+      expect(output).toEqual({ parts: [] })
+      expect(_stateStoreRegistry.get(dir)?.getAggregate().total_sessions).toBe(
+        before,
+      )
+    } finally {
+      await hooks.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
   test("improve tool returns suggestions for global weaknesses", async () => {
     const dir = await setupTestDir()
     const lowClient = makeLowScoreClient({
@@ -1671,7 +1782,8 @@ describe("subagent lifecycle", () => {
     )
 
     const scoreOut: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session parent-1" },
       scoreOut,
     )
@@ -1866,7 +1978,8 @@ describe("subagent lifecycle", () => {
     )
 
     const scoreOut: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session sub-status" },
       scoreOut,
     )
@@ -1958,7 +2071,8 @@ describe("edge cases", () => {
     )
 
     const out1: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       {
         command: "kasper",
         argument: `score session ${sessionID}`,
@@ -1969,7 +2083,8 @@ describe("edge cases", () => {
     expect(out1.message).toContain("Manual evaluation")
 
     const out2: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score", sessionID },
       out2,
     )
@@ -2079,7 +2194,8 @@ describe("edge cases", () => {
     })
 
     const output: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "score session ghost-session" },
       output,
     )

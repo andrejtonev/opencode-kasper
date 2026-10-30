@@ -13,8 +13,8 @@ import {
   normalizeV1History,
   pendingFromHistoryTurns,
 } from "./history.js"
-import { generationForContext } from "./hosts/v1-generation.js"
 import type { HistorySnapshot } from "./history-port.js"
+import { generationForContext } from "./hosts/v1-generation.js"
 import type { EvaluationRevision } from "./runtime.js"
 import type { ScorerInput } from "./scorer.js"
 import { scoringEvidenceSize } from "./scoring-evidence.js"
@@ -109,6 +109,8 @@ export async function runEvaluation(
   return ctx.evalMutex
     .runExclusive(async () => {
       if (!current()) return false
+      const coverage = await ctx.instructionCoverage?.(pending.agentName)
+      if (coverage && !coverage.complete) return false
       if (ctx.sessionsEvaluated.has(pending.sessionID)) {
         await ctx.logger.log("run_eval_skipped", {
           sessionID: pending.sessionID,
@@ -142,7 +144,7 @@ export async function runEvaluation(
       let agentPrompt: string | undefined
       let agentPromptHash: string | undefined
       if (pending.agentName) {
-        if (ctx.client.app?.agents) {
+        if (ctx.client?.app?.agents) {
           try {
             const rawAgents = await ctx.client.app.agents()
             const agents = Array.isArray(rawAgents)
@@ -221,6 +223,7 @@ export async function runEvaluation(
               { signal: pending.evaluationSignal },
             )
             pc.agent_prompt_hash = agentPromptHash
+            if (pair.evidenceTruncated) pc.evidence_truncated = true
             pc.agents_md_hash = agentsMdHash
             if (pc.fallback || !Number.isFinite(pc.overall_score)) return false
             pairCards.push(pc)
@@ -282,6 +285,7 @@ export async function runEvaluation(
         card.agents_md_hash = agentsMdHash
       }
 
+      if (pending.evidenceTruncated) card.evidence_truncated = true
       await ctx.logger.log("evaluation_done", {
         sessionID: pending.sessionID,
         overall_score: card.overall_score,
@@ -494,6 +498,7 @@ export type EvaluationOutcome = {
     | "cancelled"
     | "archive_unavailable"
     | "provenance_mismatch"
+    | "instructions_unavailable"
   detail: string
   scoredKeys: string[]
 }
@@ -563,7 +568,7 @@ export async function evaluateSession(
           )
     }
   }
-  if (!ctx.client.session.messages)
+  if (!ctx.client?.session.messages)
     return outcome(
       "failed",
       "history_unavailable",
@@ -757,6 +762,14 @@ export async function evaluateHistorySession(
     }
     const pending = pendingFromHistoryTurns(turns, key, segment.agentName, 1)
     if (!pending) continue
+    const coverage = await ctx.instructionCoverage?.(pending.agentName)
+    if (coverage && !coverage.complete)
+      return outcome(
+        "unsupported",
+        "instructions_unavailable",
+        `Instruction coverage is incomplete: ${coverage.issues.join("; ")}`,
+        scoredKeys,
+      )
     pending.sourceSessionID = sessionID
     pending.lifecycleRevision = revision
     pending.evaluationSignal = ctx.runtime?.sessionSignal(sessionID)
@@ -873,9 +886,9 @@ export async function evaluateChildSessions(
     }
   }
 
-  if (ctx.historyHost || ctx.client.session.list) {
+  if (ctx.historyHost || ctx.client?.session.list) {
     try {
-      const list = ctx.client.session.list
+      const list = ctx.client?.session.list
       const all = ctx.historyHost
         ? {
             data: await ctx.historyHost.list({
@@ -1395,6 +1408,14 @@ export async function considerImprovement(
   config: KasperConfig,
   pending: PendingEval,
 ): Promise<void> {
+  const coverage = await ctx.instructionCoverage?.(pending.agentName)
+  if (coverage && !coverage.complete) return
+  if (
+    ctx.autoUpdateEnabled &&
+    ctx.automaticImprovementAllowed &&
+    !(await ctx.automaticImprovementAllowed(pending.agentName))
+  )
+    return
   if (card.evidence_truncated) return
   // Use weakness_suggestions as the primary source (LLM prompt instructs
   // the model to populate this and leave deprecated fields empty).

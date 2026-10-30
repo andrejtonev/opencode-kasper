@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Schema } from "effect"
+import { MAX_TOOL_CALLS_EVAL } from "../src/constants.js"
 import {
   batchEvaluateSessions,
   buildEvalFromMessages,
@@ -122,6 +123,56 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
 }
 
 describe("runEvaluation", () => {
+  test("history preprocessing omissions mark partial cards and suppress automatic improvements", async () => {
+    const toolCalls = Array.from(
+      { length: MAX_TOOL_CALLS_EVAL + 1 },
+      (_, index) => ({
+        tool: "tiny",
+        args: "{}",
+        result: "ok",
+        callID: String(index),
+      }),
+    )
+    const pending = buildEvalFromMessages(
+      [
+        {
+          info: { id: "u", role: "user" },
+          parts: [{ type: "text", text: "test" }],
+        },
+        {
+          info: {
+            id: "a",
+            role: "assistant",
+            time: { completed: 1 },
+            finish: "stop",
+          },
+          parts: toolCalls.map((call) => ({
+            type: "tool",
+            tool: call.tool,
+            callID: call.callID,
+            state: { status: "completed", input: {}, output: "ok" },
+          })),
+        },
+      ] as any,
+      "test-session",
+      undefined,
+      0,
+    )
+    expect(pending?.evidenceTruncated).toBe(true)
+    const ctx = mockCtx({ autoUpdateEnabled: true })
+    const record = mock(() => {})
+    ctx.stateStore.recordSession = record as any
+    ctx.scorer.evaluate = mock(async () =>
+      makeScoreCard({
+        overall_score: 0.2,
+        weaknesses: ["tiny missing"],
+        suggested_agents_md_update: "fix",
+      }),
+    ) as any
+    expect(await runEvaluation(pending!, ctx)).toBe(true)
+    expect(record.mock.calls[0]?.[2]?.evidence_truncated).toBe(true)
+    expect(ctx.improvementsPending).toHaveLength(0)
+  })
   test("native latest-window scoring never guesses an older missing checkpoint", async () => {
     const decode = Schema.decodeUnknownSync(SessionMessage.Info)
     const history = normalizeV2History([

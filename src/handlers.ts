@@ -639,7 +639,7 @@ export async function handleBatchScoreSession(
   )
     return "Invalid date range."
   if (ctx.lifetimeSignal?.aborted) return "Kasper has unloaded."
-  if (!ctx.client.session.list) {
+  if (!ctx.historyHost && !ctx.client?.session.list) {
     return "Session listing is not available. Try /kasper score session <id> with a specific session ID instead."
   }
 
@@ -662,8 +662,10 @@ export async function handleBatchScoreSession(
   let rawSessions: SessionListItem[]
   let sessions: SessionInfo[]
   try {
-    const result = await ctx.client.session.list()
-    rawSessions = (result.data ?? []) as SessionListItem[]
+    const result = ctx.historyHost
+      ? { data: await ctx.historyHost.list({ signal: ctx.lifetimeSignal }) }
+      : await ctx.client?.session.list?.()
+    rawSessions = (result?.data ?? []) as SessionListItem[]
     sessions = rawSessions
       .filter((s) => !isKasperSession(s.title))
       .filter((s) => !ctx.kasperSessionIDs.has(s.id))
@@ -855,8 +857,16 @@ export async function executeKasperMigrate(
   ctx: KasperContext,
 ): Promise<string> {
   const arg = rawArg.trim()
-  const showOnly = /\bshow\b|\b--show\b/.test(arg)
-  const name = arg.replace(/\b(show|--show)\b/g, "").trim()
+  const tokens = arg ? arg.split(/\s+/) : []
+  if (tokens.some((token) => token.startsWith("--") && token !== "--show"))
+    return "Unknown migrate flag. Use --show to inspect the source."
+  const showOnly =
+    tokens.includes("--show") || (tokens.length > 1 && tokens.includes("show"))
+  const names = tokens.filter(
+    (token) => token !== "--show" && !(showOnly && token === "show"),
+  )
+  if (names.length > 1) return "Specify one agent name."
+  const name = names[0] ?? ""
   if (!name) {
     return [
       "Usage:",
@@ -1037,8 +1047,13 @@ export async function dispatchKasperCommand(
     case "score":
       return handleScoreCommand(arg, sessionID, ctx)
     case "improve": {
-      const dryRun = /\b--dry-run\b/.test(arg)
-      const cleanArg = arg.replace(/\b--dry-run\b/, "").trim()
+      const tokens = arg.trim() ? arg.trim().split(/\s+/) : []
+      if (
+        tokens.some((token) => token.startsWith("--") && token !== "--dry-run")
+      )
+        return "Unknown improve flag. Use --dry-run to preview."
+      const dryRun = tokens.includes("--dry-run")
+      const cleanArg = tokens.filter((token) => token !== "--dry-run").join(" ")
       return executeKasperImprove({ agent: cleanArg || undefined, dryRun }, ctx)
     }
     case "apply": {
@@ -1225,6 +1240,9 @@ export async function applyPendingImprovement(
       throw new Error("Pending improvement changed during application.")
   }
   try {
+    const coverage = await ctx.instructionCoverage?.(selected.agent_name)
+    if (coverage && !coverage.complete)
+      return `Improvement unsupported: instruction coverage is incomplete: ${coverage.issues.join("; ")}`
     const alreadyWritten = ctx.stateStore
       .getImprovements()
       .some((item) => item.id === selected.id)

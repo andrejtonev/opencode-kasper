@@ -3,6 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 import { calendarDate, validateScoreTarget } from "./actions.js"
 import {
   applyPendingImprovement,
+  dispatchKasperCommand,
   executeKasperHistory,
   executeKasperImprove,
   executeKasperReset,
@@ -18,6 +19,15 @@ export function createKasperTools(
   ctx: KasperContext,
 ): Record<string, ToolDefinition> {
   const definitions: Record<string, ToolDefinition> = {
+    kasper_control: tool({
+      description:
+        "Run a Kasper administrative command and return its result. Bind to the invoking session. Use status, history, help, auto, improve, apply, reset, migrate, or score.",
+      args: { action: $z.string(), arg: $z.string().optional() },
+      execute: async (args, toolCtx) => {
+        const { action, arg } = args as { action: string; arg?: string }
+        return dispatchKasperCommand(action, arg ?? "", toolCtx.sessionID, ctx)
+      },
+    }),
     kasper_status: tool({
       description:
         "Get the Kasper plugin's current status — aggregate scores, weaknesses with per-agent targeting, recent sessions, and improvement history. Use agent param for detailed per-agent breakdown (e.g., status agent build).",

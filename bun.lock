@@ -5,6 +5,8 @@
     "": {
       "name": "observer",
       "dependencies": {
+        "@opencode/client": "2.2.2",
+        "@opencode/schema": "2.2.2",
         "glob": "13.0.5",
         "gray-matter": "4.0.3",
         "jsonc-parser": "^3.3.1",
@@ -14,24 +16,18 @@
         "@biomejs/biome": "^2.4.15",
         "@opencode-ai/plugin": "^1.14.25",
         "@opencode-ai/sdk": "^1.15.11",
-        "@opencode/client": "2.2.2",
         "@opencode/plugin": "2.2.2",
-        "@opencode/schema": "2.2.2",
         "@types/node": "^22.0.0",
         "effect": "4.0.6",
         "typescript": "^5.9.3",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": "^1.14.0",
-        "@opencode/client": "2.2.2",
         "@opencode/plugin": "2.2.2",
-        "@opencode/schema": "2.2.2",
         "effect": "4.0.6",
       },
       "optionalPeers": [
-        "@opencode/client",
         "@opencode/plugin",
-        "@opencode/schema",
         "effect",
       ],
     },

@@ -146,22 +146,22 @@ export interface V2NativeHistoryAccess {
 /** Native Effect calls retain cancellation; no Promise SDK adapter drops the signal. */
 export function v2NativeHistoryAccess(
   session: Pick<Plugin.Context["session"], "get" | "context" | "list">,
+  run: typeof Effect.runPromise = Effect.runPromise,
 ): V2NativeHistoryAccess {
   return {
     get: async (sessionID, signal) =>
       v2SessionDescriptor(
-        await Effect.runPromise(
+        await run(
           session.get({ sessionID: SessionSchema.ID.make(sessionID) }),
           { signal },
         ),
       ),
     context: (sessionID, signal) =>
-      Effect.runPromise(
-        session.context({ sessionID: SessionSchema.ID.make(sessionID) }),
-        { signal },
-      ),
+      run(session.context({ sessionID: SessionSchema.ID.make(sessionID) }), {
+        signal,
+      }),
     list: async (input, signal) => {
-      const result = await Effect.runPromise(
+      const result = await run(
         session.list({
           directory: Schema.decodeUnknownSync(AbsolutePath)(input.directory),
           ...(input.parentID
@@ -320,6 +320,15 @@ export function createV2HistoryHost(options: {
         aborted(input.signal)
         if (records.length > maxMessages)
           throw new Error("Current context exceeds configured history bounds")
+        const after = await get(sessionID, input)
+        if (
+          after.time.updated !== session.time.updated ||
+          after.time.busy !== session.time.busy ||
+          after.time.idle !== session.time.idle
+        )
+          throw new Error(
+            "Session changed while its current context was being read",
+          )
         return {
           status: "ok",
           snapshot: {

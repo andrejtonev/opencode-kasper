@@ -22,7 +22,6 @@ import {
   SESSION_DEBOUNCE_MS,
 } from "./constants.js"
 import { evaluateChildSessions, evaluateSession } from "./evaluate.js"
-import { dispatchKasperCommand } from "./handlers.js"
 import { KasperLogger } from "./logging.js"
 import { AsyncMutex } from "./mutex.js"
 import { _stateStoreRegistry } from "./registry.js"
@@ -458,8 +457,9 @@ Call the matching kasper_* tool:
 - improve → kasper_improve (show user the table, let them pick [N])
 - apply → kasper_apply (index=N)
 - reset → kasper_reset
-- config → (handled by slash command)
-- help → (handled by slash command)`,
+- config/help/auto/pause/resume/migrate → kasper_control (action, arg)
+- Any remaining Kasper action → kasper_control exactly once (action, arg)
+V1 commands use the host model/tool flow. Show the tool result to the user.`,
             description:
               "Inspect or control the Kasper plugin (status|score|improve|apply|history|config|reset|help)",
             suggested: true,
@@ -556,39 +556,9 @@ Call the matching kasper_* tool:
 
     tool: createKasperTools(ctx),
 
-    "command.execute.before": async (
-      input: { command: string; sessionID: string; arguments: string },
-      output: { parts: Part[] },
-    ) => {
-      // The SDK type only declares { parts: Part[] }, but the runtime also reads
-      // .message and .stop for command interception.
-      const out = output as typeof output & { message?: string; stop?: boolean }
-
-      const commandName = input.command.replace(/^\/+/, "").toLowerCase()
-      if (commandName !== "kasper") return
-
-      const rawArg =
-        input.arguments ?? (input as { argument?: string }).argument ?? ""
-      const action = rawArg.trim().split(/\s+/)[0] || ""
-      const restArg = rawArg.slice(action.length).trim()
-      const sessionID = input.sessionID
-
-      if (!runtime.active) {
-        out.message = "Kasper is unloaded."
-        out.stop = true
-        return
-      }
-      try {
-        const result = await runtime.track(() =>
-          dispatchKasperCommand(action, restArg, sessionID, ctx),
-        )
-        out.message = result
-      } catch (err) {
-        out.message = `Kasper error: ${err instanceof Error ? err.message : String(err)}`
-        await ctx.logger.log("command_error", { action, error: String(err) })
-      }
-      out.stop = true
-    },
+    // V1 command templates continue through the host model/tool flow.
+    // The before hook cannot intercept execution through message/stop fields.
+    "command.execute.before": async () => {},
 
     "session.created": async (input: RuntimeHookEvent) => {
       if (!runtime.active) return
@@ -810,7 +780,7 @@ Call the matching kasper_* tool:
 }
 
 async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
-  if (!ctx.client.session.list || !ctx.client.session.messages) return
+  if (!ctx.client?.session.list || !ctx.client.session.messages) return
 
   try {
     const installedAt = ctx.stateStore.getInstalledAt()

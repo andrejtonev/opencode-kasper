@@ -57,6 +57,21 @@ function native(
     list: mock(async () => ({ data: [descriptor], cursor: {} })),
   }
 }
+
+test("current-window read rejects a changed execution anchor after awaiting context", async () => {
+  const access = native()
+  access.context.mockImplementation(async () => {
+    access.get.mockImplementation(async () => ({
+      ...descriptor,
+      time: { ...descriptor.time, updated: 11, busy: 11 },
+    }))
+    return [user(), assistant()]
+  })
+  const host = createV2HistoryHost({ location: { directory }, native: access })
+  await expect(
+    host.read(descriptor.id, { purpose: "current" }),
+  ).rejects.toThrow("changed while its current context")
+})
 function archive(
   pages: Array<{ data: unknown[]; cursor: { next?: string | null } }>,
   session: unknown = descriptor,

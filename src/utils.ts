@@ -140,13 +140,13 @@ export function formatScore(score: number): { emoji: string; pct: string } {
 }
 
 export function showToast(
-  client: OpencodeSessionClient,
+  client: OpencodeSessionClient | undefined,
   title: string,
   message: string,
   variant = "info",
   duration = 8000,
 ) {
-  client.tui
+  client?.tui
     ?.showToast?.({ body: { title, message, variant, duration } } as unknown)
     ?.catch?.((err: unknown) => {
       process.stderr.write(`[kasper] toast failed: ${err}\n`)

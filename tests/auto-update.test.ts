@@ -7,6 +7,25 @@ import { backupDirNameFor } from "../src/agents-md-resolver.js"
 import KasperPlugin from "../src/index.js"
 import { flushKasperState } from "../src/registry.js"
 
+async function invokeKasper(
+  hooks: any,
+  input: any,
+  output: any,
+): Promise<void> {
+  const text = input.arguments ?? input.argument ?? "status"
+  const split = text.trim().indexOf(" ")
+  const action = split < 0 ? text.trim() : text.trim().slice(0, split)
+  const arg = split < 0 ? "" : text.trim().slice(split + 1)
+  try {
+    output.message = await hooks.tool.kasper_control.execute(
+      { action, arg },
+      { sessionID: input.sessionID },
+    )
+  } catch (error) {
+    output.message = String(error)
+  }
+}
+
 function tmpDir(): string {
   return join(tmpdir(), `kasper-au-${randomBytes(6).toString("hex")}`)
 }
@@ -101,7 +120,8 @@ async function fullSession(
   await hooks.event({ event: { type: "session.idle", sessionID } })
 
   const scoreOut: any = {}
-  await hooks["command.execute.before"](
+  await invokeKasper(
+    hooks,
     { command: "kasper", argument: `score session ${sessionID}`, sessionID },
     scoreOut,
   )
@@ -355,7 +375,8 @@ describe("auto-update integration", () => {
 
     // Enable auto-update via command
     const out1: any = {}
-    await hooks["command.execute.before"](
+    await invokeKasper(
+      hooks,
       { command: "kasper", argument: "auto on", sessionID: "toggle-test" },
       out1,
     )
@@ -558,7 +579,8 @@ describe("auto-update integration", () => {
       await hooks.event({ event: { type: "session.idle", sessionID: sid } })
 
       const scoreOut: any = {}
-      await hooks["command.execute.before"](
+      await invokeKasper(
+        hooks,
         {
           command: "kasper",
           argument: `score session ${sid}`,

@@ -252,6 +252,13 @@ export function pendingFromHistoryTurns(
 ): PendingEval | null {
   if (turns.length === 0 || turns.length < minUserMessages) return null
   const pairs = turns.map((turn) => ({
+    evidenceTruncated:
+      turn.user.text.length > MAX_USER_INSTRUCTION_CHARS ||
+      turn.assistants
+        .map((m) => m.text)
+        .filter(Boolean)
+        .join("\n").length > MAX_MESSAGE_CHARS ||
+      turn.assistants.flatMap((m) => m.toolCalls).length > MAX_TOOL_CALLS_EVAL,
     userInstruction: turn.user.text.slice(-MAX_USER_INSTRUCTION_CHARS),
     agentResponse: turn.assistants
       .map((m) => m.text)
@@ -265,6 +272,12 @@ export function pendingFromHistoryTurns(
   }))
   return {
     sessionID,
+    evidenceTruncated:
+      pairs.some((pair) => pair.evidenceTruncated) ||
+      pairs.map((pair) => pair.userInstruction).join("\n---\n").length >
+        MAX_USER_INSTRUCTION_CHARS ||
+      pairs.filter((pair) => pair.agentResponse).length > MAX_MESSAGE_PARTS ||
+      pairs.flatMap((pair) => pair.toolCalls).length > MAX_TOOL_CALLS_EVAL,
     agentName: agent,
     userInstruction: pairs
       .map((p) => p.userInstruction)

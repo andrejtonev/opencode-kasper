@@ -367,6 +367,7 @@ export interface OpencodeSessionClient {
 }
 
 export interface EvalPair {
+  evidenceTruncated?: boolean
   userInstruction: string
   agentResponse: string
   toolCalls: ToolCallRecord[]
@@ -374,6 +375,7 @@ export interface EvalPair {
 }
 
 export interface PendingEval {
+  evidenceTruncated?: boolean
   /** Logical score-record key; host identity is sourceSessionID when different. */
   sessionID: string
   sourceSessionID?: string
@@ -448,7 +450,12 @@ export interface KasperUserContext {
 export interface KasperClientContext {
   generation?: GenerationPort
   historyHost?: HistoryHost
-  client: OpencodeSessionClient
+  historyArchiveAvailable?: boolean
+  client?: OpencodeSessionClient
+  instructionCoverage?: (
+    agentName?: string,
+  ) => Promise<{ complete: boolean; issues: string[] }>
+  automaticImprovementAllowed?: (agentName?: string) => Promise<boolean>
   logger: KasperLogger
   agentsMd: AgentsMdAccess
   agentPrompts: AgentPromptAccess
