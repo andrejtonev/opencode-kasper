@@ -197,13 +197,17 @@ export class AgentsMdManager {
     return files
   }
 
-  async rollback(backupPath?: string): Promise<boolean> {
+  async rollback(
+    backupPath?: string,
+    assertCurrent?: () => void,
+  ): Promise<boolean> {
     const backupDir = this.backupsDir
     const backups = await this.listBackups()
     if (!backupPath && backups.length === 0) return false
     const result = await rollbackInstruction(
       backupPath ?? backups[0].path,
       backupDir,
+      { assertCurrent },
     )
     this.invalidateCache()
     return result

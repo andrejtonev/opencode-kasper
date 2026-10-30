@@ -303,13 +303,18 @@ export class AgentPromptManager {
     return result
   }
 
-  async rollback(agentName: string, backupPath?: string): Promise<boolean> {
+  async rollback(
+    agentName: string,
+    backupPath?: string,
+    assertCurrent?: () => void,
+  ): Promise<boolean> {
     const entries = await this.listBackups(agentName)
     if (!backupPath && !entries.length) return false
     const dir = this.agentDir(agentName)
     const result = await rollbackInstruction(
       backupPath ?? join(dir, entries[0]),
       dir,
+      { assertCurrent },
     )
     this.invalidateSourceCache(agentName)
     return result

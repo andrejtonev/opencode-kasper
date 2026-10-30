@@ -125,10 +125,18 @@ export async function writeGuardedInstruction(
   path: string,
   text: string,
   assertCurrent?: () => void,
+  options: { expectedHash?: string; beforeReplace?: () => Promise<void> } = {},
 ): Promise<void> {
+  const expectedHash =
+    options.expectedHash ?? instructionHash(await readInstructionText(path))
   await writeTextAtomic(path, text, async (from, to) => {
     // Staging/fsync is asynchronous. Recheck at the actual replacement,
     // rather than only before entering the atomic writer.
+    await options.beforeReplace?.()
+    if (instructionHash(await readInstructionText(path)) !== expectedHash)
+      throw new InstructionConflictError(
+        "source changed while staging replacement",
+      )
     assertCurrent?.()
     await rename(from, to)
   })
@@ -236,6 +244,8 @@ export async function commitInstructionUpdate(
     label?: string
     expectedHash?: string
     assertCurrent?: () => void
+    /** Optional staging-boundary integration probe; runs before final source validation. */
+    beforeReplace?: () => Promise<void>
   } = {},
 ): Promise<{
   target: InstructionLocator
@@ -265,7 +275,10 @@ export async function commitInstructionUpdate(
     if (instructionHash(await readInstructionText(target.path)) !== beforeHash)
       throw new InstructionConflictError("source changed during update")
     options.assertCurrent?.()
-    await writeGuardedInstruction(target.path, after, options.assertCurrent)
+    await writeGuardedInstruction(target.path, after, options.assertCurrent, {
+      expectedHash: beforeHash,
+      beforeReplace: options.beforeReplace,
+    })
     if (backupPath) await finishInstructionBackup(backupPath, after)
     return { target, backupPath, beforeHash, afterHash: instructionHash(after) }
   })
@@ -274,6 +287,10 @@ export async function commitInstructionUpdate(
 export async function rollbackInstruction(
   backupPath: string,
   backupDir: string,
+  options: {
+    assertCurrent?: () => void
+    beforeReplace?: () => Promise<void>
+  } = {},
 ): Promise<boolean> {
   const receipt = await readInstructionReceipt(backupPath)
   return withInstructionLock(receipt.target, async (target) => {
@@ -328,9 +345,28 @@ export async function rollbackInstruction(
       instructionHash(current)
     )
       throw new InstructionConflictError("target changed during rollback")
-    if (!receipt.beforeExists)
-      await rm(target.path) // restore absence, not an empty file
-    else await writeTextAtomic(target.path, restored)
+    if (!receipt.beforeExists) {
+      // Restore absence without deleting an external edit made during backup awaits.
+      await options.beforeReplace?.()
+      if (
+        instructionHash(await readInstructionText(target.path)) !==
+        instructionHash(current)
+      )
+        throw new InstructionConflictError(
+          "source changed before rollback removal",
+        )
+      options.assertCurrent?.()
+      await rm(target.path)
+    } else
+      await writeGuardedInstruction(
+        target.path,
+        restored,
+        options.assertCurrent,
+        {
+          expectedHash: instructionHash(current),
+          beforeReplace: options.beforeReplace,
+        },
+      )
     await finishInstructionBackup(
       reverse,
       receipt.beforeExists ? restored : undefined,

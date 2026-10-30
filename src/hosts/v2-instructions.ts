@@ -406,14 +406,18 @@ export class V2AgentPrompts {
     if (confirmed) this.refreshStatus.set(name, "confirmed")
     return confirmed
   }
-  async rollback(name: string, backupPath?: string): Promise<boolean> {
+  async rollback(
+    name: string,
+    backupPath?: string,
+    assertCurrent?: () => void,
+  ): Promise<boolean> {
     const bucket = join(
       this.backupsDir,
       createHash("sha256").update(name).digest("hex"),
     )
     const path = backupPath ?? (await this.backups(bucket))[0]
     if (!path) return false
-    const restored = await rollbackInstruction(path, bucket)
+    const restored = await rollbackInstruction(path, bucket, { assertCurrent })
     if (restored) this.refreshStatus.set(name, "pending")
     return restored
   }
@@ -604,8 +608,8 @@ export function createV2AgentsMd(options: V2InstructionOptions) {
       refreshStatus = "pending"
       return backup
     },
-    rollback: async (backupPath?: string) => {
-      const restored = await local.rollback(backupPath)
+    rollback: async (backupPath?: string, assertCurrent?: () => void) => {
+      const restored = await local.rollback(backupPath, assertCurrent)
       if (restored) refreshStatus = "pending"
       return restored
     },

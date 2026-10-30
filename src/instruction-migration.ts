@@ -132,7 +132,9 @@ export async function migrateInstructionSource(
     )
       throw new InstructionConflictError("destination changed during migration")
     if (existing === undefined) {
-      await writeGuardedInstruction(destination, generated, assertCurrent)
+      await writeGuardedInstruction(destination, generated, assertCurrent, {
+        expectedHash: instructionHash(existing),
+      })
       journal.status = "fileCreated"
       await writeTextAtomic(journalPath, JSON.stringify(journal, null, 2))
     }
@@ -144,7 +146,9 @@ export async function migrateInstructionSource(
       throw new InstructionConflictError(
         `config changed; recover using ${journalPath}`,
       )
-    await writeGuardedInstruction(config, updated, assertCurrent)
+    await writeGuardedInstruction(config, updated, assertCurrent, {
+      expectedHash: instructionHash(original),
+    })
     await finishInstructionBackup(configBackup, updated)
     journal.status = "committed"
     await writeTextAtomic(journalPath, JSON.stringify(journal, null, 2))
