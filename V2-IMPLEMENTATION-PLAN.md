@@ -51,11 +51,11 @@ No force resets, global config rewrites, publication, or title-based deletion of
 | C02 | Integrated | lifecycle_commands | `e8c1176` (agent `8686b77`); 56 focused tests, 565 offline passed/27 skipped; build/typecheck. |
 | C03 | Integrated | storage_instructions | `756bc8b` (agent `91cb886`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
 | C04 | Integrated | storage_instructions | `c1af22c` (agent `c5b0a15`); 163 focused tests; combined C01–C04: 559 top-level tests/typecheck passed. |
-| C05 | In progress | lifecycle_commands | Isolated `migration/c05-sdk`; exact 2.2.2 contracts and native fixture. |
-| C06 | Pending | lifecycle_commands | |
-| C07 | In progress | history_scoring | Isolated `migration/c07-runtime`; lifecycle/session/actions and late-result fences. |
-| C08 | Pending | history_scoring | Runs after C07/C05; generation integration follows C06. |
-| C09 | Pending | storage_instructions | |
+| C05 | Integrated | lifecycle_commands | `faafa4d` (agent `ff07140`); exact 2.2.2 compile contracts; native packed `./server` load and Effect interruption passed. |
+| C06 | In progress | lifecycle_commands | Isolated `migration/c06-generation`; shared scoring/generation ports and safe request budgets. |
+| C07 | Integrated | history_scoring | `73df794` (agent `81790fa`); lifecycle/actions/strict commit fences. Combined integrated tests: 575 top-level passed. |
+| C08 | In progress | history_scoring | Isolated `migration/c08-v2-history`; native normalization, archive capability and manual shared flow. |
+| C09 | In progress | storage_instructions | Isolated `migration/c09-v2-instructions`; authoritative sources, explicit editable targets/overlays. |
 | C10 | Pending | history_scoring | |
 | C11 | Pending | lifecycle_commands | |
 | C12 | Pending | storage_instructions | |
