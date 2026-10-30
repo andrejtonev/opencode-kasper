@@ -77,6 +77,12 @@ localhost provider completed after reset, while Kasper returned cancellation,
 left sessions empty, made no overlapping retry and committed no late score.
 Unknown outcomes must remain quarantined; reset/reload must not be described as
 a provider termination or spend-stop mechanism.
+Interrupted or unknown dispatched native generation quarantines the current plugin scope;
+further judge dispatch requires a new scope through reload. Execution start,
+agent changes and reset can invalidate an active judge as well as a timeout.
+Reload creates a fresh local scope and does not prove the previous provider
+attempt stopped. This restart policy is visible to users, rather than a silent
+retry of an uncertain request.
 
 The isolated native 2.2.2 SDK fixture made exactly one localhost streamed judge
 request and created no session. Its model metadata specified output limit 512,
@@ -102,6 +108,11 @@ regressions verify the exact request ([tool isolation evidence](V2-C10-V1-TOOL-I
 This source-grounded restriction does not remove the host's normal system/config
 context or trusted plugin hooks; it is separate from provider cancellation and
 output limits. Forced-tool runtime qualification belongs to the native acceptance report.
+The actual packed V1 1.18.23 fixture advertised no tools, rejected a malicious
+provider write-tool reply, left the forbidden file absent and deleted the exact
+owned auxiliary session. A second local request continued that same attempt to
+valid 0.8 JSON; it was not an additional evaluation or diagnostic probe. See the
+[native acceptance report](V2-NATIVE-ACCEPTANCE.md) for artifacts and scope.
 
 ## Instructions and recovery
 
