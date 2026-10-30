@@ -94,9 +94,19 @@ export async function runEvaluation(
   pending: PendingEval,
   ctx: KasperContext,
 ): Promise<boolean> {
+  const sourceID = pending.sourceSessionID ?? pending.sessionID
+  pending.lifecycleRevision ??= ctx.runtime?.capture(sourceID)
+  pending.evaluationSignal ??= ctx.runtime?.sessionSignal(sourceID)
+  const current = () =>
+    !ctx.deletedSessions.has(sourceID) &&
+    !ctx.lifetimeSignal?.aborted &&
+    (!pending.lifecycleRevision ||
+      !ctx.runtime ||
+      ctx.runtime.isCurrent(sourceID, pending.lifecycleRevision))
   let scoreRecorded = false
   return ctx.evalMutex
     .runExclusive(async () => {
+      if (!current()) return false
       if (ctx.sessionsEvaluated.has(pending.sessionID)) {
         await ctx.logger.log("run_eval_skipped", {
           sessionID: pending.sessionID,
@@ -199,13 +209,23 @@ export async function runEvaluation(
             agentsMdContent,
             agentName: pending.agentName,
             agentPrompt,
-            userGuidance: ctx.userGuidance.get(pending.sessionID) ?? undefined,
+            userGuidance: ctx.userGuidance.get(sourceID) ?? undefined,
             compacted: pending.compacted,
             agentsMdChanged,
             existingWeaknesses: pending.existingWeaknesses,
           }
           try {
-            const pc = await ctx.scorer.evaluate(pairInput, ctx.client)
+            const evaluate = ctx.scorer.evaluate.bind(ctx.scorer) as (
+              ...args: [
+                ...Parameters<typeof ctx.scorer.evaluate>,
+                { signal?: AbortSignal }?,
+              ]
+            ) => ReturnType<typeof ctx.scorer.evaluate>
+            const pc = await evaluate(
+              { ...pairInput, sessionID: sourceID },
+              ctx.client,
+              { signal: pending.evaluationSignal },
+            )
             pc.agent_prompt_hash = agentPromptHash
             pc.agents_md_hash = agentsMdHash
             if (pc.fallback || !Number.isFinite(pc.overall_score)) return false
@@ -244,7 +264,7 @@ export async function runEvaluation(
           agentsMdContent,
           agentName: pending.agentName,
           agentPrompt,
-          userGuidance: ctx.userGuidance.get(pending.sessionID) ?? undefined,
+          userGuidance: ctx.userGuidance.get(sourceID) ?? undefined,
           compacted: pending.compacted,
           agentsMdChanged,
           existingWeaknesses: pending.existingWeaknesses,
@@ -260,7 +280,17 @@ export async function runEvaluation(
           truncatedToolCalls: pending.toolCalls.length > MAX_TOOL_CALLS_EVAL,
         })
 
-        card = await ctx.scorer.evaluate(scoreInput, ctx.client)
+        const evaluate = ctx.scorer.evaluate.bind(ctx.scorer) as (
+          ...args: [
+            ...Parameters<typeof ctx.scorer.evaluate>,
+            { signal?: AbortSignal }?,
+          ]
+        ) => ReturnType<typeof ctx.scorer.evaluate>
+        card = await evaluate(
+          { ...scoreInput, sessionID: sourceID },
+          ctx.client,
+          { signal: pending.evaluationSignal },
+        )
         card.agent_prompt_hash = agentPromptHash
         card.agents_md_hash = agentsMdHash
       }
@@ -313,6 +343,9 @@ export async function runEvaluation(
         sessionsEvaluatedSizeBefore: ctx.sessionsEvaluated.size,
       })
 
+      if (!current()) return false
+      card.session_id = pending.sessionID
+      const previousRecord = ctx.stateStore.getSession?.(pending.sessionID)
       ctx.stateStore.recordSession(
         pending.sessionID,
         pending.userInstruction.slice(0, 100),
@@ -322,8 +355,33 @@ export async function runEvaluation(
         pending.parentSessionID,
         pending.lastMessageId,
         Date.now(),
+        sourceID,
       )
 
+      try {
+        await ctx.stateStore.flush?.({
+          strict: true,
+          assertCurrent: evaluationGuard(pending, ctx),
+        })
+      } catch (error) {
+        if (
+          !(
+            error instanceof Error &&
+            error.message === "State commit cancelled by an external reset"
+          )
+        )
+          ctx.stateStore.restoreSessionAfterFailedCommit?.(
+            pending.sessionID,
+            previousRecord,
+            card,
+          )
+        await ctx.logger.log("evaluation_persistence_failed", {
+          sessionID: pending.sessionID,
+          error: String(error),
+        })
+        return false
+      }
+      if (!current()) return false
       scoreRecorded = true
       ctx.sessionsEvaluated.add(pending.sessionID)
       ctx.stateStore.addEvaluatedSession?.(pending.sessionID)
@@ -350,11 +408,16 @@ export async function runEvaluation(
       if (aggAfterRecording.total_sessions > 1 && !ctx.isMergingWeaknesses) {
         ctx.isMergingWeaknesses = true
         try {
-          await ctx.stateStore.mergeAllWeaknesses(ctx.scorer, ctx.client)
+          await ctx.stateStore.mergeAllWeaknesses(ctx.scorer, ctx.client, {
+            signal: pending.evaluationSignal,
+            assertCurrent: evaluationGuard(pending, ctx),
+          })
         } finally {
           ctx.isMergingWeaknesses = false
         }
       }
+
+      if (!current()) return scoreRecorded
 
       const expired = ctx.stateStore.expireOldImprovements?.() ?? 0
       if (expired > 0) {
@@ -365,7 +428,7 @@ export async function runEvaluation(
 
       ctx.logger.trim().catch(() => {})
 
-      if (card.overall_score < config.scoring_threshold) {
+      if (current() && card.overall_score < config.scoring_threshold) {
         await considerImprovement(card, ctx, config, pending)
       }
 
@@ -420,7 +483,7 @@ export function buildEvalFromMessages(
 
 export type EvaluationOutcome = {
   sessionID: string
-  status: "scored" | "skipped" | "failed"
+  status: "scored" | "skipped" | "failed" | "cancelled"
   reason:
     | "scored"
     | "already_evaluated"
@@ -432,6 +495,7 @@ export type EvaluationOutcome = {
     | "judge_failed"
     | "owned_session"
     | "deleted_session"
+    | "cancelled"
   detail: string
   scoredKeys: string[]
 }
@@ -441,7 +505,13 @@ export async function evaluateSession(
   sessionID: string,
   ctx: KasperContext,
   agentHint?: string,
+  options: { minimumUserMessages?: number } = {},
 ): Promise<EvaluationOutcome> {
+  const revision = ctx.runtime?.capture(sessionID)
+  const current = () =>
+    !ctx.lifetimeSignal?.aborted &&
+    !ctx.deletedSessions.has(sessionID) &&
+    (!revision || !ctx.runtime || ctx.runtime.isCurrent(sessionID, revision))
   const outcome = (
     status: EvaluationOutcome["status"],
     reason: EvaluationOutcome["reason"],
@@ -492,6 +562,12 @@ export async function evaluateSession(
       "no_content",
       `No messages found for session "${sessionID}".`,
     )
+  if (!current())
+    return outcome(
+      "cancelled",
+      "cancelled",
+      "Evaluation cancelled by a lifecycle change.",
+    )
   const history = normalizeV1History(raw)
   const parentRecord = ctx.stateStore.getSession(sessionID)
   if (
@@ -512,6 +588,12 @@ export async function evaluateSession(
     isIdle,
   )
   const registry = ctx.agentRegistry.get(sessionID)
+  if (complete.length < (options.minimumUserMessages ?? 1))
+    return outcome(
+      "skipped",
+      "incomplete",
+      "Not enough completed user messages for automatic evaluation.",
+    )
   const segments = historySegments(complete, agentHint ?? registry?.agentName)
   if (segments.length === 0)
     return outcome(
@@ -575,12 +657,22 @@ export async function evaluateSession(
     }
     const pending = pendingFromHistoryTurns(turns, key, segment.agentName, 1)
     if (!pending) continue
+    pending.sourceSessionID = sessionID
+    pending.lifecycleRevision = revision
+    pending.evaluationSignal = ctx.runtime?.sessionSignal(sessionID)
     pending.agentType = registry?.agentType ?? "primary"
     pending.parentSessionID = registry?.parentSessionID
     if (previous?.weaknesses.length)
       pending.existingWeaknesses = previous.weaknesses
     ctx.sessionsEvaluated.delete(key)
     if (!(await runEvaluation(pending, ctx))) {
+      if (!current())
+        return outcome(
+          "cancelled",
+          "cancelled",
+          "Evaluation cancelled by a lifecycle change.",
+          scoredKeys,
+        )
       // A concurrent action may have committed this exact range while we waited for the mutex.
       const concurrent = ctx.stateStore.getSession(key)
       if (
@@ -770,7 +862,9 @@ export async function batchEvaluateSessions(
   }
   const scored = outcomes.filter((o) => o.status === "scored")
   const skipped = outcomes.filter((o) => o.status === "skipped")
-  const failed = outcomes.filter((o) => o.status === "failed")
+  const failed = outcomes.filter(
+    (o) => o.status === "failed" || o.status === "cancelled",
+  )
   await ctx.logger.log("batch_evaluate_done", {
     totalInput: sessionIDs.length,
     ok: scored.length,
@@ -806,6 +900,16 @@ export async function batchEvaluateSessions(
   return lines.join("\n")
 }
 
+function evaluationGuard(pending: PendingEval, ctx: KasperContext): () => void {
+  const sourceID = pending.sourceSessionID ?? pending.sessionID
+  return () => {
+    if (ctx.deletedSessions.has(sourceID) || ctx.lifetimeSignal?.aborted)
+      throw new Error("Evaluation cancelled")
+    if (pending.lifecycleRevision)
+      ctx.runtime?.assertCurrent(sourceID, pending.lifecycleRevision)
+  }
+}
+
 async function queueImprovement(
   target: "agents_md" | "agent_prompt",
   agentName: string | undefined,
@@ -819,6 +923,7 @@ async function queueImprovement(
   }
   ctx.improvementsPending.push({
     id: randomUUID(),
+    source_session_id: sessionID,
     timestamp: Date.now(),
     target,
     agent_name: agentName,
@@ -864,6 +969,7 @@ async function applyAgentPromptImprovement(
 ): Promise<void> {
   const agentName = pending.agentName
   if (!agentName) return
+  const assertCurrent = evaluationGuard(pending, ctx)
 
   // Built-in opencode agents (build, plan, general, ...) have hard-coded
   // prompts shipped with opencode. `.opencode/agents/<name>.md` is only
@@ -959,7 +1065,14 @@ async function applyAgentPromptImprovement(
     return
   }
 
-  await ctx.agentPrompts.injectSection(
+  assertCurrent()
+  const inject = ctx.agentPrompts.injectSection.bind(ctx.agentPrompts) as (
+    ...args: [
+      ...Parameters<typeof ctx.agentPrompts.injectSection>,
+      (() => void)?,
+    ]
+  ) => ReturnType<typeof ctx.agentPrompts.injectSection>
+  await inject(
     agentName,
     "Kasper Inferred Instructions",
     updateText,
@@ -967,7 +1080,9 @@ async function applyAgentPromptImprovement(
     BACKUP_MAX_VERSIONS,
     "subagent",
     _config.agent_prompt_inject_mode,
+    assertCurrent,
   )
+  assertCurrent()
   ctx.stateStore.recordImprovement({
     id: randomUUID(),
     timestamp: Date.now(),
@@ -1006,6 +1121,7 @@ async function applyAgentsMdImprovement(
   _config: KasperConfig,
   pending: PendingEval,
 ): Promise<void> {
+  const assertCurrent = evaluationGuard(pending, ctx)
   if (_config.strict_sanitize) {
     const result = sanitizeImprovementText(updateText)
     if (!result.safe) {
@@ -1063,18 +1179,31 @@ async function applyAgentsMdImprovement(
   }
 
   let backupPath = ""
-  await ctx.agentsMd.lockedUpdate(async (existing) => {
-    if (BACKUP_ENABLED) {
-      backupPath = await ctx.agentsMd.backup("pre-improvement")
-    }
-    const sectionName = "Kasper Inferred Instructions"
-    const updated = ctx.agentsMd.injectSection(
-      existing,
-      sectionName,
-      updateText,
-    )
-    return updated
-  })
+  assertCurrent()
+  const manager = ctx.agentsMd as typeof ctx.agentsMd & {
+    applyGuidance?: (
+      content: string,
+      assertCurrent?: () => void,
+    ) => Promise<string | undefined>
+  }
+  if (manager.applyGuidance) {
+    backupPath = (await manager.applyGuidance(updateText, assertCurrent)) ?? ""
+  } else {
+    await ctx.agentsMd.lockedUpdate(async (existing) => {
+      if (BACKUP_ENABLED) {
+        backupPath = await ctx.agentsMd.backup("pre-improvement")
+      }
+      assertCurrent()
+      const sectionName = "Kasper Inferred Instructions"
+      const updated = ctx.agentsMd.injectSection(
+        existing,
+        sectionName,
+        updateText,
+      )
+      return updated
+    })
+  }
+  assertCurrent()
   const reasonText = updateText
   ctx.stateStore.recordImprovement({
     id: randomUUID(),
@@ -1167,7 +1296,7 @@ export async function considerImprovement(
     for (const rejected of ctx.rejectedPatterns) {
       if (weaknessesMergeable(weakness, rejected)) {
         ctx.logger.log("improvement_rejected_cached", {
-          sessionID: pending.sessionID,
+          sessionID: pending.sourceSessionID ?? pending.sessionID,
           weakness,
           matched_rejected: rejected,
         })
@@ -1204,6 +1333,7 @@ export async function considerImprovement(
     (await shouldRerouteBuiltinAgentPrompt(pending.agentName, ctx))
 
   // Prefer local agent/subagent prompt over global AGENTS.md
+  evaluationGuard(pending, ctx)()
   if (isAuto) {
     if (hasAgentPrompt) {
       await applyAgentPromptImprovement(
@@ -1234,7 +1364,7 @@ export async function considerImprovement(
       pending.agentName,
       agentPromptUpdate,
       ctx,
-      pending.sessionID,
+      pending.sourceSessionID ?? pending.sessionID,
       card.weaknesses,
     )
   } else if (rerouteToAgentsMd && agentPromptUpdate) {
@@ -1243,17 +1373,18 @@ export async function considerImprovement(
       pending.agentName,
       agentPromptUpdate,
       ctx,
-      pending.sessionID,
+      pending.sourceSessionID ?? pending.sessionID,
       card.weaknesses,
     )
   }
   if (hasAgentsMd) {
+    evaluationGuard(pending, ctx)()
     await queueImprovement(
       "agents_md",
       pending.agentName,
       agentsMdUpdate,
       ctx,
-      pending.sessionID,
+      pending.sourceSessionID ?? pending.sessionID,
       card.weaknesses,
     )
   }

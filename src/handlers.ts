@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto"
+import { calendarDate, positiveInteger } from "./actions.js"
 import {
   type AgentPromptSource,
   materializeInlinePrompt,
@@ -503,7 +504,7 @@ export async function executeKasperScoreSession(
   sessionID: string | undefined,
   ctx: KasperContext,
 ): Promise<string> {
-  const targetID = sessionID || ctx.lastActiveSessionID
+  const targetID = sessionID
   if (!targetID) {
     return "No session ID provided and no active session."
   }
@@ -592,8 +593,8 @@ async function handleScoreCommand(
 
     const sinceMatch = rest.match(/^since\s+(\d{4}-\d{2}-\d{2})$/i)
     if (sinceMatch) {
-      const since = new Date(sinceMatch[1])
-      if (Number.isNaN(since.getTime()))
+      const since = calendarDate(sinceMatch[1])
+      if (!since)
         return "Invalid date format. Use YYYY-MM-DD (e.g., since 2026-03-01)."
       return handleBatchScoreSession(undefined, since, new Date(), ctx)
     }
@@ -602,15 +603,15 @@ async function handleScoreCommand(
       /^range\s+(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})$/i,
     )
     if (rangeMatch) {
-      const start = new Date(rangeMatch[1])
-      const end = new Date(rangeMatch[2])
-      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+      const start = calendarDate(rangeMatch[1])
+      const end = calendarDate(rangeMatch[2])
+      if (!start || !end || start > end) {
         return "Invalid date format. Use YYYY-MM-DD (e.g., range 2026-03-01 2026-03-15)."
       }
       return handleBatchScoreSession(undefined, start, end, ctx)
     }
 
-    const targetID = rest || ctx.lastActiveSessionID
+    const targetID = rest || sessionID
     if (!targetID) {
       return "No session ID provided and no active session. Use /kasper score session <id> to specify a session."
     }
@@ -629,6 +630,15 @@ export async function handleBatchScoreSession(
   until: Date | undefined,
   ctx: KasperContext,
 ): Promise<string> {
+  if (lastCount !== undefined && !positiveInteger(lastCount))
+    return "Count must be a finite positive integer (maximum 1000)."
+  if (
+    since &&
+    (!Number.isFinite(since.getTime()) ||
+      (until && (!Number.isFinite(until.getTime()) || until < since)))
+  )
+    return "Invalid date range."
+  if (ctx.lifetimeSignal?.aborted) return "Kasper has unloaded."
   if (!ctx.client.session.list) {
     return "Session listing is not available. Try /kasper score session <id> with a specific session ID instead."
   }
@@ -956,6 +966,7 @@ export async function executeKasperReset(
   }
 
   const before = ctx.stateStore.getAggregate()
+  ctx.runtime?.invalidateAll()
   ctx.kasperPaused = true
   await ctx.stateStore.reset()
   ctx.sessionsEvaluated.clear()
@@ -1001,6 +1012,7 @@ export async function dispatchKasperCommand(
   sessionID: string | undefined,
   ctx: KasperContext,
 ): Promise<string> {
+  if (ctx.lifetimeSignal?.aborted) return "Kasper has unloaded."
   if (!action) {
     const agg = ctx.stateStore.getAggregate()
     const { emoji: scoreEmoji, pct: scorePct } = formatScore(agg.avg_score)
@@ -1034,14 +1046,16 @@ export async function dispatchKasperCommand(
         if (ctx.improvementsPending.length === 0) {
           return "No pending improvements. Run /kasper improve to generate suggestions."
         }
-        const count = ctx.improvementsPending.length
+        const selected = ctx.improvementsPending.map((item) => item.id)
         const results: string[] = []
-        while (ctx.improvementsPending.length > 0) {
-          const item = ctx.improvementsPending.shift()
-          if (!item) break
-          results.push(await applyImprovement(item, ctx))
+        for (const id of selected) {
+          const index = ctx.improvementsPending.findIndex(
+            (item) => item.id === id,
+          )
+          if (index >= 0)
+            results.push(await applyPendingImprovement(index + 1, ctx))
         }
-        return `Applied all ${count} pending improvement(s):\n\n${results.join("\n\n")}`
+        return results.join("\n\n")
       }
       const parsed = Number(arg)
       const index = Number.isInteger(parsed) && parsed > 0 ? parsed : NaN
@@ -1049,11 +1063,10 @@ export async function dispatchKasperCommand(
         if (index < 1 || index > ctx.improvementsPending.length) {
           return `Invalid index ${arg}. There are ${ctx.improvementsPending.length} pending improvements. Use /kasper improve to see the list.`
         }
-        const [pending] = ctx.improvementsPending.splice(index - 1, 1)
-        return applyImprovement(pending, ctx)
+        return applyPendingImprovement(index, ctx)
       }
-      const pending = ctx.improvementsPending.shift()
-      if (pending) return applyImprovement(pending, ctx)
+      if (arg) return "Index must be a finite positive integer, or all."
+      if (ctx.improvementsPending.length) return applyPendingImprovement(1, ctx)
       return "No pending improvements. Run /kasper improve to generate suggestions."
     }
     case "history":
@@ -1184,10 +1197,65 @@ export function buildApplyPromptForPendings(
   return lines.join("\n")
 }
 
+const pendingReservations = new WeakMap<KasperContext, Set<string>>()
+
+/** Reserve by stable identity; a rejected or failed application stays queued. */
+export async function applyPendingImprovement(
+  index: number,
+  ctx: KasperContext,
+): Promise<string> {
+  if (!positiveInteger(index) || index > ctx.improvementsPending.length)
+    return `Invalid index ${index}. Use /kasper improve to see the list.`
+  if (ctx.lifetimeSignal?.aborted) return "Kasper has unloaded."
+  const selected = ctx.improvementsPending[index - 1]
+  let reserved = pendingReservations.get(ctx)
+  if (!reserved) {
+    reserved = new Set()
+    pendingReservations.set(ctx, reserved)
+  }
+  if (reserved.has(selected.id))
+    return "This improvement is already being applied."
+  reserved.add(selected.id)
+  const sourceID = selected.source_session_id ?? "kasper-actions"
+  const revision = ctx.runtime?.capture(sourceID)
+  const assertCurrent = () => {
+    if (ctx.lifetimeSignal?.aborted) throw new Error("Kasper has unloaded.")
+    if (revision) ctx.runtime?.assertCurrent(sourceID, revision)
+    if (!ctx.improvementsPending.some((item) => item.id === selected.id))
+      throw new Error("Pending improvement changed during application.")
+  }
+  try {
+    const alreadyWritten = ctx.stateStore
+      .getImprovements()
+      .some((item) => item.id === selected.id)
+    const result = alreadyWritten
+      ? "Improvement was already written; its state acknowledgement has been retried."
+      : await applyImprovement(selected, ctx, assertCurrent)
+    // Successful writes record their exact ID. UI text is never the acknowledgement.
+    if (
+      ctx.stateStore.getImprovements().some((item) => item.id === selected.id)
+    ) {
+      await ctx.stateStore.flush?.({ strict: true, assertCurrent })
+      assertCurrent()
+      const position = ctx.improvementsPending.findIndex(
+        (item) => item.id === selected.id,
+      )
+      if (position >= 0) ctx.improvementsPending.splice(position, 1)
+    }
+    return result
+  } catch (error) {
+    return `Improvement application interrupted: ${error instanceof Error ? error.message : String(error)}. Review the target and backup receipt before retrying.`
+  } finally {
+    reserved.delete(selected.id)
+  }
+}
+
 export async function applyImprovement(
   pending: ImprovementRecord,
   ctx: KasperContext,
+  assertCurrent: () => void = () => {},
 ): Promise<string> {
+  assertCurrent()
   const config = ctx.stateStore.getConfig()
   if (config.strict_sanitize) {
     const sanResult = sanitizeImprovementText(pending.reason)
@@ -1224,9 +1292,15 @@ export async function applyImprovement(
         ...pending,
         target: "agents_md",
       }
-      return applyAgentsMd(rerouted, patterns, ctx, {
-        rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
-      })
+      return applyAgentsMd(
+        rerouted,
+        patterns,
+        ctx,
+        {
+          rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
+        },
+        assertCurrent,
+      )
     }
 
     const promptExisted = await ctx.agentPrompts.exists(pending.agent_name)
@@ -1239,7 +1313,14 @@ export async function applyImprovement(
       }
     }
 
-    const backupPath = await ctx.agentPrompts.injectSection(
+    assertCurrent()
+    const inject = ctx.agentPrompts.injectSection.bind(ctx.agentPrompts) as (
+      ...args: [
+        ...Parameters<typeof ctx.agentPrompts.injectSection>,
+        (() => void)?,
+      ]
+    ) => ReturnType<typeof ctx.agentPrompts.injectSection>
+    const backupPath = await inject(
       pending.agent_name,
       "Kasper Inferred Instructions",
       pending.reason,
@@ -1247,7 +1328,9 @@ export async function applyImprovement(
       BACKUP_MAX_VERSIONS,
       agentMode,
       ctx.config.agent_prompt_inject_mode,
+      assertCurrent,
     )
+    assertCurrent()
     ctx.stateStore.recordImprovement({
       ...pending,
       backup_path: backupPath ?? "",
@@ -1271,7 +1354,7 @@ export async function applyImprovement(
     return `${pending.agent_name} agent prompt updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${restartNote}`
   }
 
-  return applyAgentsMd(pending, patterns, ctx)
+  return applyAgentsMd(pending, patterns, ctx, {}, assertCurrent)
 }
 
 async function applyAgentsMd(
@@ -1279,18 +1362,33 @@ async function applyAgentsMd(
   patterns: string[],
   ctx: KasperContext,
   opts: { rerouteNote?: string } = {},
+  assertCurrent: () => void = () => {},
 ): Promise<string> {
   let backupPath = ""
-  await ctx.agentsMd.lockedUpdate(async (existing) => {
-    if (BACKUP_ENABLED) {
-      backupPath = await ctx.agentsMd.backup("manual-apply")
-    }
-    return ctx.agentsMd.injectSection(
-      existing,
-      "Kasper Inferred Instructions",
-      pending.reason,
-    )
-  })
+  const manager = ctx.agentsMd as typeof ctx.agentsMd & {
+    applyGuidance?: (
+      content: string,
+      assertCurrent?: () => void,
+    ) => Promise<string | undefined>
+  }
+  if (manager.applyGuidance) {
+    backupPath =
+      (await manager.applyGuidance(pending.reason, assertCurrent)) ?? ""
+  } else {
+    assertCurrent()
+    await ctx.agentsMd.lockedUpdate(async (existing) => {
+      if (BACKUP_ENABLED) {
+        backupPath = await ctx.agentsMd.backup("manual-apply")
+      }
+      assertCurrent()
+      return ctx.agentsMd.injectSection(
+        existing,
+        "Kasper Inferred Instructions",
+        pending.reason,
+      )
+    })
+  }
+  assertCurrent()
   ctx.stateStore.recordImprovement({ ...pending, backup_path: backupPath })
   ctx.stateStore.resetWeaknessCounts(patterns)
   showToast(

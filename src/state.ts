@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto"
-import { mkdir, readFile } from "node:fs/promises"
+import { mkdir, readFile, rename } from "node:fs/promises"
 import {
   MAX_EVALUATED_SESSION_SET,
   MAX_EVALUATED_SESSIONS_STORED,
@@ -127,6 +127,7 @@ export class KasperStateStore {
   private baseline: PersistentState
   private readonly flushMutex = new AsyncMutex()
   private dirty = false
+  private closing = false
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private flushingPromise: Promise<void> | null = null
   private version = 0
@@ -252,6 +253,7 @@ export class KasperStateStore {
     parentSessionId?: string,
     lastMsgId?: string,
     lastUpdatedAt?: number,
+    sourceSessionId?: string,
   ): void {
     const existing = this.state.sessions[sessionId]
     if (
@@ -262,6 +264,7 @@ export class KasperStateStore {
       return
     this.state.sessions[sessionId] = {
       title,
+      source_session_id: sourceSessionId,
       agent_name: agentName,
       agent_type: agentType,
       parent_session_id: parentSessionId,
@@ -450,21 +453,27 @@ export class KasperStateStore {
   async mergeAllWeaknesses(
     scorer: Scorer,
     sessionClient: OpencodeSessionClient,
+    options: { signal?: AbortSignal; assertCurrent?: () => void } = {},
   ): Promise<void> {
+    const revision = this.version
+    const current = () => this.version === revision && !options.signal?.aborted
+    if (!current()) return
+    options.assertCurrent?.()
     this.clearWeaknessCache()
     const globalWeaks: WeaknessPattern[] = [...this.weaknessFreq.entries()]
       .map(([pattern, count]) => ({ pattern, count, suggested_fix: "" }))
       .sort((a, b) => b.count - a.count)
 
+    let globalMerged: WeaknessPattern[] | undefined
     if (globalWeaks.length > 1) {
       const merged = await scorer.mergeWeaknesses(globalWeaks, sessionClient)
+      if (!current()) return
       if (merged.length > 0 && merged.length < globalWeaks.length) {
-        const m = new Map(merged.map((w) => [w.pattern, w.count]))
-        this.weaknessFreq = m
+        globalMerged = merged
       }
     }
 
-    let mergedAnyAgent = false
+    const agentMerged = new Map<string, WeaknessPattern[]>()
     for (const [_name, ars] of this.byAgentRunning) {
       const agentWeaks: WeaknessPattern[] = [...ars.weaknessFreq.entries()]
         .map(([pattern, count]) => ({ pattern, count, suggested_fix: "" }))
@@ -472,14 +481,23 @@ export class KasperStateStore {
 
       if (agentWeaks.length > 1) {
         const merged = await scorer.mergeWeaknesses(agentWeaks, sessionClient)
+        if (!current()) return
         if (merged.length > 0 && merged.length < agentWeaks.length) {
-          ars.weaknessFreq = new Map(merged.map((w) => [w.pattern, w.count]))
-          mergedAnyAgent = true
+          agentMerged.set(_name, merged)
         }
       }
     }
 
-    if (globalWeaks.length > 1 || mergedAnyAgent) {
+    if (!current()) return
+    options.assertCurrent?.()
+    if (globalMerged)
+      this.weaknessFreq = new Map(globalMerged.map((w) => [w.pattern, w.count]))
+    for (const [name, merged] of agentMerged) {
+      const agent = this.byAgentRunning.get(name)
+      if (agent)
+        agent.weaknessFreq = new Map(merged.map((w) => [w.pattern, w.count]))
+    }
+    if (globalMerged || agentMerged.size) {
       this.computeAggregateFromRunning()
       this.markDirty()
     }
@@ -583,6 +601,7 @@ export class KasperStateStore {
   }
 
   async reset(): Promise<void> {
+    this.version++ // Revoke merge snapshots immediately, before the awaited reset lock.
     await this.flushMutex.runExclusive(async () => {
       if (this.flushTimer) {
         clearTimeout(this.flushTimer)
@@ -612,8 +631,32 @@ export class KasperStateStore {
 
   /** Explicit session deletion; removing an evaluated marker alone permits rescoring. */
   removeSession(sessionID: string): void {
-    delete this.state.sessions[sessionID]
+    for (const [id, record] of Object.entries(this.state.sessions)) {
+      if (
+        id === sessionID ||
+        record.source_session_id === sessionID ||
+        id.startsWith(`${sessionID}|agent:`)
+      ) {
+        delete this.state.sessions[id]
+        this.evaluatedSet.delete(id)
+      }
+    }
     this.evaluatedSet.delete(sessionID)
+    this.buildRunningState()
+    this.computeAggregateFromRunning()
+    this.markDirty()
+  }
+
+  /** Never restore over a reset, deletion, or a newer record. */
+  restoreSessionAfterFailedCommit(
+    id: string,
+    previous?: SessionRecord,
+    expectedCard?: ScoreCard,
+  ): void {
+    if (expectedCard && this.state.sessions[id]?.score_card !== expectedCard)
+      return
+    if (previous) this.state.sessions[id] = previous
+    else delete this.state.sessions[id]
     this.buildRunningState()
     this.computeAggregateFromRunning()
     this.markDirty()
@@ -627,6 +670,7 @@ export class KasperStateStore {
   }
 
   async destroy(): Promise<void> {
+    this.closing = true
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
@@ -905,19 +949,22 @@ export class KasperStateStore {
   private markDirty(): void {
     this.version++
     this.dirty = true
-    if (!this.flushTimer) {
+    if (!this.closing && !this.flushTimer) {
       this.flushTimer = setTimeout(() => this.flush(), 2000)
     }
   }
 
-  async flush(): Promise<void> {
+  async flush(
+    options: { strict?: boolean; assertCurrent?: () => void } = {},
+  ): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
     }
     const promise = this.flushMutex.runExclusive(async () => {
       if (!this.dirty) return
-      await this.execFlush(this.version)
+      options.assertCurrent?.()
+      await this.execFlush(this.version, options)
     })
     this.flushingPromise = promise
     try {
@@ -927,7 +974,10 @@ export class KasperStateStore {
     }
   }
 
-  private async execFlush(capturedVersion: number): Promise<void> {
+  private async execFlush(
+    capturedVersion: number,
+    options: { strict?: boolean; assertCurrent?: () => void } = {},
+  ): Promise<void> {
     const lockPath = `${this.statePath}.lock`
     let unlock: (() => Promise<void>) | undefined
 
@@ -940,14 +990,19 @@ export class KasperStateStore {
 
     try {
       unlock = await acquireLock(lockPath)
+      const epoch = this.state._reset_epoch ?? "legacy"
       await this.mergeExternalState()
-      await this.doFlush()
+      if (options.strict && (this.state._reset_epoch ?? "legacy") !== epoch)
+        throw new Error("State commit cancelled by an external reset")
+      options.assertCurrent?.()
+      await this.doFlush(options.assertCurrent)
     } catch (err) {
       this.logger?.log("state_flush_error", { error: String(err) })
       this.dirty = true
-      if (!this.flushTimer) {
+      if (!this.closing && !this.flushTimer) {
         this.flushTimer = setTimeout(() => this.flush(), 2000)
       }
+      if (options.strict) throw err
       return
     } finally {
       if (unlock) {
@@ -962,7 +1017,7 @@ export class KasperStateStore {
         capturedVersion,
         newVersion: this.version,
       })
-      if (!this.flushTimer) {
+      if (!this.closing && !this.flushTimer) {
         this.flushTimer = setTimeout(() => this.flush(), 0)
       }
     } else {
@@ -1054,7 +1109,7 @@ export class KasperStateStore {
     }
   }
 
-  private async doFlush(): Promise<void> {
+  private async doFlush(assertCurrent?: () => void): Promise<void> {
     const evaluatedSnapshot = [...this.evaluatedSet]
     const byAgent: Record<
       string,
@@ -1085,7 +1140,14 @@ export class KasperStateStore {
     }
     this.state._integrity = KasperStateStore.computeIntegrityHash(this.state)
     const snapshot = structuredClone(this.state)
-    await writeTextAtomic(this.statePath, JSON.stringify(snapshot, null, 2))
+    await writeTextAtomic(
+      this.statePath,
+      JSON.stringify(snapshot, null, 2),
+      async (source, target) => {
+        assertCurrent?.()
+        await rename(source, target)
+      },
+    )
     // The persisted evaluated list is intentionally bounded, while the
     // in-memory set is larger. Retain its complete comparison base so
     // unchanged older markers do not become fresh writes on every flush.

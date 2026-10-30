@@ -1,7 +1,8 @@
 import type { ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import { calendarDate, validateScoreTarget } from "./actions.js"
 import {
-  applyImprovement,
+  applyPendingImprovement,
   executeKasperHistory,
   executeKasperImprove,
   executeKasperReset,
@@ -16,7 +17,7 @@ const $z = tool.schema
 export function createKasperTools(
   ctx: KasperContext,
 ): Record<string, ToolDefinition> {
-  return {
+  const definitions: Record<string, ToolDefinition> = {
     kasper_status: tool({
       description:
         "Get the Kasper plugin's current status — aggregate scores, weaknesses with per-agent targeting, recent sessions, and improvement history. Use agent param for detailed per-agent breakdown (e.g., status agent build).",
@@ -71,12 +72,7 @@ export function createKasperTools(
       },
       execute: async (args, _toolCtx) => {
         const a = args as { index: number }
-        const idx = a.index - 1
-        if (idx < 0 || idx >= ctx.improvementsPending.length) {
-          return `Invalid index ${a.index}. There are ${ctx.improvementsPending.length} pending improvements. Use /kasper improve to see the list.`
-        }
-        const [selected] = ctx.improvementsPending.splice(idx, 1)
-        return applyImprovement(selected, ctx)
+        return applyPendingImprovement(a.index, ctx)
       },
     }),
     kasper_history: tool({
@@ -126,28 +122,30 @@ export function createKasperTools(
             "End date for range scoring (YYYY-MM-DD). Only used with since.",
           ),
       },
-      execute: async (args, _toolCtx) => {
+      execute: async (args, toolCtx) => {
         const a = args as {
           session_id?: string
           count?: number
           since?: string
           until?: string
         }
+        const invalid = validateScoreTarget(a)
+        if (invalid) return invalid
         if (a.count !== undefined) {
           return handleBatchScoreSession(a.count, undefined, undefined, ctx)
         }
         if (a.since) {
-          const sinceDate = new Date(a.since)
-          const untilDate = a.until ? new Date(a.until) : new Date()
-          if (Number.isNaN(sinceDate.getTime())) {
+          const sinceDate = calendarDate(a.since)
+          const untilDate = a.until ? calendarDate(a.until) : new Date()
+          if (!sinceDate) {
             return `Invalid since date: ${a.since}. Use YYYY-MM-DD format.`
           }
-          if (a.until && Number.isNaN(untilDate.getTime())) {
+          if (!untilDate) {
             return `Invalid until date: ${a.until}. Use YYYY-MM-DD format.`
           }
           return handleBatchScoreSession(undefined, sinceDate, untilDate, ctx)
         }
-        return executeKasperScoreSession(a.session_id, ctx)
+        return executeKasperScoreSession(a.session_id ?? toolCtx.sessionID, ctx)
       },
     }),
     kasper_reset: tool({
@@ -166,4 +164,12 @@ export function createKasperTools(
       },
     }),
   }
+  for (const definition of Object.values(definitions)) {
+    const execute = definition.execute
+    definition.execute = (args, context) =>
+      ctx.runtime
+        ? ctx.runtime.track(() => execute(args, context))
+        : execute(args, context)
+  }
+  return definitions
 }

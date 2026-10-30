@@ -147,6 +147,83 @@ async function setupTestDir(): Promise<string> {
 }
 
 describe("plugin integration", () => {
+  test("public V1 events route creation, message activity and deletion", async () => {
+    const dir = await setupTestDir()
+    const client = makeClient()
+    const hooks = await KasperPlugin({ client: client as any, directory: dir })
+    try {
+      await hooks.event({
+        event: {
+          type: "session.created",
+          properties: {
+            info: { id: "public", agent: "reviewer", title: "task" },
+          },
+        } as any,
+      })
+      const output = { parts: [] } as any
+      await hooks["command.execute.before"](
+        { command: "kasper", sessionID: "public", arguments: "score session" },
+        output,
+      )
+      expect(output.message).toContain("85%")
+      await hooks.event({
+        event: {
+          type: "message.updated",
+          properties: {
+            info: { id: "public-a2", sessionID: "public", role: "assistant" },
+          },
+        } as any,
+      })
+      await hooks.event({
+        event: {
+          type: "session.deleted",
+          properties: { info: { id: "public" } },
+        } as any,
+      })
+      const deleted = { parts: [] } as any
+      await hooks["command.execute.before"](
+        { command: "kasper", sessionID: "public", arguments: "score session" },
+        deleted,
+      )
+      expect(deleted.message).toContain("deleted")
+      await flushKasperState(dir)
+      const state = JSON.parse(
+        await readFile(join(dir, ".opencode", "kasper", "state.json"), "utf-8"),
+      )
+      expect(state.sessions.public).toBeUndefined()
+    } finally {
+      await hooks.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("score tool defaults to its invoking session instead of last activity", async () => {
+    const dir = await setupTestDir()
+    const client = makeClient()
+    const hooks = await KasperPlugin({ client: client as any, directory: dir })
+    try {
+      await hooks["session.created"]({
+        sessionID: "other",
+        info: { agent: "build" },
+      } as any)
+      await hooks.tool.kasper_score_session.execute({}, {
+        sessionID: "caller",
+      } as any)
+      expect(client.session.messages.mock.calls[0][0].path.id).toBe("caller")
+      const invalid = await hooks.tool.kasper_score_session.execute(
+        { count: NaN },
+        { sessionID: "caller" } as any,
+      )
+      expect(invalid).toContain("positive integer")
+      expect(client.session.messages.mock.calls).toHaveLength(1)
+      expect(client.session.delete.mock.calls).not.toContainEqual([
+        { path: { id: "other" } },
+      ])
+    } finally {
+      await hooks.close()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
   let testDir: string
 
   beforeAll(async () => {

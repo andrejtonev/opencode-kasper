@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test"
 import {
+  applyPendingImprovement,
   buildApplyPromptForPendings,
   executeKasperHistory,
   executeKasperImprove,
@@ -8,6 +9,7 @@ import {
   summarizeValidationInProgress,
 } from "../src/handlers.js"
 import { AsyncMutex } from "../src/mutex.js"
+import { KasperRuntime } from "../src/runtime.js"
 import type {
   AggregateStats,
   ImprovementRecord,
@@ -40,6 +42,127 @@ function mockAggregate(
     ...overrides,
   }
 }
+
+test("rejected guidance and invalid indices preserve the exact pending queue", async () => {
+  const ctx = mockCtx()
+  ctx.stateStore.getImprovements = () => []
+  const item = {
+    id: "stable",
+    timestamp: 1,
+    target: "agents_md",
+    reason: "bad",
+    agents_md_diff: "bad",
+    backup_path: "",
+  } as ImprovementRecord
+  ctx.improvementsPending.push(item)
+  for (const index of [NaN, Infinity, 0, -1, 1.5]) {
+    await applyPendingImprovement(index, ctx)
+    expect(ctx.improvementsPending).toEqual([item])
+  }
+  const result = await applyPendingImprovement(1, ctx)
+  expect(result).toContain("rejected")
+  expect(ctx.improvementsPending).toEqual([item])
+})
+
+test("unload blocks queued improvement admission", async () => {
+  const runtime = new KasperRuntime()
+  const ctx = mockCtx({ runtime, lifetimeSignal: runtime.lifetimeSignal })
+  ctx.improvementsPending.push({
+    id: "stable",
+    timestamp: 1,
+    target: "agents_md",
+    reason: "Check inputs carefully before making code changes.",
+    agents_md_diff: "",
+    backup_path: "",
+  })
+  await runtime.dispose()
+  expect(await applyPendingImprovement(1, ctx)).toContain("unloaded")
+  expect(ctx.improvementsPending).toHaveLength(1)
+})
+
+test("concurrent application reserves the stable ID and acknowledges only that item", async () => {
+  const ctx = mockCtx()
+  const applied: ImprovementRecord[] = []
+  ctx.stateStore.getImprovements = () => applied
+  ctx.stateStore.recordImprovement = (item) => {
+    applied.push(item)
+  }
+  ctx.stateStore.resetWeaknessCounts = () => {}
+  let release!: () => void
+  ctx.agentPrompts = {
+    resolve: async () => ({ kind: "file" }),
+    exists: async () => true,
+    injectSection: async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return "backup"
+    },
+  } as any
+  ctx.agentRegistry = new Map()
+  const selected: ImprovementRecord = {
+    id: "selected",
+    timestamp: 1,
+    target: "agent_prompt",
+    agent_name: "reviewer",
+    reason: "Check all input assumptions before modifying implementation.",
+    agents_md_diff: "",
+    backup_path: "",
+  }
+  ctx.improvementsPending = [selected]
+  const application = applyPendingImprovement(1, ctx)
+  while (!release) await Promise.resolve()
+  expect(await applyPendingImprovement(1, ctx)).toContain(
+    "already being applied",
+  )
+  const other = { ...selected, id: "other" }
+  ctx.improvementsPending.unshift(other)
+  release()
+  expect(await application).toContain("updated")
+  expect(applied.map((item) => item.id)).toEqual(["selected"])
+  expect(ctx.improvementsPending.map((item) => item.id)).toEqual(["other"])
+})
+
+test("failed improvement persistence keeps pending identity and retry never repeats the file write", async () => {
+  const ctx = mockCtx()
+  const applied: ImprovementRecord[] = []
+  ctx.stateStore.getImprovements = () => applied
+  ctx.stateStore.recordImprovement = (item) => {
+    applied.push(item)
+  }
+  ctx.stateStore.resetWeaknessCounts = () => {}
+  let writes = 0,
+    fail = true
+  ctx.stateStore.flush = (async () => {
+    if (fail) throw new Error("disk unavailable")
+  }) as any
+  ctx.agentPrompts = {
+    resolve: async () => ({ kind: "file" }),
+    exists: async () => true,
+    injectSection: async () => {
+      writes++
+      return "backup"
+    },
+  } as any
+  ctx.agentRegistry = new Map()
+  ctx.improvementsPending = [
+    {
+      id: "selected",
+      timestamp: 1,
+      target: "agent_prompt",
+      agent_name: "reviewer",
+      reason: "Check all input assumptions before modifying implementation.",
+      agents_md_diff: "",
+      backup_path: "",
+    },
+  ]
+  expect(await applyPendingImprovement(1, ctx)).toContain("interrupted")
+  expect(ctx.improvementsPending).toHaveLength(1)
+  fail = false
+  expect(await applyPendingImprovement(1, ctx)).toContain("already written")
+  expect(writes).toBe(1)
+  expect(ctx.improvementsPending).toHaveLength(0)
+})
 
 function makeSession(
   id: string,

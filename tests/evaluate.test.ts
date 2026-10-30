@@ -9,6 +9,7 @@ import {
   runEvaluation,
 } from "../src/evaluate.js"
 import { AsyncMutex } from "../src/mutex.js"
+import { KasperRuntime } from "../src/runtime.js"
 import type { KasperContext, PendingEval, ScoreCard } from "../src/types.js"
 import { DEFAULT_CONFIG } from "../src/types.js"
 
@@ -116,6 +117,59 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
 }
 
 describe("runEvaluation", () => {
+  test("deleted or reset source cannot commit an in-flight logical range", async () => {
+    for (const reset of [false, true]) {
+      const runtime = new KasperRuntime()
+      let release!: (card: ScoreCard) => void
+      const ctx = mockCtx({ runtime, lifetimeSignal: runtime.lifetimeSignal })
+      const record = mock(() => {})
+      ctx.stateStore.recordSession = record as any
+      ctx.scorer.evaluate = mock(
+        () =>
+          new Promise<ScoreCard>((resolve) => {
+            release = resolve
+          }),
+      ) as any
+      const evaluation = runEvaluation(
+        makePendingEval({
+          sessionID: "s|agent:A|from:a1",
+          sourceSessionID: "s",
+        }),
+        ctx,
+      )
+      while (!release) await Promise.resolve()
+      if (reset) runtime.invalidateAll()
+      else {
+        ctx.deletedSessions.add("s")
+        runtime.invalidateSession("s")
+      }
+      release(makeScoreCard())
+      expect(await evaluation).toBe(false)
+      expect(record).not.toHaveBeenCalled()
+      expect(ctx.sessionsEvaluated.size).toBe(0)
+      await runtime.dispose()
+    }
+  })
+
+  test("failed durable flush preserves evidence for retry and prevents guidance", async () => {
+    const ctx = mockCtx()
+    const restore = mock(() => {})
+    ctx.stateStore.restoreSessionAfterFailedCommit = restore as any
+    ctx.stateStore.flush = mock(async () => {
+      throw new Error("disk unavailable")
+    }) as any
+    ctx.scorer.evaluate = mock(async () =>
+      makeScoreCard({
+        overall_score: 0.2,
+        suggested_agents_md_update:
+          "Always check all relevant inputs before changes.",
+      }),
+    ) as any
+    expect(await runEvaluation(makePendingEval(), ctx)).toBe(false)
+    expect(restore).toHaveBeenCalled()
+    expect(ctx.sessionsEvaluated.size).toBe(0)
+    expect(ctx.improvementsPending).toHaveLength(0)
+  })
   test("records session and adds to sessionsEvaluated", async () => {
     let recorded = false
     const ctx = mockCtx({
@@ -1603,7 +1657,8 @@ describe("history correctness regressions", () => {
     ctx.stateStore.getRecentSessions = (() => [...records.values()]) as any
     const result = await manualEvaluateSession("s", ctx, undefined, false)
     expect(inputs).toHaveLength(3)
-    expect(new Set(inputs.map((i) => i.sessionID)).size).toBe(3)
+    expect(inputs.map((i) => i.sessionID)).toEqual(["s", "s", "s"])
+    expect(records.size).toBe(3)
     expect(inputs.map((i) => i.userInstruction)).toEqual([
       "first request",
       "second request",

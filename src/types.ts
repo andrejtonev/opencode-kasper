@@ -2,6 +2,7 @@ import type { AgentPromptManager } from "./agent-prompts.js"
 import type { AgentsMdManager } from "./agents-md.js"
 import type { KasperLogger } from "./logging.js"
 import type { AsyncMutex } from "./mutex.js"
+import type { EvaluationRevision, KasperRuntime } from "./runtime.js"
 import type { Scorer } from "./scorer.js"
 import type { KasperStateStore } from "./state.js"
 
@@ -227,6 +228,7 @@ export interface PerAgentStats {
 
 export interface SessionRecord {
   title: string
+  source_session_id?: string
   agent_name?: string
   agent_type?: "primary" | "subagent"
   parent_session_id?: string
@@ -250,6 +252,7 @@ export interface AggregateStats {
 
 export interface ImprovementRecord {
   id: string
+  source_session_id?: string
   timestamp: number
   target: "agents_md" | "agent_prompt"
   agent_name?: string
@@ -365,7 +368,11 @@ export interface EvalPair {
 }
 
 export interface PendingEval {
+  /** Logical score-record key; host identity is sourceSessionID when different. */
   sessionID: string
+  sourceSessionID?: string
+  lifecycleRevision?: EvaluationRevision
+  evaluationSignal?: AbortSignal
   agentName?: string
   agentType?: "primary" | "subagent"
   parentSessionID?: string
@@ -418,6 +425,8 @@ export interface KasperScoringContext {
 }
 
 export interface KasperPluginContext {
+  runtime?: KasperRuntime
+  lifetimeSignal?: AbortSignal
   pluginStartTime: number
   lastActiveSessionID?: string
   evaluationPollTimer?: ReturnType<typeof setInterval>

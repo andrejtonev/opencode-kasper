@@ -5,6 +5,7 @@ import type { Event, Part, UserMessage } from "@opencode-ai/sdk"
 import { AgentPromptManager } from "./agent-prompts.js"
 import { AgentsMdManager } from "./agents-md.js"
 import { resolveAgentsMdSource } from "./agents-md-resolver.js"
+import { renderCompactionFeedback } from "./compaction.js"
 import {
   ensureDefaultKasperConfigFile,
   loadKasperConfig,
@@ -15,23 +16,17 @@ import {
   CONFIG_POLL_INTERVAL_MS,
   LOG_MAX_LINES,
   MAX_AGENT_SESSION_IDS,
-  MAX_EVAL_DURATION_MS,
   MAX_SESSION_PARENTS,
   MAX_TRACKED_DELETED_IDS,
   PARENT_CLEANUP_BATCH,
-  SDK_TIMEOUT_MS,
   SESSION_DEBOUNCE_MS,
 } from "./constants.js"
-import {
-  buildEvalFromMessages,
-  evaluateChildSessions,
-  runEvaluation,
-} from "./evaluate.js"
+import { evaluateChildSessions, evaluateSession } from "./evaluate.js"
 import { dispatchKasperCommand } from "./handlers.js"
 import { KasperLogger } from "./logging.js"
 import { AsyncMutex } from "./mutex.js"
-import { clearWriteLocks } from "./prompt-utils.js"
 import { _stateStoreRegistry } from "./registry.js"
+import { KasperRuntime } from "./runtime.js"
 import { Scorer } from "./scorer.js"
 import { KasperStateStore } from "./state.js"
 import { createKasperTools } from "./tools.js"
@@ -42,17 +37,9 @@ import type {
   KasperConfig,
   KasperContext,
 } from "./types.js"
-import {
-  deepEqual,
-  formatScore,
-  getSessionID,
-  isKasperSession,
-  showToast,
-  withTimeout,
-} from "./utils.js"
+import { deepEqual, getSessionID, isKasperSession, showToast } from "./utils.js"
 
-// Runtime hooks not present in the official @opencode-ai/plugin Hooks type.
-// They are dispatched dynamically by the SDK and supplement the polling mechanism.
+// Compatibility handlers for direct callers. Official hosts enter through `event`.
 interface RuntimeHookEvent {
   event?: {
     type?: string
@@ -86,56 +73,6 @@ async function cleanupStaleTempFiles(stateDir: string): Promise<void> {
     }
   } catch {
     /* directory may not exist yet */
-  }
-}
-
-/**
- * Delete kasper-prefixed sessions that are not tracked by the current plugin
- * instance. This is purely a hygiene step - the polling loop already skips
- * kasper sessions, so leaving them in the server has no functional impact.
- * We use a short, bounded timeout here (SDK_TIMEOUT_MS / 2) because this is
- * a background task and we don't want a slow server to make it pile up.
- */
-async function cleanupStaleKasperSessions(
-  ctx: KasperContext,
-  logger: KasperLogger,
-): Promise<void> {
-  if (!ctx.client.session.list || !ctx.client.session.delete) return
-  const cleanupStart = Date.now()
-  try {
-    const allSessions = await withTimeout(
-      ctx.client.session.list(),
-      Math.max(1000, Math.floor(SDK_TIMEOUT_MS / 2)),
-      "stale.session.list",
-    )
-    const sessions = allSessions.data ?? []
-    const stale = sessions.filter(
-      (s) => isKasperSession(s.title) && !ctx.kasperSessionIDs.has(s.id),
-    )
-    if (stale.length === 0) return
-
-    await logger.log("stale_kasper_cleanup_start", {
-      count: stale.length,
-      sessionIDs: stale.map((s) => s.id),
-    })
-    for (const s of stale) {
-      try {
-        await ctx.client.session.delete({ path: { id: s.id } })
-        ctx.kasperSessionIDs.add(s.id)
-        await logger.log("stale_kasper_deleted", { sessionID: s.id })
-      } catch (e) {
-        await logger.log("stale_kasper_delete_failed", {
-          sessionID: s.id,
-          error: String(e),
-        })
-      }
-    }
-    await logger.log("stale_kasper_cleanup_done", {
-      total: stale.length,
-      durationMs: Date.now() - cleanupStart,
-    })
-  } catch (e) {
-    await logger.log("stale_kasper_cleanup_error", { error: String(e) })
   }
 }
 
@@ -370,7 +307,10 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   let lastActiveSessionID: string | undefined
   const pluginStartTime = Date.now()
 
+  const runtime = new KasperRuntime()
   const ctx: KasperContext = {
+    runtime,
+    lifetimeSignal: runtime.lifetimeSignal,
     stateStore,
     agentsMd,
     agentPrompts,
@@ -402,91 +342,76 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
   }
 
   let configReloading = false
-  const configReloadTimer = setInterval(async () => {
-    if (configReloading) return
-    configReloading = true
-    try {
-      const fresh = await loadKasperConfig(cwd, true)
-      const changed = !deepEqual(fresh, ctx.config)
-      if (!changed) return
-      const prevModel = ctx.config.model
-      ctx.config = fresh
-      ctx.stateStore.reloadConfig(fresh)
-      ctx.scorer.reloadModel(fresh)
-      // Re-resolve the rules file if `agents_md_paths` changed, and
-      // push the new resolver inputs into the agent-prompt manager.
-      // Pre-fix, the reload timer only invalidated the AGENTS.md
-      // *content* cache — it left the managers pinned to old paths
-      // until opencode restarted, so editing `agents_md_paths` or
-      // `prompt_paths` in `kasper.json` had no effect (B4).
-      const newAgentsMdSource = await resolveAgentsMdSource(cwd, {
-        agentsMdPaths: fresh.agents_md_paths,
-        globalOpencodeDir: globalDir,
-      })
-      ctx.agentsMd.setResolvedPath(newAgentsMdSource.primary)
-      ctx.agentPrompts.setResolverInputs(globalDir, fresh.prompt_paths)
-      await ctx.logger.log("config_reloaded", {
-        model: fresh.model,
-        prevModel,
-        autoUpdate: fresh.auto_update,
-        threshold: fresh.scoring_threshold,
-        agentsMdPath: newAgentsMdSource.primary,
-        agentsMdReason: newAgentsMdSource.reason,
-      })
-    } catch {
-      await ctx.logger.log("debug", {
-        context: "config_reload",
-        detail: "config load failure is non-fatal",
-      })
-    } finally {
-      configReloading = false
-    }
-  }, CONFIG_POLL_INTERVAL_MS)
+  const configReloadTimer = runtime.every(
+    "config",
+    CONFIG_POLL_INTERVAL_MS,
+    async () => {
+      if (configReloading) return
+      configReloading = true
+      try {
+        const fresh = await loadKasperConfig(cwd, true)
+        const changed = !deepEqual(fresh, ctx.config)
+        if (!changed) return
+        if (!runtime.active) return
+        runtime.invalidateAll()
+        const prevModel = ctx.config.model
+        ctx.config = fresh
+        ctx.autoUpdateEnabled = fresh.auto_update
+        ctx.stateStore.reloadConfig(fresh)
+        ctx.scorer.reloadModel(fresh)
+        // Re-resolve the rules file if `agents_md_paths` changed, and
+        // push the new resolver inputs into the agent-prompt manager.
+        // Pre-fix, the reload timer only invalidated the AGENTS.md
+        // *content* cache — it left the managers pinned to old paths
+        // until opencode restarted, so editing `agents_md_paths` or
+        // `prompt_paths` in `kasper.json` had no effect (B4).
+        const newAgentsMdSource = await resolveAgentsMdSource(cwd, {
+          agentsMdPaths: fresh.agents_md_paths,
+          globalOpencodeDir: globalDir,
+        })
+        if (!runtime.active) return
+        ctx.agentsMd.setResolvedPath(newAgentsMdSource.primary)
+        ctx.agentPrompts.setResolverInputs(globalDir, fresh.prompt_paths)
+        await ctx.logger.log("config_reloaded", {
+          model: fresh.model,
+          prevModel,
+          autoUpdate: fresh.auto_update,
+          threshold: fresh.scoring_threshold,
+          agentsMdPath: newAgentsMdSource.primary,
+          agentsMdReason: newAgentsMdSource.reason,
+        })
+      } catch {
+        await ctx.logger.log("debug", {
+          context: "config_reload",
+          detail: "config load failure is non-fatal",
+        })
+      } finally {
+        configReloading = false
+      }
+    },
+    (error) => {
+      void ctx.logger.log("config_reload_error", { error: String(error) })
+    },
+  )
   ctx.configReloadTimer = configReloadTimer
 
-  // Stale kasper-session cleanup is hygiene, not correctness: pollAndEvaluate
-  // (line 757) already filters kasper sessions out of the polling set, so the
-  // user-facing prompt is unaffected by leaving them in the server. We used
-  // to await client.session.list() synchronously here, but the opencode
-  // server's HTTP listener may not be bound yet at plugin-init time, and the
-  // call then waited the full SDK_TIMEOUT_MS (30s) before timing out. That
-  // blocked opencode startup. Defer the work to the next event-loop tick
-  // (and a short retry) so init returns immediately. The helper guards on
-  // client.session.list / .delete being present at runtime.
-  const cleanupAttempts = [0, 500]
-  for (const delayMs of cleanupAttempts) {
-    setTimeout(() => {
-      cleanupStaleKasperSessions(ctx, logger).catch(() => {
-        /* errors are logged inside the helper */
-      })
-    }, delayMs)
-  }
-
-  const evaluationPollTimer = setInterval(async () => {
-    if (ctx.kasperPaused) return
-
-    if (ctx.evaluationRunning) {
-      if (
-        ctx.evaluationStartedAt &&
-        Date.now() - ctx.evaluationStartedAt > MAX_EVAL_DURATION_MS
-      ) {
-        ctx.logger.log("eval_timeout_skip", {
-          startedAt: new Date(ctx.evaluationStartedAt).toISOString(),
-          duration: Date.now() - ctx.evaluationStartedAt,
-        })
+  const evaluationPollTimer = runtime.every(
+    "evaluation",
+    config.evaluation_poll_interval_ms,
+    async () => {
+      if (ctx.kasperPaused || !ctx.config.enabled) return
+      ctx.evaluationRunning = true
+      ctx.evaluationStartedAt = Date.now()
+      try {
+        await pollAndEvaluate(ctx)
+      } finally {
         ctx.evaluationRunning = false
       }
-      return
-    }
-
-    ctx.evaluationRunning = true
-    ctx.evaluationStartedAt = Date.now()
-    try {
-      await pollAndEvaluate(ctx)
-    } finally {
-      ctx.evaluationRunning = false
-    }
-  }, config.evaluation_poll_interval_ms)
+    },
+    (error) => {
+      void ctx.logger.log("poll_error", { error: String(error) })
+    },
+  )
   ctx.evaluationPollTimer = evaluationPollTimer
 
   async function gracefulShutdown(
@@ -494,9 +419,9 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     configReloadTimer: ReturnType<typeof setInterval>,
     evaluationPollTimer: ReturnType<typeof setInterval>,
   ): Promise<void> {
+    await runtime.dispose()
     clearInterval(configReloadTimer)
     clearInterval(evaluationPollTimer)
-    clearWriteLocks()
     await ctx.logger.log("plugin_unloaded", {
       sessionsEvaluated: ctx.sessionsEvaluated.size,
       improvementsPending: ctx.improvementsPending.length,
@@ -504,7 +429,7 @@ const KasperPlugin: Plugin = async ({ client, directory }) => {
     await ctx.stateStore.destroy()
   }
 
-  return {
+  const hooks = {
     config: async (opencodeConfig: Config) => {
       try {
         opencodeConfig.command ??= {}
@@ -540,7 +465,8 @@ Call the matching kasper_* tool:
       }
     },
 
-    event: async (input: { event: Event }) => {
+    event: async (input: { event: Event }): Promise<void> => {
+      if (!runtime.active) return
       const evt = input.event as unknown as Record<string, unknown>
       const name =
         (evt?.type as string) ||
@@ -553,12 +479,45 @@ Call the matching kasper_* tool:
         return handleErrorEvent(name, evt, ctx)
       }
 
+      const properties = evt.properties as Record<string, unknown> | undefined
+      const info = properties?.info as Record<string, unknown> | undefined
+      const part = properties?.part as Record<string, unknown> | undefined
+      const sid = (properties?.sessionID ??
+        info?.sessionID ??
+        part?.sessionID ??
+        (name.startsWith("session.") ? info?.id : undefined) ??
+        evt.sessionID) as string | undefined
+      const routed = { event: input.event, sessionID: sid } as RuntimeHookEvent
+      if (name === "session.created") return hooks["session.created"](routed)
+      if (name === "session.updated") return hooks["session.updated"](routed)
+      if (name === "session.deleted") return hooks["session.deleted"](routed)
+      if (
+        name === "message.updated" ||
+        name === "message.part.updated" ||
+        name === "message.removed" ||
+        name === "message.part.removed"
+      )
+        return hooks["message.updated"](routed)
+      if (
+        name === "session.status" &&
+        properties?.status &&
+        (properties.status as { type?: string }).type !== "idle" &&
+        sid
+      ) {
+        ctx.idleSessions.delete(sid)
+        if (!ctx.kasperSessionIDs.has(sid)) runtime.invalidateSession(sid)
+      }
+
       if (name === "session.idle") {
         const sid =
           ((evt.properties as Record<string, unknown>)?.sessionID as string) ||
           ((evt.info as Record<string, unknown>)?.id as string) ||
           ((evt as Record<string, unknown>).sessionID as string)
-        if (sid) {
+        if (
+          sid &&
+          !ctx.deletedSessions.has(sid) &&
+          !ctx.kasperSessionIDs.has(sid)
+        ) {
           ctx.idleSessions.add(sid)
           await ctx.logger.log("session_idle", { sessionID: sid })
         }
@@ -591,12 +550,14 @@ Call the matching kasper_* tool:
       const restArg = rawArg.slice(action.length).trim()
       const sessionID = input.sessionID
 
+      if (!runtime.active) {
+        out.message = "Kasper is unloaded."
+        out.stop = true
+        return
+      }
       try {
-        const result = await dispatchKasperCommand(
-          action,
-          restArg,
-          sessionID,
-          ctx,
+        const result = await runtime.track(() =>
+          dispatchKasperCommand(action, restArg, sessionID, ctx),
         )
         out.message = result
       } catch (err) {
@@ -607,6 +568,7 @@ Call the matching kasper_* tool:
     },
 
     "session.created": async (input: RuntimeHookEvent) => {
+      if (!runtime.active) return
       const sessionID = getSessionID(input)
       if (!sessionID) return
 
@@ -620,6 +582,7 @@ Call the matching kasper_* tool:
         return
       }
 
+      runtime.invalidateSession(sessionID)
       ctx.deletedSessions.delete(sessionID)
       ctx.idleSessions.delete(sessionID)
       ctx.lastActiveSessionID = sessionID
@@ -669,15 +632,15 @@ Call the matching kasper_* tool:
     },
 
     "session.updated": async (input: RuntimeHookEvent) => {
+      if (!runtime.active) return
       const sessionID = getSessionID(input)
       if (!sessionID) return
-      ctx.deletedSessions.delete(sessionID)
-      ctx.idleSessions.delete(sessionID)
+      if (ctx.deletedSessions.has(sessionID)) return
       ctx.lastActiveSessionID = sessionID
 
       const { parentID, agentName } = extractAgentInfo(input)
 
-      if (agentName && !agentRegistry.has(sessionID)) {
+      if (agentName) {
         agentRegistry.set(sessionID, {
           agentName,
           agentType: parentID ? "subagent" : "primary",
@@ -687,10 +650,20 @@ Call the matching kasper_* tool:
     },
 
     "session.deleted": async (input: RuntimeHookEvent) => {
+      if (!runtime.active) return
       const sessionID = getSessionID(input)
       if (!sessionID) return
 
+      runtime.invalidateSession(sessionID)
       ctx.deletedSessions.add(sessionID)
+      ctx.idleSessions.delete(sessionID)
+      ctx.stateStore.removeSession(sessionID)
+      for (const key of ctx.sessionsEvaluated)
+        if (key === sessionID || key.startsWith(`${sessionID}|agent:`))
+          ctx.sessionsEvaluated.delete(key)
+      ctx.improvementsPending = ctx.improvementsPending.filter(
+        (p) => p.source_session_id !== sessionID,
+      )
       if (ctx.deletedSessions.size > MAX_TRACKED_DELETED_IDS) {
         const toRemove = [...ctx.deletedSessions].slice(
           0,
@@ -732,11 +705,27 @@ Call the matching kasper_* tool:
     },
 
     "message.updated": async (input: RuntimeHookEvent) => {
+      if (!runtime.active) return
       const sessionID = getSessionID(input) || input.sessionID
       if (!sessionID) return
 
+      if (
+        ctx.kasperSessionIDs.has(sessionID) ||
+        ctx.deletedSessions.has(sessionID)
+      )
+        return
+      runtime.invalidateSession(sessionID)
       ctx.lastActiveSessionID = sessionID
       ctx.idleSessions.delete(sessionID)
+      const { agentName } = extractAgentInfo(input)
+      if (agentName) {
+        const prior = agentRegistry.get(sessionID)
+        agentRegistry.set(sessionID, {
+          agentName,
+          agentType: prior?.agentType ?? "primary",
+          parentSessionID: prior?.parentSessionID,
+        })
+      }
       if (ctx.deletedSessions.has(sessionID)) return
     },
 
@@ -751,8 +740,23 @@ Call the matching kasper_* tool:
       _output: { message: UserMessage; parts: Part[] },
     ) => {
       const sessionID = input.sessionID
+      if (
+        !runtime.active ||
+        ctx.kasperSessionIDs.has(sessionID) ||
+        ctx.deletedSessions.has(sessionID)
+      )
+        return
+      runtime.invalidateSession(sessionID)
       ctx.lastActiveSessionID = sessionID
       ctx.idleSessions.delete(sessionID)
+      if (input.agent) {
+        const prior = agentRegistry.get(sessionID)
+        agentRegistry.set(sessionID, {
+          agentName: input.agent,
+          agentType: prior?.agentType ?? "primary",
+          parentSessionID: prior?.parentSessionID,
+        })
+      }
       if (ctx.deletedSessions.has(sessionID)) return
       if (ctx.kasperSessionIDs.has(sessionID)) return
     },
@@ -764,66 +768,16 @@ Call the matching kasper_* tool:
       const sessionID = input.sessionID
       if (ctx.kasperSessionIDs.has(sessionID)) return
 
-      const agg = ctx.stateStore.getAggregate()
-      if (agg.total_sessions === 0) return
-
-      const lines: string[] = []
-
-      const { emoji: scoreEmoji, pct: scorePct } = formatScore(agg.avg_score)
-      const recent = ctx.stateStore.getRecentSessions(5)
-      let trend = ""
-      if (recent.length >= 2) {
-        const sorted = [...recent].sort((a, b) => a.timestamp - b.timestamp)
-        const first = sorted[0].score
-        const last = sorted[sorted.length - 1].score
-        const delta = last - first
-        if (delta > 0.05) trend = " \u2191 improving"
-        else if (delta < -0.05) trend = " \u2193 worsening"
-        else trend = " \u2192 stable"
-        lines.push(`**Overall score**: ${scoreEmoji} ${scorePct}%${trend}`)
-      }
-
-      const topWeak = agg.top_weaknesses.slice(0, 3)
-      if (topWeak.length > 0) {
-        lines.push(`## Kasper Feedback`)
-        lines.push(
-          `The following issues have been observed across ${agg.total_sessions} session(s):`,
-        )
-        for (const w of topWeak) {
-          lines.push(
-            `${topWeak.indexOf(w) + 1}. **${w.pattern}** (appeared ${w.count} time(s))`,
-          )
-        }
-        lines.push(
-          `Current average adherence score: ${scoreEmoji} ${scorePct}%`,
-        )
-        lines.push(``)
-        lines.push(
-          `Review these patterns and adjust your approach accordingly.`,
-        )
-      }
-
-      const agentInfo = agentRegistry.get(sessionID)
-      if (agentInfo) {
-        const agentAgg = ctx.stateStore.getAgentAggregate(agentInfo.agentName)
-        if (agentAgg && agentAgg.total_sessions > 0) {
-          lines.push(``)
-          lines.push(`### ${agentInfo.agentName} Agent Stats`)
-          lines.push(
-            `Sessions: ${agentAgg.total_sessions}, Avg Score: ${(agentAgg.avg_score * 100).toFixed(0)}%`,
-          )
-          if (agentAgg.top_weaknesses.length > 0) {
-            lines.push(`Top weaknesses for ${agentInfo.agentName}:`)
-            for (const w of agentAgg.top_weaknesses.slice(0, 3)) {
-              lines.push(`- **${w.pattern}** (${w.count}x)`)
-            }
-          }
-        }
-      }
-
-      if (lines.length > 0) {
+      if (!runtime.active) return
+      const agentName = agentRegistry.get(sessionID)?.agentName
+      const text = renderCompactionFeedback(
+        ctx.stateStore.getAggregate(),
+        agentName,
+        agentName ? ctx.stateStore.getAgentAggregate(agentName) : undefined,
+      )
+      if (text) {
         if (!Array.isArray(output.context)) output.context = []
-        output.context.push(lines.join("\n"))
+        output.context.push(text)
       }
     },
 
@@ -832,6 +786,7 @@ Call the matching kasper_* tool:
       _stateStoreRegistry.delete(directory)
     },
   }
+  return hooks
 }
 
 async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
@@ -840,11 +795,8 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
   try {
     const installedAt = ctx.stateStore.getInstalledAt()
 
-    const result = await withTimeout(
-      ctx.client.session.list(),
-      SDK_TIMEOUT_MS,
-      "session.list",
-    )
+    // Keep the polling admission until the host request actually settles.
+    const result = await ctx.client.session.list()
     const allSessions = result.data ?? []
     const sessions = allSessions.filter((s) => {
       if (!s.id) return false
@@ -866,120 +818,28 @@ async function pollAndEvaluate(ctx: KasperContext): Promise<void> {
       })
     }
 
-    for (const s of sessions) {
-      const sid = s.id
-      if (!sid) continue
-      const agentInfo = ctx.agentRegistry.get(sid)
-      const agentName =
-        s.agent || s.agentName || s.subagent_type || agentInfo?.agentName
-
-      const msgsResult = await withTimeout(
-        ctx.client.session.messages({ path: { id: sid } }),
-        SDK_TIMEOUT_MS,
-        "session.messages",
-      )
-      const msgs = msgsResult?.data ?? []
-      if (!msgs.length) continue
-
-      let lastMsgId: string | undefined
-      if (ctx.sessionsEvaluated.has(sid)) {
-        const existing = ctx.stateStore.getSession(sid)
-        if (existing?.last_msg_id) {
-          const foundIdx = msgs.findIndex(
-            (m) => m.info?.id === existing.last_msg_id,
-          )
-          if (foundIdx < 0 || foundIdx === msgs.length - 1) continue
-          lastMsgId = existing.last_msg_id
-        } else {
-          continue
-        }
-        ctx.sessionsEvaluated.delete(sid)
-      }
-
-      const isIdle = ctx.idleSessions.has(sid)
-      const isSubagent = agentInfo?.agentType === "subagent" || s.parentID
-      const minUserMsgs = isSubagent ? 1 : ctx.config.min_session_messages
-      const pending = buildEvalFromMessages(
-        msgs,
-        sid,
-        agentName,
-        minUserMsgs,
-        ctx.registeredCommands,
-        lastMsgId,
-        isIdle,
-      )
-      if (isIdle) {
-        ctx.idleSessions.delete(sid)
-      }
-      if (!pending) {
-        await ctx.logger.log("poll_skip", {
-          sessionID: sid,
-          agentName,
-          msgCount: msgs.length,
-          minUserMsgs,
-          isIdle,
-          reason: "buildEvalFromMessages returned null",
+    for (const session of sessions) {
+      if (ctx.lifetimeSignal?.aborted) return
+      const hint = session.agent || session.agentName || session.subagent_type
+      if (hint && !ctx.agentRegistry.has(session.id))
+        ctx.agentRegistry.set(session.id, {
+          agentName: hint,
+          agentType: session.parentID ? "subagent" : "primary",
+          parentSessionID: session.parentID,
         })
-        continue
-      }
-
-      const storedSession = ctx.stateStore.getSession(sid)
-      if (storedSession?.agents_md_hash) {
-        pending.agentsMdHash = storedSession.agents_md_hash
-      }
-
-      if (agentName && !ctx.agentRegistry.has(sid)) {
-        ctx.agentRegistry.set(sid, {
-          agentName,
-          agentType: s.parentID ? "subagent" : "primary",
-          parentSessionID: s.parentID,
-        })
-      }
-
-      // Ensure agentType and parentSessionID are set on pending before evaluation
-      const registryInfo = ctx.agentRegistry.get(sid)
-      if (registryInfo) {
-        pending.agentType = registryInfo.agentType
-        pending.parentSessionID = registryInfo.parentSessionID
-      } else if (s.parentID) {
-        pending.agentType = "subagent"
-        pending.parentSessionID = s.parentID
-      } else {
-        pending.agentType = "primary"
-      }
-
-      try {
-        await runEvaluation(pending, ctx)
-      } catch (err) {
-        await ctx.logger.log("eval_error", {
-          sessionID: sid,
-          agentName,
-          error: String(err),
-        })
-      }
-
-      // Also evaluate subagent children for primary sessions
-      if (pending.agentType === "primary" || !pending.agentType) {
-        try {
-          const childResults = await evaluateChildSessions(
-            pending.sessionID,
-            ctx,
-            0,
-          )
-          if (childResults.length > 0) {
-            await ctx.logger.log("poll_child_eval", {
-              sessionID: sid,
-              childCount: childResults.length,
-              childIDs: childResults.map((c) => c.id),
-            })
-          }
-        } catch (err) {
-          await ctx.logger.log("poll_child_eval_error", {
-            sessionID: sid,
-            error: String(err),
-          })
-        }
-      }
+      const minimumUserMessages = session.parentID
+        ? 1
+        : ctx.config.min_session_messages
+      const outcome = await evaluateSession(session.id, ctx, hint, {
+        minimumUserMessages,
+      })
+      await ctx.logger.log("poll_evaluation", {
+        sessionID: session.id,
+        status: outcome.status,
+        reason: outcome.reason,
+      })
+      if (!session.parentID && outcome.status === "scored")
+        await evaluateChildSessions(session.id, ctx, 0)
     }
   } catch (err) {
     await ctx.logger.log("poll_error", { error: String(err) })

@@ -232,6 +232,52 @@ describe("KasperStateStore", () => {
     return new KasperStateStore(statePath, backupDir, config)
   }
 
+  test("weakness merge cannot restore a snapshot after reset", async () => {
+    const store = createStore()
+    await store.init()
+    store.recordSession(
+      "s",
+      "task",
+      makeScoreCard({ weaknesses: ["missed validation", "ignored tests"] }),
+      "reviewer",
+    )
+    let release!: (result: any[]) => void
+    const scorer = {
+      mergeWeaknesses: () =>
+        new Promise<any[]>((resolve) => {
+          release = resolve
+        }),
+    }
+    const merge = store.mergeAllWeaknesses(scorer as any, {} as any)
+    while (!release) await Promise.resolve()
+    await store.reset()
+    release([{ pattern: "stale merged issue", count: 2, suggested_fix: "" }])
+    await merge
+    expect(store.getAggregate().total_sessions).toBe(0)
+    expect(store.getAggregate().top_weaknesses).toEqual([])
+    expect(store.getAgentAggregate("reviewer")).toBeUndefined()
+    await store.destroy()
+  })
+
+  test("strict state flush checks lifecycle immediately before atomic replacement", async () => {
+    const store = createStore()
+    await store.init()
+    const before = await readFile(statePath, "utf-8")
+    store.recordSession("s", "task", makeScoreCard())
+    let checks = 0
+    await expect(
+      store.flush({
+        strict: true,
+        assertCurrent: () => {
+          if (++checks >= 3) throw new Error("cancelled before replace")
+        },
+      }),
+    ).rejects.toThrow("cancelled before replace")
+    expect(await readFile(statePath, "utf-8")).toBe(before)
+    store.removeSession("s")
+    await store.destroy()
+  })
+
   test("init creates backup directory and default state file", async () => {
     const store = createStore()
     await store.init()
