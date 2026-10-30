@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto"
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { createHash, randomUUID } from "node:crypto"
+import { mkdir, readFile } from "node:fs/promises"
 import {
   MAX_EVALUATED_SESSION_SET,
   MAX_EVALUATED_SESSIONS_STORED,
@@ -11,8 +11,10 @@ import {
 } from "./constants.js"
 import { acquireLock } from "./lock.js"
 import type { KasperLogger } from "./logging.js"
+import { AsyncMutex } from "./mutex.js"
 import { writeTextAtomic } from "./prompt-utils.js"
 import type { Scorer } from "./scorer.js"
+import { changesFrom, fingerprint, reconcile } from "./state-sync.js"
 import type {
   ImprovementRecord,
   KasperConfig,
@@ -31,6 +33,15 @@ interface AgentRunningStats {
   count: number
   weaknessFreq: Map<string, number>
   strengthFreq: Map<string, number>
+}
+
+type PersistentState = KasperState & { _reset_epoch?: string }
+
+function keyed<T>(
+  values: readonly T[],
+  key: (value: T) => string,
+): Record<string, T> {
+  return Object.fromEntries(values.map((value) => [key(value), value]))
 }
 
 function defaultState(config: KasperConfig): KasperState {
@@ -110,7 +121,11 @@ export function computeStats(
 }
 
 export class KasperStateStore {
-  private state: KasperState
+  private state: PersistentState
+  // The last committed/read snapshot is our three-way merge base. Only
+  // differences from it are intents; stale untouched records never replay.
+  private baseline: PersistentState
+  private readonly flushMutex = new AsyncMutex()
   private dirty = false
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private flushingPromise: Promise<void> | null = null
@@ -134,6 +149,7 @@ export class KasperStateStore {
   ) {
     this.configDefaults = { ...DEFAULT_CONFIG, ...config }
     this.state = defaultState(this.configDefaults)
+    this.baseline = structuredClone(this.state)
   }
 
   /**
@@ -208,6 +224,7 @@ export class KasperStateStore {
       } else {
         this.buildRunningState()
       }
+      this.baseline = structuredClone(this.state)
     } catch {
       this.dirty = true
       if (!this.state.installed_at) {
@@ -237,6 +254,12 @@ export class KasperStateStore {
     lastUpdatedAt?: number,
   ): void {
     const existing = this.state.sessions[sessionId]
+    if (
+      existing?.last_updated_at !== undefined &&
+      lastUpdatedAt !== undefined &&
+      existing.last_updated_at > lastUpdatedAt
+    )
+      return
     this.state.sessions[sessionId] = {
       title,
       agent_name: agentName,
@@ -348,10 +371,14 @@ export class KasperStateStore {
 
   recordImprovement(record: ImprovementRecord): void {
     record.expires_at =
-      this.configDefaults.improvement_expiry_days > 0
-        ? Date.now() + this.configDefaults.improvement_expiry_days * 86400000
+      this.state.config.improvement_expiry_days > 0
+        ? Date.now() + this.state.config.improvement_expiry_days * 86400000
         : undefined
-    this.state.improvements_applied.push(record)
+    const existing = this.state.improvements_applied.findIndex(
+      (i) => i.id === record.id,
+    )
+    if (existing < 0) this.state.improvements_applied.push(record)
+    else this.state.improvements_applied[existing] = record
     this.markDirty()
   }
 
@@ -367,12 +394,13 @@ export class KasperStateStore {
   }
 
   getImprovementBudget(): number {
-    return this.configDefaults.max_agent_guidance_chars
+    return this.state.config.max_agent_guidance_chars
   }
 
   recordBudgetUsage(chars: number): void {
     this.state.improvement_budget_used =
       (this.state.improvement_budget_used ?? 0) + chars
+    this.markDirty()
   }
 
   setImprovementDelta(id: string, delta: number): void {
@@ -555,56 +583,47 @@ export class KasperStateStore {
   }
 
   async reset(): Promise<void> {
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer)
-      this.flushTimer = null
-    }
-    if (this.flushingPromise) {
-      try {
-        await this.flushingPromise
-      } catch {
-        // flush error is non-fatal
+    await this.flushMutex.runExclusive(async () => {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer)
+        this.flushTimer = null
       }
-      this.flushingPromise = null
-    }
+      const unlock = await acquireLock(`${this.statePath}.lock`)
+      try {
+        const installedAt = this.state.installed_at
+        this.state = {
+          ...defaultState(this.state.config),
+          installed_at: installedAt,
+          _reset_epoch: randomUUID(),
+        }
+        this.evaluatedSet.clear()
+        this.deltaScanCursor = undefined
+        this.buildRunningState()
+        this.version++
+        this.dirty = true
+        const resetVersion = this.version
+        await this.doFlush()
+        this.dirty = this.version !== resetVersion
+      } finally {
+        await unlock()
+      }
+    })
+  }
 
-    const installedAt = this.state.installed_at
+  /** Explicit session deletion; removing an evaluated marker alone permits rescoring. */
+  removeSession(sessionID: string): void {
+    delete this.state.sessions[sessionID]
+    this.evaluatedSet.delete(sessionID)
+    this.buildRunningState()
+    this.computeAggregateFromRunning()
+    this.markDirty()
+  }
 
-    this.state.sessions = {}
-    this.state.evaluated_sessions = []
-    this.state.rejected_patterns = []
-    this.state.improvements_applied = []
-    delete this.state._running
-    this.evaluatedSet.clear()
-    this.deltaScanCursor = undefined
-    this.runningSum = 0
-    this.runningCount = 0
-    this.weaknessFreq.clear()
-    this.strengthFreq.clear()
-    this.byAgentRunning.clear()
-    this.clearWeaknessCache()
-    this.state.aggregate = {
-      total_sessions: 0,
-      avg_score: 0,
-      top_weaknesses: [],
-      top_strengths: [],
-      by_agent: {},
-    }
-    if (installedAt) {
-      this.state.installed_at = installedAt
-    }
-    this.dirty = false
-
-    try {
-      await rm(this.statePath, { force: true })
-      await writeFile(
-        this.statePath,
-        JSON.stringify(this.state, null, 2),
-        "utf-8",
-      )
-    } catch {
-      this.dirty = true
-    }
+  removeImprovement(id: string): void {
+    this.state.improvements_applied = this.state.improvements_applied.filter(
+      (i) => i.id !== id,
+    )
+    this.markDirty()
   }
 
   async destroy(): Promise<void> {
@@ -892,17 +911,19 @@ export class KasperStateStore {
   }
 
   async flush(): Promise<void> {
-    this.flushTimer = null
-    if (!this.dirty) return
-    const capturedVersion = this.version
-    const promise = this.execFlush(capturedVersion)
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    const promise = this.flushMutex.runExclusive(async () => {
+      if (!this.dirty) return
+      await this.execFlush(this.version)
+    })
     this.flushingPromise = promise
     try {
       await promise
     } finally {
-      if (this.flushingPromise === promise) {
-        this.flushingPromise = null
-      }
+      if (this.flushingPromise === promise) this.flushingPromise = null
     }
   }
 
@@ -956,78 +977,85 @@ export class KasperStateStore {
   }
 
   private async mergeExternalState(): Promise<void> {
-    let onDisk: KasperState
+    let disk: PersistentState
     try {
-      const raw = await readFile(this.statePath, "utf-8")
-      onDisk = JSON.parse(raw)
-    } catch {
+      disk = JSON.parse(await readFile(this.statePath, "utf-8"))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+      // Never replace a corrupt/unreadable state with an apparent empty store.
+      throw error
+    }
+    if (
+      (disk._reset_epoch ?? "legacy") !==
+      (this.baseline._reset_epoch ?? "legacy")
+    ) {
+      // A reset invalidates all work based on the earlier epoch. Adopt the
+      // durable reset rather than publishing stale pending evaluations.
+      this.state = { ...defaultState(this.state.config), ...disk }
+      this.evaluatedSet = new Set(this.state.evaluated_sessions)
+      this.buildRunningState()
+      this.computeAggregateFromRunning()
+      this.logger?.log("state_reset_fenced", {})
       return
     }
-
-    const ourIds = new Set(this.state.improvements_applied.map((i) => i.id))
-
-    const newSessions: SessionRecord[] = []
-    const ourSessionCount = Object.keys(this.state.sessions).length
-    const diskSessionCount = Object.keys(onDisk.sessions ?? {}).length
-
-    for (const [id, session] of Object.entries(onDisk.sessions ?? {})) {
-      if (!this.state.sessions[id]) {
-        this.state.sessions[id] = session
-        newSessions.push(session)
-      }
-    }
-
-    let newEvalCount = 0
-    for (const sid of onDisk.evaluated_sessions ?? []) {
-      if (!this.evaluatedSet.has(sid)) {
-        this.evaluatedSet.add(sid)
-        newEvalCount++
-      }
-    }
-
-    for (const imp of onDisk.improvements_applied ?? []) {
-      if (!ourIds.has(imp.id)) {
-        this.state.improvements_applied.push(imp)
-      }
-    }
-
-    for (const pattern of onDisk.rejected_patterns ?? []) {
-      if (!this.state.rejected_patterns.includes(pattern)) {
-        this.state.rejected_patterns.push(pattern)
-      }
-    }
-
-    this.pruneHistory()
-
-    if (newSessions.length > 0) {
-      this.logger?.log("state_merge_found_new", {
-        newSessions: newSessions.length,
-        newEvaluated: newEvalCount,
-        ourSessions: ourSessionCount,
-        diskSessions: diskSessionCount,
-        runningCountBefore: this.runningCount,
-      })
-      for (const s of newSessions) {
-        this.incrementAggregate(s)
-      }
+    const before = fingerprint(this.state.sessions)
+    this.state.sessions = reconcile(
+      disk.sessions ?? {},
+      changesFrom(this.baseline.sessions, this.state.sessions),
+      (candidate, current) => {
+        const a = candidate.last_updated_at ?? candidate.timestamp
+        const b = current.last_updated_at ?? current.timestamp
+        return (
+          a > b ||
+          (a === b &&
+            candidate.last_msg_id === current.last_msg_id &&
+            candidate.timestamp > current.timestamp)
+        )
+      },
+    )
+    const baseImprovements = keyed(
+      this.baseline.improvements_applied,
+      (i) => i.id,
+    )
+    this.state.improvements_applied = Object.values(
+      reconcile(
+        keyed(disk.improvements_applied ?? [], (i) => i.id),
+        changesFrom(
+          baseImprovements,
+          keyed(this.state.improvements_applied, (i) => i.id),
+        ),
+      ),
+    )
+    const baseRejected = keyed(this.baseline.rejected_patterns ?? [], (s) => s)
+    this.state.rejected_patterns = Object.values(
+      reconcile(
+        keyed(disk.rejected_patterns ?? [], (s) => s),
+        changesFrom(
+          baseRejected,
+          keyed(this.state.rejected_patterns ?? [], (s) => s),
+        ),
+      ),
+    ).slice(-MAX_REJECTED_PATTERNS)
+    this.evaluatedSet = new Set(
+      Object.values(
+        reconcile(
+          keyed(disk.evaluated_sessions ?? [], (s) => s),
+          changesFrom(
+            keyed(this.baseline.evaluated_sessions ?? [], (s) => s),
+            keyed([...this.evaluatedSet], (s) => s),
+          ),
+        ),
+      ).slice(-MAX_EVALUATED_SESSION_SET),
+    )
+    const pruned = this.pruneHistory()
+    if (before !== fingerprint(this.state.sessions) || pruned.length > 0) {
+      this.buildRunningState()
       this.computeAggregateFromRunning()
-    } else if (newEvalCount > 0) {
-      this.logger?.log("state_merge_new_evaluated_only", {
-        newEvaluated: newEvalCount,
-        ourSessions: ourSessionCount,
-        diskSessions: diskSessionCount,
-      })
-    } else {
-      this.logger?.log("state_merge_nothing_new", {
-        ourSessions: ourSessionCount,
-        diskSessions: diskSessionCount,
-        ourEvaluated: this.evaluatedSet.size,
-        diskEvaluated: onDisk.evaluated_sessions?.length ?? 0,
-      })
     }
   }
 
   private async doFlush(): Promise<void> {
+    const evaluatedSnapshot = [...this.evaluatedSet]
     const byAgent: Record<
       string,
       {
@@ -1045,7 +1073,7 @@ export class KasperStateStore {
         strength_freq: Object.fromEntries(ars.strengthFreq),
       }
     }
-    this.state.evaluated_sessions = [...this.evaluatedSet].slice(
+    this.state.evaluated_sessions = evaluatedSnapshot.slice(
       -MAX_EVALUATED_SESSIONS_STORED,
     )
     this.state._running = {
@@ -1056,6 +1084,12 @@ export class KasperStateStore {
       by_agent: byAgent,
     }
     this.state._integrity = KasperStateStore.computeIntegrityHash(this.state)
-    await writeTextAtomic(this.statePath, JSON.stringify(this.state, null, 2))
+    const snapshot = structuredClone(this.state)
+    await writeTextAtomic(this.statePath, JSON.stringify(snapshot, null, 2))
+    // The persisted evaluated list is intentionally bounded, while the
+    // in-memory set is larger. Retain its complete comparison base so
+    // unchanged older markers do not become fresh writes on every flush.
+    snapshot.evaluated_sessions = evaluatedSnapshot
+    this.baseline = snapshot
   }
 }

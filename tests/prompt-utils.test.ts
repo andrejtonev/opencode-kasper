@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
-import { readFile, rm, writeFile } from "node:fs/promises"
+import { readdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -140,6 +140,49 @@ describe("writeTextAtomic", () => {
     const content = await readFile(path, "utf-8")
     expect(content).toBe("hello world")
     await rm(dir, { recursive: true, force: true })
+  })
+
+  test("persistent Windows sharing failure preserves old bytes and cleans staging files", async () => {
+    const dir = join(tmpdir(), `atomic-${randomBytes(4).toString("hex")}`)
+    const path = join(dir, "test.txt")
+    await writeTextAtomic(path, "previous bytes")
+    let attempts = 0
+    const sharingFailure = async () => {
+      attempts++
+      throw Object.assign(new Error("Windows sharing violation"), {
+        code: "EPERM",
+      })
+    }
+    try {
+      await expect(
+        writeTextAtomic(path, "new bytes", sharingFailure),
+      ).rejects.toThrow("sharing violation")
+      expect(attempts).toBe(5)
+      expect(await readFile(path, "utf-8")).toBe("previous bytes")
+      expect(await readdir(dir)).toEqual(["test.txt"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a transient sharing failure retries an atomic replacement", async () => {
+    const dir = join(tmpdir(), `atomic-${randomBytes(4).toString("hex")}`)
+    const path = join(dir, "test.txt")
+    await writeTextAtomic(path, "old")
+    let attempts = 0
+    const transient: typeof rename = async (from, to) => {
+      if (++attempts < 3)
+        throw Object.assign(new Error("busy"), { code: "EBUSY" })
+      await rename(from, to)
+    }
+    try {
+      await writeTextAtomic(path, "new", transient)
+      expect(attempts).toBe(3)
+      expect(await readFile(path, "utf-8")).toBe("new")
+      expect(await readdir(dir)).toEqual(["test.txt"])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

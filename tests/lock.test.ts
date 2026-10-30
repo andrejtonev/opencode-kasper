@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { acquireLock } from "../src/lock.js"
@@ -75,7 +75,8 @@ describe("acquireLock", () => {
     expect(unlock).toBeInstanceOf(Function)
 
     const content = await readFile(lockPath, "utf-8")
-    expect(content.trim()).toBe(String(process.pid))
+    expect(JSON.parse(content).pid).toBe(process.pid)
+    expect(JSON.parse(content).token).toBeString()
 
     await unlock()
     await rm(dir, { recursive: true, force: true })
@@ -116,6 +117,44 @@ describe("acquireLock", () => {
     const unlock = await acquireLock(lockPath, 1000)
     await unlock()
 
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test("an aged live owner is never reclaimed", async () => {
+    const dir = await tmpLockDir()
+    const path = join(dir, "live.lock")
+    const unlock = await acquireLock(path)
+    try {
+      await utimes(path, new Date(0), new Date(0))
+      await expect(acquireLock(path, 100, 0)).rejects.toThrow(
+        "Failed to acquire",
+      )
+    } finally {
+      await unlock()
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("a replaced owner cannot remove a successor lock", async () => {
+    const dir = await tmpLockDir()
+    const path = join(dir, "successor.lock")
+    const oldUnlock = await acquireLock(path)
+    await rm(path)
+    const successorUnlock = await acquireLock(path)
+    const successor = await readFile(path, "utf-8")
+    await oldUnlock()
+    expect(await readFile(path, "utf-8")).toBe(successor)
+    await successorUnlock()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  test("unknown lock ownership fails closed even when aged", async () => {
+    const dir = await tmpLockDir()
+    const path = join(dir, "unknown.lock")
+    await writeFile(path, "incomplete owner")
+    await utimes(path, new Date(0), new Date(0))
+    await expect(acquireLock(path, 100, 0)).rejects.toThrow()
+    expect(await readFile(path, "utf-8")).toBe("incomplete owner")
     await rm(dir, { recursive: true, force: true })
   })
 })

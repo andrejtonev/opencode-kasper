@@ -1,13 +1,5 @@
 import { randomBytes } from "node:crypto"
-import {
-  mkdir,
-  open,
-  readFile,
-  rename,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises"
+import { mkdir, open, rename, rm, stat } from "node:fs/promises"
 import { dirname } from "node:path"
 
 export function timestampFilename(label: string): string {
@@ -55,16 +47,14 @@ export async function withPathWriteLock<T>(
   const next = new Promise<void>((r) => {
     release = r
   })
-  writeLocks.set(
-    filePath,
-    prev.then(() => next),
-  )
+  const tail = prev.then(() => next)
+  writeLocks.set(filePath, tail)
   try {
     await prev
     return await fn()
   } finally {
     release()
-    if (writeLocks.get(filePath) === next) {
+    if (writeLocks.get(filePath) === tail) {
       writeLocks.delete(filePath)
     }
   }
@@ -73,6 +63,7 @@ export async function withPathWriteLock<T>(
 export async function writeTextAtomic(
   filePath: string,
   content: string,
+  replace: typeof rename = rename,
 ): Promise<void> {
   await withPathWriteLock(filePath, async () => {
     await mkdir(dirname(filePath), { recursive: true })
@@ -89,23 +80,12 @@ export async function writeTextAtomic(
         } finally {
           await handle.close()
         }
-        await rename(tmpPath, filePath)
+        await replace(tmpPath, filePath)
         return
       } catch (err: unknown) {
         lastError = err
-        const errCode = (err as { code?: string }).code
-        if (
-          process.platform === "win32" &&
-          (errCode === "EPERM" || errCode === "EBUSY")
-        ) {
-          try {
-            const data = await readFile(tmpPath, "utf-8")
-            await writeFile(filePath, data, "utf-8")
-            return
-          } catch {
-            /* fall through */
-          }
-        }
+        // Sharing violations on Windows are retried, never degraded into
+        // truncating the live file. Failure preserves the old destination.
         const waitMs = 10 * (attempt + 1)
         await new Promise((resolve) => setTimeout(resolve, waitMs))
       }
