@@ -4,25 +4,38 @@ Kasper is a plugin for [opencode](https://opencode.ai) that monitors agent sessi
 
 > **Unofficial plugin:** This is an independent project and is not affiliated with, endorsed by, or maintained by the opencode team.
 
+This checkout contains the V1/V2 migration work. Package publication is a separate
+step; a registry install does not establish that these changes are published.
+See [support and verified limitations](SUPPORT.md), [migration steps](MIGRATION.md),
+and the [release checklist](RELEASE-CHECKLIST.md) before choosing a host profile.
+
 ## Features
 
-- **LLM-as-Judge Scoring** — Evaluates every session on 5 dimensions: instruction following, completeness, proactiveness, code quality, and communication
+- **LLM-as-Judge Scoring** — Evaluates eligible completed turns on 5 dimensions: instruction following, completeness, proactiveness, code quality, and communication
 - **Automatic Improvements** — Detects recurring weaknesses and injects fixes into `AGENTS.md` or per-agent prompts (auto or manual approval)
 - **Idle-Aware Evaluation** — Sessions scored only when idle or complete, preventing partial-turn scoring
 - **Per-Agent Scoring** — Separate aggregates and weakness profiles per agent
 - **Batch & Retroactive Scoring** — Score past sessions via `/kasper score session <id>` or bulk with `last N`
 - **Subagent Tracking** — Tracks subagent calls and evaluates child sessions independently
 - **Real-time Status** — `/kasper status` shows an In Progress banner with the current evaluation pass, weakness merge, and any pending improvements
-- **Backups & Safety** — Timestamped backups before every change; atomic writes with file locks
-- **Prompt Resolution** — Honours opencode's `agent.<name>.prompt` `{file:...}` and `{path:...}` directives; will not overwrite the wrong file
+- **Backups & Safety** — Standard apply paths preserve source receipts and before-byte backups, with conflict-checked rollback and guarded atomic writes
+- **Prompt Resolution** — Supported V1 file directives and native V2 explicit provenance opt-ins; unknown native origins remain read-only
 
 ## Installation
+
+### Legacy V1 profile
+
+For this unpublished migration checkout, use the packed local installation in
+[MIGRATION.md](MIGRATION.md). Once the desired release is verified in the registry,
+install it and register its package name in your project `opencode.json`:
 
 ```bash
 npm install @atonev/opencode-kasper
 ```
 
-Register the plugin in your `opencode.json` (or in your global `~/.config/opencode/opencode.json`):
+The packaged dual server
+entry supplies V1's legacy function and V2's Effect setup; production package
+loading was verified on V1 host 1.18.23:
 
 ```json
 {
@@ -34,6 +47,14 @@ That's the entire plugin registration — there are no plugin-level options to p
 
 **Verify:** Start a session and run `/kasper status`.
 
+### Native V2 profile
+
+Native V2 uses the pinned `@opencode/plugin` 2.2.2 contracts and the package's
+separate `./server` export. Its configuration uses plural `plugins`, while V1
+uses singular `plugin`. The [migration guide](MIGRATION.md) records the packaged
+local installation, qualified host evidence and native options. Do not register an
+invented package `/v2` subpath or use the older REST SDK `/v2` entry as a plugin API.
+
 ## Commands
 
 | Command | Description |
@@ -43,15 +64,21 @@ That's the entire plugin registration — there are no plugin-level options to p
 | `/kasper improve [agent]` | Numbered table of improvement suggestions; pass `--dry-run` to preview without applying |
 | `/kasper apply [n\|all]` | Apply pending improvement (`n` for an index, `all` for everything queued) |
 | `/kasper history [agent]` | Session history with score breakdowns |
-| `/kasper auto on\|off` | Toggle auto-apply for improvements in the current session |
-| `/kasper migrate <name> [--show]` | Extract an inline `opencode.json` agent prompt to a file so kasper can edit it. With `--show`, just reports the current source |
+| `/kasper auto on\|off` | Toggle auto-apply for the current host instance |
+| `/kasper migrate <name> [--show]` | V1 inline-prompt extraction; `--show` reports the source. Native migration is unsupported |
 | `/kasper reset` | Clear all state (prompts `/kasper reset --force` to confirm) |
 | `/kasper help` | Show all commands |
 
 ## Tools
 
+Native V2 exposes `kasper_control({action, arg?})` for the direct action boundary.
+V1 retains the individual tools below plus `kasper_control`; V1 slash commands
+use the supported model/tool flow. Native also provides `/kasper config`,
+`/kasper pause`, and `/kasper resume` through direct commands.
+
 | Tool | Description |
 |---|---|
+| `kasper_control` | Execute a supported action with optional text arguments; native command results are session/location-correlated receipts |
 | `kasper_status` | Aggregate scores, per-agent breakdown, weaknesses |
 | `kasper_improve` | Numbered improvement suggestions; supports `--dry-run` |
 | `kasper_apply` | Apply by `[N]` index, or `all` |
@@ -61,7 +88,11 @@ That's the entire plugin registration — there are no plugin-level options to p
 
 ## Configuration
 
-Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the `kasper` key in `opencode.json`. Project values override global values; missing fields fall back to the defaults below.
+Use a standalone `kasper.jsonc` or `kasper.json`. V1 also accepts a legacy `kasper`
+key in the invoking directory's `opencode.json`/`opencode.jsonc`; that legacy key
+is applied last and overrides standalone values. Remove it when moving to native
+V2, whose host schema and plugin options are separate. Missing fields use the
+defaults below. See [configuration precedence](MIGRATION.md#configuration).
 
 ### Core
 
@@ -87,11 +118,11 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `scoring_retries` | integer (0–10) | `2` | Retries when the scoring model returns invalid JSON |
-| `scoring_timeout_ms` | integer (10000–600000) | `120000` | Per-attempt timeout for the scoring model call |
+| `scoring_retries` | integer (0–10) | `2` | Retries completed invalid judge output; unknown transport outcomes are not retried |
+| `scoring_timeout_ms` | integer (10000–600000) | `120000` | Per-attempt control deadline; V1 can continue awaiting underlying settlement |
 | `max_score_input_chars` | integer (1000–50000) | `10000` | Cap on input sent to the scoring model per session |
 | `max_agent_guidance_chars` | integer (200–5000) | `1200` | Cap on the size of each generated improvement (`AGENTS.md` or per-agent) |
-| `improvement_expiry_days` | integer (0–365) | `60` | Inactive improvements are pruned after this many days. `0` = never expire |
+| `improvement_expiry_days` | integer (0–365) | `60` | Active improvement metadata retention. Expiry does not remove previously written guidance; use an explicit reviewed rollback. `0` disables expiry |
 
 ### Safety
 
@@ -109,7 +140,7 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
 
 ### Example
 
-`~/.config/opencode/kasper.jsonc` (recommended — full JSONC support including comments):
+`.opencode/kasper.jsonc` (project-local, supported by both profiles, with JSONC comments):
 
 ```jsonc
 {
@@ -123,7 +154,7 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
 }
 ```
 
-…or as a nested `kasper` key in `opencode.json`:
+For V1 only, a legacy nested `kasper` key in `opencode.json` is also accepted:
 
 ```json
 {
@@ -136,9 +167,17 @@ Loaded from `~/.config/opencode/kasper.jsonc`, `.opencode/kasper.jsonc`, or the 
 }
 ```
 
-The `kasper.jsonc` file always wins over the `kasper` key in `opencode.json` if both exist. Project-local config overrides global config; the global config file lives at `~/.config/opencode/kasper.jsonc` (or wherever `XDG_CONFIG_HOME` points).
+Within each directory `kasper.jsonc` is preferred to `kasper.json`. Standalone
+project values override global values; V1's legacy nested `kasper` key overrides
+both. The global search honors `XDG_CONFIG_HOME` and Windows fallback locations.
 
 ## Agent Prompt Resolution
+
+This section describes the **V1 resolver**. Native V2 reads effective catalog
+system text and authoritative layered configuration entries. Editing requires
+an explicit source identity or an owned append overlay; unknown or transformed
+origins remain read-only. Native V2 combines applicable AGENTS.md sources and
+does not use CLAUDE.md fallback. See [native source policy](SUPPORT.md#instructions-and-recovery).
 
 Kasper follows opencode's own agent resolution rules when deciding **where** to read and write an agent's prompt. For an agent named `<name>`:
 
@@ -174,7 +213,8 @@ How kasper writes an improvement into the resolved prompt file is controlled by 
   <!-- kasper: 2026-06-08T12:00:00.000Z -->
   <guidance>
   ```
-  Self-documenting, easy to spot in a diff, easy to roll back via `/kasper rollback <agent>`.
+  Self-documenting and easy to review in a diff. Rollback uses the recorded source
+  receipt; V1 does not register a `/kasper rollback` command. See [recovery](SUPPORT.md#instructions-and-recovery).
 - **`inline`** — appends the guidance directly at the end of the file with no section header:
   ```markdown
   <!-- kasper-injected:begin -->
@@ -199,6 +239,9 @@ Scores display as 🟢 ≥80%, 🟡 ≥60%, 🔴 <60%. The `/kasper status` comm
 
 ## How It Works
 
+The V1 hook flow is below. Native V2 uses scoped Effect services, explicit archive
+and instruction coverage, and direct command receipts described in [SUPPORT.md](SUPPORT.md).
+
 1. **Observe** — Hooks on `chat.message` and `session.created` accumulate session data; configurable polling catches idle sessions
 2. **Evaluate** — LLM-as-judge scores each session across 5 dimensions; large sessions split into per-pair evaluation
 3. **Improve** — Recurring weaknesses trigger suggestions (`AGENTS.md` or per-agent prompt); auto-applied or queued for review
@@ -215,11 +258,11 @@ The `/kasper status` In Progress banner surfaces what's happening right now: pau
 ## Development
 
 ```bash
-bun install            # Install dependencies
+bun install --frozen-lockfile # Install pinned dependencies
 bun run build          # Compile TypeScript
 bun run typecheck      # Type-check only
 bun run lint           # Lint with biome
-bun test               # ~504 unit tests (503 pass, 1 pre-existing fail in auto-update.test.ts)
+bun test               # Offline suite; opt-in native/provider tests are skipped
 bun run test:e2e       # End-to-end tests (requires OPENCODE_E2E=1 and the opencode binary)
 ```
 

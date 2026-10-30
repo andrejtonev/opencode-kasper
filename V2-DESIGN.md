@@ -1,5 +1,12 @@
 # Kasper V1/V2 migration: collected verification and design
 
+> **Implementation and acceptance update:** Follow [SUPPORT.md](SUPPORT.md) and
+> [the execution ledger](V2-IMPLEMENTATION-PLAN.md) for the final contracts.
+> Separate root/server exports preserve a legacy function module, but C11 found
+> host 1.18.23 also prefers `./server` for ordinary package identity. The final
+> dual server entry supplies the legacy function; explicit compiled-file loading
+> is an alternative. This assessment remains review history.
+
 Reviewed: 2026-10-30. Repository baseline: `de180b07bbff177740358163958b41de86ca06be`, Kasper 1.2.0.
 
 ## Decision

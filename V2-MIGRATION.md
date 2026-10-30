@@ -1,5 +1,11 @@
 # OpenCode V1/V2 migration assessment
 
+> **Historical assessment, superseded for installation and support.** This guide
+> records the initial 2.0.8 API review. Use [SUPPORT.md](SUPPORT.md) for the current
+> pinned contracts and acceptance limits, [MIGRATION.md](MIGRATION.md) for migration
+> steps, and [V2-IMPLEMENTATION-PLAN.md](V2-IMPLEMENTATION-PLAN.md) for task results.
+> The original assessment below is preserved as review history.
+
 Recorded: 2026-10-30.
 
 Baseline: `main` at `de180b07bbff177740358163958b41de86ca06be`, Kasper 1.2.0. The repository's default branch is `main`; it is not named `master`.

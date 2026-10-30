@@ -1,5 +1,13 @@
 # Pinned V2 SDK contracts and native loading evidence
 
+> **Acceptance correction:** C05 proved V2 fixture loading, not ordinary V1
+> package-name compatibility. C11 found host 1.18.23 also selects `./server` from
+> package identity. The final dual server entry supplies its legacy function;
+> use the qualified package/file profiles in the current
+> [support matrix](SUPPORT.md); the original contract-spike record below is preserved.
+> C11 also required client/schema 2.2.2 as ordinary runtime dependencies: the
+> clean native host supplies plugin/Effect services, but not the schema package.
+
 C05, reviewed 2026-10-30. The SDK, client and schema are pinned to **2.2.2**, and Effect to **4.0.6**. These optional peers are installed for development; the production default remains the existing V1 function. No production V2 setup or dummy compatibility entrypoint is exported by this chunk.
 
 ## Verified package layout

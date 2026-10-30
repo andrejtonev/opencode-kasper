@@ -1,11 +1,16 @@
 # Kasper E2E Tests
 
+This directory contains legacy opt-in integration tests and some deterministic
+in-process resolver regressions. It is not the native V2 acceptance matrix.
+Use [the support record](../../SUPPORT.md) and [release checklist](../../RELEASE-CHECKLIST.md)
+for packaged V1/V2 qualification and its isolated host harness.
+
 End-to-end tests that exercise the Kasper plugin through a real `opencode` binary.
 
 ## Prerequisites
 
 - `opencode` binary on `$PATH`
-- Set `OPENCODE_E2E=1` to enable (tests are skipped otherwise)
+- Set `OPENCODE_E2E=1` to enable opt-in tests (the in-process resolver tests can still run without it)
 - Kasper plugin symlinked at `~/.config/opencode/plugins/opencode-kasper.ts`
 - Tests use `--dangerously-skip-permissions` and free-tier models
 
@@ -38,8 +43,10 @@ required, no LLM scoring — deterministic and fast (~40ms total).
 
 Other test files in `tests/e2e/` that may run without the opencode binary:
 
-- `oh-my-opencode.test.ts` — uses `AgentPromptManager` directly for
-  plugin-config scenarios; the omo npm install runs in `beforeAll`.
+- `oh-my-opencode.test.ts` uses `AgentPromptManager` directly for plugin-config
+  scenarios, but still requires `OPENCODE_E2E=1` and installs the external package
+  from npm in `beforeAll`. Its result does not qualify arbitrary plugin-origin
+  writes in native V2, whose source provenance is explicitly restricted.
 
 ## Running
 
