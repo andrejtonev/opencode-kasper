@@ -51,20 +51,44 @@
     "test:watch": "bun test --watch",
     "test:e2e": "OPENCODE_E2E=1 bun test --timeout 300000 tests/e2e/",
     "prepublishOnly": "npm run build",
-    "install-plugin": "node scripts/symlink-plugin.mjs"
+    "install-plugin": "node scripts/symlink-plugin.mjs",
+    "typecheck:contracts": "tsc -p tests/contracts/tsconfig.json",
+    "verify:native-sdk": "bun scripts/verify-native-sdk.ts"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1",
     "zod": "^4.4.3"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.14.0"
+    "@opencode-ai/plugin": "^1.14.0",
+    "@opencode/plugin": "2.2.2",
+    "effect": "4.0.6",
+    "@opencode/client": "2.2.2",
+    "@opencode/schema": "2.2.2"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.14.25",
     "@opencode-ai/sdk": "^1.15.11",
     "@biomejs/biome": "^2.4.15",
     "@types/node": "^22.0.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "@opencode/plugin": "2.2.2",
+    "effect": "4.0.6",
+    "@opencode/client": "2.2.2",
+    "@opencode/schema": "2.2.2"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "effect": {
+      "optional": true
+    },
+    "@opencode/client": {
+      "optional": true
+    },
+    "@opencode/schema": {
+      "optional": true
+    }
   }
 }
