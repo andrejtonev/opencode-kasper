@@ -136,7 +136,7 @@ export interface V2NativeHistoryAccess {
     input: {
       directory: string
       parentID?: string
-      order: "asc"
+      order?: "asc"
       cursor?: string
     },
     signal?: AbortSignal,
@@ -163,11 +163,17 @@ export function v2NativeHistoryAccess(
     list: async (input, signal) => {
       const result = await run(
         session.list({
-          directory: Schema.decodeUnknownSync(AbsolutePath)(input.directory),
-          ...(input.parentID
-            ? { parentID: SessionSchema.ID.make(input.parentID) }
+          ...(!input.cursor
+            ? {
+                directory: Schema.decodeUnknownSync(AbsolutePath)(
+                  input.directory,
+                ),
+                ...(input.parentID
+                  ? { parentID: SessionSchema.ID.make(input.parentID) }
+                  : {}),
+                order: input.order ?? "asc",
+              }
             : {}),
-          order: input.order,
           ...(input.cursor
             ? {
                 cursor: Schema.decodeUnknownSync(SessionSchema.ListCursor)(
@@ -278,8 +284,7 @@ export function createV2HistoryHost(options: {
           {
             directory: options.location.directory,
             parentID: input?.parentID,
-            order: "asc",
-            cursor,
+            ...(cursor ? { cursor } : { order: "asc" }),
           },
           input?.signal,
         )
@@ -368,8 +373,7 @@ export function createV2HistoryHost(options: {
           {
             sessionID,
             limit: Math.min(200, maxMessages),
-            order: "asc",
-            cursor,
+            ...(cursor ? { cursor } : { order: "asc" }),
           },
           { signal: input.signal },
         )

@@ -9,6 +9,28 @@ import {
   v2NativeHistoryAccess,
 } from "../src/v2-history.js"
 
+test("native cursor requests omit direction and filters already encoded in the opaque cursor", async () => {
+  const list = mock(() => Effect.succeed({ data: [], cursor: {} }))
+  const access = v2NativeHistoryAccess({
+    list,
+    get: () => Effect.never,
+    context: () => Effect.succeed([]),
+  } as any)
+  await access.list({ directory, parentID: "ses_parent", order: "asc" })
+  await access.list({
+    directory,
+    parentID: "ses_parent",
+    order: "asc",
+    cursor: "opaque",
+  })
+  expect(list.mock.calls[0][0]).toMatchObject({
+    directory,
+    parentID: "ses_parent",
+    order: "asc",
+  })
+  expect(list.mock.calls[1][0]).toEqual({ cursor: "opaque" })
+})
+
 const directory = process.cwd()
 const descriptor: SessionDescriptor = {
   id: "ses_test",
@@ -254,8 +276,12 @@ test("explicit archive reads every ascending page and forwards cancellation", as
   expect(reader.client.message.list.mock.calls[1][0]).toEqual({
     sessionID: "ses_test",
     limit: 200,
-    order: "asc",
     cursor: "page2",
+  })
+  expect(reader.client.message.list.mock.calls[0][0]).toEqual({
+    sessionID: "ses_test",
+    limit: 200,
+    order: "asc",
   })
   expect(reader.client.message.list.mock.calls[1][1].signal).toBe(
     controller.signal,

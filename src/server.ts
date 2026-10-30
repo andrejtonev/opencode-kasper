@@ -5,7 +5,7 @@ import { OpenCode } from "@opencode/client"
 import type { Plugin } from "@opencode/plugin/effect"
 import { Config } from "@opencode/schema/config"
 import type { Plugin as LegacyPlugin } from "@opencode-ai/plugin"
-import { Effect, Schedule, Schema, Stream } from "effect"
+import { Effect, Schema } from "effect"
 import { parse } from "jsonc-parser"
 import {
   type CommandRequest,
@@ -25,6 +25,7 @@ import {
 import { KasperLogger } from "./logging.js"
 import { AsyncMutex } from "./mutex.js"
 import { executeNativeAction } from "./native-actions.js"
+import { superviseNativeEvents } from "./native-events.js"
 import { _stateStoreRegistry } from "./registry.js"
 import { KasperRuntime } from "./runtime.js"
 import { Scorer } from "./scorer.js"
@@ -380,9 +381,9 @@ export const KasperServer: Plugin.Plugin = {
           if (text) event.system.push({ type: "text", text })
         }),
       )
-      yield* context.event.subscribe().pipe(
-        Stream.retry(Schedule.spaced(1000)),
-        Stream.runForEach((event) =>
+      yield* superviseNativeEvents(
+        context.event.subscribe(),
+        (event) =>
           Effect.tryPromise(async () => {
             if (
               event.location &&
@@ -444,15 +445,9 @@ export const KasperServer: Plugin.Plugin = {
               )
               await stateStore.flush()
             }
-          }).pipe(
-            Effect.catch((error) =>
-              Effect.promise(() =>
-                logger.log("native_event_error", { error: String(error) }),
-              ),
-            ),
-          ),
-        ),
-        Effect.forkScoped,
+          }),
+        runtime,
+        (error) => logger.log("native_event_error", { error: String(error) }),
       )
       let lastPoll = 0
       runtime.every(

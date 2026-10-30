@@ -8,7 +8,7 @@ The implementation compiles against pinned `@opencode/plugin`, `@opencode/client
 
 `./tui` provides native `setup` plus a benign legacy `tui()` entry, with a type-only plugin import. The legacy loader shape is source-verified; C11 must qualify production TUI behavior. Exact ordinary runtime dependencies include client/schema because the native loader does not inject these packages.
 
-Native setup captures Effect services, scopes the event fiber, and owns timers/actions/generation with the shared lifetime/revision runtime. Native session/history/catalog calls use the captured Effect runner. Per-event failure is logged without terminating later event routing; stream failures retry with a bounded delay. Poll cadence follows reloaded config, while changing the state directory requires a restart. Deletion removes records by exact source identity, including synthetic agent ranges. Compaction uses the shared bounded pure renderer and the actual compaction agent.
+Native setup captures Effect services, scopes the event fiber, and owns timers/actions/generation with the shared lifetime/revision runtime. Native session/history/catalog calls use the captured Effect runner. Per-event failure and logger rejection cannot terminate later routing. Unexpected subscription completion or failure aborts the runtime and closes admission; reload is required, and late judgments cannot commit. Poll cadence follows reloaded config, while changing the state directory requires a restart. Deletion removes records by exact source identity, including synthetic agent ranges. Compaction uses the shared bounded pure renderer and the actual compaction agent.
 
 ## Options and capabilities
 
@@ -41,3 +41,7 @@ Request IDs bind raw command, session, and location. A matching in-flight retry 
 - Command tests cover concurrent deduplication, payload binding, eviction/capacity refusal, and pre-admission validation. History tests cover the post-context execution race; preprocessing regression covers more than 25 tiny tools and suppression of improvements.
 - Flags regression proves dry-run preserves instructions/pending queue, `--show` preserves the exact agent name and config bytes, unknown flags do not mutate, and the V1 before hook does not reset state.
 - Actual production packing, host loading, provider receipts/cancellation, and TUI qualification belong to C11; these local checks do not claim public publication or live provider acceptance. Host retry/model output limits are not a demonstrated physical output/spend ceiling.
+
+## Native acceptance followup
+
+C11 actual packed server qualification found that pagination cursors cannot be combined with an explicit order. Archive message reads now set `order: asc` only on the initial request and omit absent cursors; subsequent pages pass the opaque cursor. Native session listing likewise omits order and filters encoded by its cursor, while validating each returned identity/location/parent. Tests assert the exact public request shapes. The public plugin event domain promises a stream without guaranteeing it cannot terminate. Scoped supervision therefore fails closed on any unexpected completion, typed error or defect, and tolerates handler/logging failures. Deterministic asynchronous tests prove closed admission and canceled late commits. Actual provider/package acceptance remains C11's qualification.

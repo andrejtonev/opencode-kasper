@@ -22,7 +22,6 @@ export const fixture = Plugin.define({
         yield* context.session.list({
           cursor: next,
           limit: 20,
-          order: "asc",
           directory: context.location.directory,
         })
       yield* context.command.transform((editor) =>
@@ -100,7 +99,6 @@ export function archivePage(message: MessageApi, sessionID: Session.ID) {
     if (page.cursor.next)
       yield* message.list({
         sessionID,
-        order: "asc",
         limit: 20,
         cursor: page.cursor.next,
       })
