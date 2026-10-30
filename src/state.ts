@@ -9,6 +9,7 @@ import {
   TOP_WEAKNESSES_COUNT,
   WEAKNESS_SIMILARITY_THRESHOLD,
 } from "./constants.js"
+import type { GenerationPort } from "./generation.js"
 import { acquireLock } from "./lock.js"
 import type { KasperLogger } from "./logging.js"
 import { AsyncMutex } from "./mutex.js"
@@ -27,6 +28,15 @@ import type {
 } from "./types.js"
 import { categorizeWeakness, DEFAULT_CONFIG } from "./types.js"
 import { weaknessesMergeable, weaknessSimilarity } from "./utils.js"
+
+function eligibleWeaknesses(session: SessionRecord): string[] {
+  return session.score_card.evidence_truncated ? [] : session.weaknesses
+}
+function eligibleStrengths(session: SessionRecord): string[] {
+  return session.score_card.evidence_truncated
+    ? []
+    : session.score_card.strengths
+}
 
 interface AgentRunningStats {
   sum: number
@@ -83,6 +93,7 @@ export function computeStats(
   const strengthMap = new Map<string, number>()
 
   for (const e of entries) {
+    if (e.score_card.evidence_truncated) continue
     let weight = 1
     if (decayDays > 0) {
       const ageMs = now - e.timestamp
@@ -309,6 +320,7 @@ export class KasperStateStore {
   }
 
   private populateSuggestedFixes(card: ScoreCard, agentName?: string): void {
+    if (card.evidence_truncated) return
     const populate = (weaknesses: WeaknessPattern[]) => {
       for (const w of weaknesses) {
         if (w.suggested_fix && w.target) continue
@@ -324,6 +336,7 @@ export class KasperStateStore {
           if (card.session_id) {
             const entry = Object.values(this.state.sessions).find(
               (s) =>
+                !s.score_card.evidence_truncated &&
                 s.agent_name &&
                 weaknessesMergeable(
                   s.score_card.weaknesses.join(" "),
@@ -452,7 +465,7 @@ export class KasperStateStore {
 
   async mergeAllWeaknesses(
     scorer: Scorer,
-    sessionClient: OpencodeSessionClient,
+    sessionClient: OpencodeSessionClient | GenerationPort,
     options: { signal?: AbortSignal; assertCurrent?: () => void } = {},
   ): Promise<void> {
     const revision = this.version
@@ -466,7 +479,9 @@ export class KasperStateStore {
 
     let globalMerged: WeaknessPattern[] | undefined
     if (globalWeaks.length > 1) {
-      const merged = await scorer.mergeWeaknesses(globalWeaks, sessionClient)
+      const merged = await scorer.mergeWeaknesses(globalWeaks, sessionClient, {
+        signal: options.signal,
+      })
       if (!current()) return
       if (merged.length > 0 && merged.length < globalWeaks.length) {
         globalMerged = merged
@@ -480,7 +495,9 @@ export class KasperStateStore {
         .sort((a, b) => b.count - a.count)
 
       if (agentWeaks.length > 1) {
-        const merged = await scorer.mergeWeaknesses(agentWeaks, sessionClient)
+        const merged = await scorer.mergeWeaknesses(agentWeaks, sessionClient, {
+          signal: options.signal,
+        })
         if (!current()) return
         if (merged.length > 0 && merged.length < agentWeaks.length) {
           agentMerged.set(_name, merged)
@@ -753,10 +770,10 @@ export class KasperStateStore {
     for (const session of Object.values(this.state.sessions)) {
       this.runningSum += session.score
       this.runningCount++
-      for (const w of session.weaknesses) {
+      for (const w of eligibleWeaknesses(session)) {
         this.mergeWeaknessIntoMap(this.weaknessFreq, w, 1)
       }
-      for (const s of session.score_card.strengths) {
+      for (const s of eligibleStrengths(session)) {
         this.strengthFreq.set(s, (this.strengthFreq.get(s) ?? 0) + 1)
       }
 
@@ -773,10 +790,10 @@ export class KasperStateStore {
       }
       ars.sum += session.score
       ars.count++
-      for (const w of session.weaknesses) {
+      for (const w of eligibleWeaknesses(session)) {
         this.mergeWeaknessIntoMap(ars.weaknessFreq, w, 1)
       }
-      for (const s of session.score_card.strengths) {
+      for (const s of eligibleStrengths(session)) {
         ars.strengthFreq.set(s, (ars.strengthFreq.get(s) ?? 0) + 1)
       }
     }
@@ -803,10 +820,10 @@ export class KasperStateStore {
   private incrementAggregate(session: SessionRecord): void {
     this.runningSum += session.score
     this.runningCount++
-    for (const w of session.weaknesses) {
+    for (const w of eligibleWeaknesses(session)) {
       this.mergeWeaknessIntoMap(this.weaknessFreq, w, 1)
     }
-    for (const s of session.score_card.strengths) {
+    for (const s of eligibleStrengths(session)) {
       this.strengthFreq.set(s, (this.strengthFreq.get(s) ?? 0) + 1)
     }
 
@@ -823,10 +840,10 @@ export class KasperStateStore {
     }
     ars.sum += session.score
     ars.count++
-    for (const w of session.weaknesses) {
+    for (const w of eligibleWeaknesses(session)) {
       this.mergeWeaknessIntoMap(ars.weaknessFreq, w, 1)
     }
-    for (const s of session.score_card.strengths) {
+    for (const s of eligibleStrengths(session)) {
       ars.strengthFreq.set(s, (ars.strengthFreq.get(s) ?? 0) + 1)
     }
   }
@@ -835,10 +852,10 @@ export class KasperStateStore {
     for (const session of sessions) {
       this.runningSum -= session.score
       this.runningCount--
-      for (const w of session.weaknesses) {
+      for (const w of eligibleWeaknesses(session)) {
         this.unmergeWeaknessFromMap(this.weaknessFreq, w)
       }
-      for (const s of session.score_card.strengths) {
+      for (const s of eligibleStrengths(session)) {
         const c = (this.strengthFreq.get(s) ?? 0) - 1
         if (c <= 0) this.strengthFreq.delete(s)
         else this.strengthFreq.set(s, c)
@@ -849,10 +866,10 @@ export class KasperStateStore {
       if (ars) {
         ars.sum -= session.score
         ars.count--
-        for (const w of session.weaknesses) {
+        for (const w of eligibleWeaknesses(session)) {
           this.unmergeWeaknessFromMap(ars.weaknessFreq, w)
         }
-        for (const s of session.score_card.strengths) {
+        for (const s of eligibleStrengths(session)) {
           const c = (ars.strengthFreq.get(s) ?? 0) - 1
           if (c <= 0) ars.strengthFreq.delete(s)
           else ars.strengthFreq.set(s, c)

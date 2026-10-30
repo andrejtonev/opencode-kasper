@@ -4,10 +4,7 @@ import {
   BACKUP_MAX_VERSIONS,
   isBuiltinAgentName,
   MAX_EVALUATED_SESSION_SET,
-  MAX_MESSAGE_CHARS,
   MAX_PENDING_IMPROVEMENTS,
-  MAX_TOOL_CALLS_EVAL,
-  MAX_USER_INSTRUCTION_CHARS,
 } from "./constants.js"
 import type { V1HistoryMessage } from "./history.js"
 import {
@@ -16,7 +13,9 @@ import {
   normalizeV1History,
   pendingFromHistoryTurns,
 } from "./history.js"
+import { generationForContext } from "./hosts/v1-generation.js"
 import type { ScorerInput } from "./scorer.js"
+import { scoringEvidenceSize } from "./scoring-evidence.js"
 import type {
   KasperConfig,
   KasperContext,
@@ -87,6 +86,7 @@ function aggregateScoreCards(cards: ScoreCard[], sessionID: string): ScoreCard {
     )?.suggested_agent_prompt_update,
     weakness_suggestions: cards.flatMap((c) => c.weakness_suggestions ?? []),
     fallback: cards.some((c) => c.fallback),
+    evidence_truncated: cards.some((c) => c.evidence_truncated) || undefined,
   }
 }
 
@@ -174,21 +174,21 @@ export async function runEvaluation(
       }
 
       const fullResponse = pending.agentResponseParts.join("\n")
-      const agentResponse =
-        fullResponse.length > MAX_MESSAGE_CHARS
-          ? fullResponse.slice(0, MAX_MESSAGE_CHARS)
-          : fullResponse
-
-      const toolCalls =
-        pending.toolCalls.length > MAX_TOOL_CALLS_EVAL
-          ? pending.toolCalls.slice(-MAX_TOOL_CALLS_EVAL)
-          : pending.toolCalls
+      const agentResponse = fullResponse
+      const toolCalls = pending.toolCalls
 
       let card: ScoreCard
       const maxInputChars = ctx.config.max_score_input_chars
       if (
         pending.pairs.length > 1 &&
-        pending.userInstruction.length + fullResponse.length > maxInputChars
+        scoringEvidenceSize({
+          sessionID: sourceID,
+          userInstruction: pending.userInstruction,
+          agentResponse: fullResponse,
+          toolCalls,
+          subagentCalls: pending.subagentCalls,
+          agentsMdContent: "",
+        }) > maxInputChars
       ) {
         await ctx.logger.log("evaluation_split", {
           sessionID: pending.sessionID,
@@ -200,11 +200,9 @@ export async function runEvaluation(
           const pair = pending.pairs[i]
           const pairInput: ScorerInput = {
             sessionID: pending.sessionID,
-            userInstruction: pair.userInstruction.slice(
-              -MAX_USER_INSTRUCTION_CHARS,
-            ),
-            agentResponse: pair.agentResponse.slice(0, MAX_MESSAGE_CHARS),
-            toolCalls: pair.toolCalls.slice(-MAX_TOOL_CALLS_EVAL),
+            userInstruction: pair.userInstruction,
+            agentResponse: pair.agentResponse,
+            toolCalls: pair.toolCalls,
             subagentCalls: pair.subagentCalls,
             agentsMdContent,
             agentName: pending.agentName,
@@ -215,15 +213,9 @@ export async function runEvaluation(
             existingWeaknesses: pending.existingWeaknesses,
           }
           try {
-            const evaluate = ctx.scorer.evaluate.bind(ctx.scorer) as (
-              ...args: [
-                ...Parameters<typeof ctx.scorer.evaluate>,
-                { signal?: AbortSignal }?,
-              ]
-            ) => ReturnType<typeof ctx.scorer.evaluate>
-            const pc = await evaluate(
+            const pc = await ctx.scorer.evaluate(
               { ...pairInput, sessionID: sourceID },
-              ctx.client,
+              generationForContext(ctx),
               { signal: pending.evaluationSignal },
             )
             pc.agent_prompt_hash = agentPromptHash
@@ -276,19 +268,12 @@ export async function runEvaluation(
           instructionLen: pending.userInstruction.length,
           responseLen: fullResponse.length,
           toolCalls: pending.toolCalls.length,
-          truncatedResponse: fullResponse.length > MAX_MESSAGE_CHARS,
-          truncatedToolCalls: pending.toolCalls.length > MAX_TOOL_CALLS_EVAL,
+          evidenceBudget: maxInputChars,
         })
 
-        const evaluate = ctx.scorer.evaluate.bind(ctx.scorer) as (
-          ...args: [
-            ...Parameters<typeof ctx.scorer.evaluate>,
-            { signal?: AbortSignal }?,
-          ]
-        ) => ReturnType<typeof ctx.scorer.evaluate>
-        card = await evaluate(
+        card = await ctx.scorer.evaluate(
           { ...scoreInput, sessionID: sourceID },
-          ctx.client,
+          generationForContext(ctx),
           { signal: pending.evaluationSignal },
         )
         card.agent_prompt_hash = agentPromptHash
@@ -299,6 +284,7 @@ export async function runEvaluation(
         sessionID: pending.sessionID,
         overall_score: card.overall_score,
         fallback: card.fallback,
+        evidenceTruncated: card.evidence_truncated ?? false,
         weaknesses: card.weaknesses.slice(0, 3),
       })
 
@@ -408,10 +394,14 @@ export async function runEvaluation(
       if (aggAfterRecording.total_sessions > 1 && !ctx.isMergingWeaknesses) {
         ctx.isMergingWeaknesses = true
         try {
-          await ctx.stateStore.mergeAllWeaknesses(ctx.scorer, ctx.client, {
-            signal: pending.evaluationSignal,
-            assertCurrent: evaluationGuard(pending, ctx),
-          })
+          await ctx.stateStore.mergeAllWeaknesses(
+            ctx.scorer,
+            generationForContext(ctx),
+            {
+              signal: pending.evaluationSignal,
+              assertCurrent: evaluationGuard(pending, ctx),
+            },
+          )
         } finally {
           ctx.isMergingWeaknesses = false
         }
@@ -428,7 +418,11 @@ export async function runEvaluation(
 
       ctx.logger.trim().catch(() => {})
 
-      if (current() && card.overall_score < config.scoring_threshold) {
+      if (
+        current() &&
+        !card.evidence_truncated &&
+        card.overall_score < config.scoring_threshold
+      ) {
         await considerImprovement(card, ctx, config, pending)
       }
 
@@ -1270,6 +1264,7 @@ export async function considerImprovement(
   config: KasperConfig,
   pending: PendingEval,
 ): Promise<void> {
+  if (card.evidence_truncated) return
   // Use weakness_suggestions as the primary source (LLM prompt instructs
   // the model to populate this and leave deprecated fields empty).
   // Fall back to deprecated fields only for backward compatibility.

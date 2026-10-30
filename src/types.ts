@@ -1,5 +1,6 @@
 import type { AgentPromptManager } from "./agent-prompts.js"
 import type { AgentsMdManager } from "./agents-md.js"
+import type { GenerationPort } from "./generation.js"
 import type { KasperLogger } from "./logging.js"
 import type { AsyncMutex } from "./mutex.js"
 import type { EvaluationRevision, KasperRuntime } from "./runtime.js"
@@ -155,6 +156,8 @@ export interface ScoreCard {
   suggested_agent_prompt_update?: string
   weakness_suggestions?: WeaknessSuggestion[]
   fallback?: boolean
+  /** Judge evidence was visibly omitted; observations cannot authorize improvements. */
+  evidence_truncated?: boolean
   scoring_prompt_hash?: string
   agent_prompt_hash?: string
   agents_md_hash?: string
@@ -440,6 +443,7 @@ export interface KasperUserContext {
 }
 
 export interface KasperClientContext {
+  generation?: GenerationPort
   client: OpencodeSessionClient
   logger: KasperLogger
   agentsMd: AgentsMdManager

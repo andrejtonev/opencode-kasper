@@ -6,6 +6,7 @@ import { Plugin, Rpc } from "@opencode/plugin/effect"
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { Session } from "@opencode/schema/session"
 import { Effect, Schema } from "effect"
+import { createV2Generation } from "../../src/hosts/v2-generation.js"
 
 export const fixture = Plugin.define({
   id: "kasper.sdk-contract",
@@ -73,6 +74,11 @@ export function nativeText(
   return Effect.runPromise(context.experimental.generate.text({ prompt }), {
     signal,
   })
+}
+
+// Compile the production bridge against the actual public host context.
+export function nativePort(context: Context, lifetimeSignal?: AbortSignal) {
+  return createV2Generation(context.experimental.generate, lifetimeSignal)
 }
 
 // Actual declared APIs; these @ts-expect-error checks fail compilation if the contract changes.

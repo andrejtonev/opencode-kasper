@@ -422,7 +422,7 @@ describe("runEvaluation", () => {
     expect(secondCallCount).toBe(1)
   })
 
-  test("truncates long agent response before scoring", async () => {
+  test("passes complete response to the scorer's single visible evidence budget", async () => {
     let receivedResponse = ""
     const ctx = mockCtx({
       scorer: {
@@ -437,11 +437,10 @@ describe("runEvaluation", () => {
       makePendingEval({ agentResponseParts: [longResponse] }),
       ctx,
     )
-    expect(receivedResponse.length).toBeLessThanOrEqual(10000)
-    expect(receivedResponse).toBe(longResponse.slice(5000))
+    expect(receivedResponse).toBe(longResponse)
   })
 
-  test("truncates excessive tool calls before scoring", async () => {
+  test("passes tool coverage to the scorer rather than silently dropping calls", async () => {
     let receivedToolCalls = 0
     const ctx = mockCtx({
       scorer: {
@@ -457,11 +456,32 @@ describe("runEvaluation", () => {
       result: "ok",
     }))
     await runEvaluation(makePendingEval({ toolCalls: manyToolCalls }), ctx)
-    expect(receivedToolCalls).toBe(25)
+    expect(receivedToolCalls).toBe(50)
   })
 })
 
 describe("considerImprovement", () => {
+  test("partial-evidence observations cannot queue or auto-apply improvements", async () => {
+    for (const auto_update of [false, true]) {
+      const ctx = mockCtx()
+      const update = mock(async () => {})
+      ctx.agentsMd.lockedUpdate = update as any
+      await considerImprovement(
+        makeScoreCard({
+          evidence_truncated: true,
+          overall_score: 0.2,
+          weaknesses: ["missed tests"],
+          suggested_agents_md_update:
+            "Always run relevant tests before completing changes.",
+        }),
+        ctx,
+        { ...DEFAULT_CONFIG, auto_update },
+        makePendingEval(),
+      )
+      expect(update).not.toHaveBeenCalled()
+      expect(ctx.improvementsPending).toHaveLength(0)
+    }
+  })
   test("returns early when no suggested updates at all", async () => {
     const ctx = mockCtx()
     const card = makeScoreCard({

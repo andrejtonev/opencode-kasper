@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test"
+import { GenerationError } from "../src/generation.js"
 import type { ScorerInput } from "../src/scorer.js"
 import { parseModelString, Scorer } from "../src/scorer.js"
 import { weaknessMergeInputs } from "../src/scoring-validation.js"
@@ -57,7 +58,8 @@ describe("Scorer", () => {
       session: {
         create: mock(() => Promise.resolve({ data: { id: createId } })),
         prompt: mock(() => {
-          if (rejectWith !== undefined) return Promise.reject(rejectWith)
+          if (rejectWith !== undefined)
+            return Promise.reject(new GenerationError(rejectWith, true))
           return Promise.resolve({
             data: {
               parts:
@@ -298,7 +300,10 @@ describe("Scorer", () => {
             Promise.resolve({ data: { id: `s-${++callCount}` } }),
           ),
           prompt: mock(() => {
-            if (callCount <= 2) return Promise.reject("error")
+            if (callCount <= 2)
+              return Promise.reject(
+                new GenerationError("terminal provider rejection", true),
+              )
             return Promise.resolve({
               data: {
                 parts: [
@@ -579,7 +584,9 @@ describe("Scorer", () => {
           ),
           prompt: mock(() => {
             if (callCount === 1) {
-              return Promise.reject(new Error("tool_choice not supported"))
+              return Promise.reject(
+                new GenerationError("tool_choice not supported", true),
+              )
             }
             return Promise.resolve({
               data: {

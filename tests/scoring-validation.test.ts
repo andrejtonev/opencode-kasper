@@ -196,9 +196,13 @@ describe("evidence envelopes", () => {
       subagentCalls: Array(1000).fill({ agent: huge, input: huge }),
       existingWeaknesses: Array(1000).fill(huge),
     })
-    expect(prompt.length).toBeLessThan(400000)
-    expect(prompt).toContain("[975 tool calls omitted]")
-    expect(prompt).toContain("[975 subagent calls omitted]")
+    const evidence = prompt.match(/<session_data>[\s\S]*?<\/session_data>/)![0]
+    expect(evidence.length).toBeLessThanOrEqual(
+      DEFAULT_CONFIG.max_score_input_chars,
+    )
+    expect(prompt.length).toBeLessThan(20000)
+    expect(prompt).toMatch(/\[\d+ tool calls omitted\]/)
+    expect(prompt).toMatch(/\[\d+ subagent calls omitted\]/)
     expect(prompt).toContain("[980 known weaknesses omitted]")
   })
 })
