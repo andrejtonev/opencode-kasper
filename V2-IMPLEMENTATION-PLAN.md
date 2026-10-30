@@ -52,12 +52,14 @@ No force resets, global config rewrites, publication, or title-based deletion of
 | C03 | Integrated | storage_instructions | `756bc8b` (agent `91cb886`); 91 final focused tests, two-process/async flush evidence; build/typecheck. |
 | C04 | Integrated | storage_instructions | `c1af22c` (agent `c5b0a15`); 163 focused tests; combined C01–C04: 559 top-level tests/typecheck passed. |
 | C05 | Integrated | lifecycle_commands | `faafa4d` (agent `ff07140`); exact 2.2.2 compile contracts; native packed `./server` load and Effect interruption passed. |
-| C06 | In progress | lifecycle_commands | Isolated `migration/c06-generation`; shared scoring/generation ports and safe request budgets. |
+| C06 | Integrated | lifecycle_commands | `4885f53` (agent `5158c07`); 643 offline passed/27 skipped; generation, budget and partial-evidence regression tests. |
 | C07 | Integrated | history_scoring | `73df794` (agent `81790fa`); lifecycle/actions/strict commit fences. Combined integrated tests: 575 top-level passed. |
-| C08 | In progress | history_scoring | Isolated `migration/c08-v2-history`; native normalization, archive capability and manual shared flow. |
-| C09 | In progress | storage_instructions | Isolated `migration/c09-v2-instructions`; authoritative sources, explicit editable targets/overlays. |
-| C10 | Pending | history_scoring | |
-| C11 | Pending | lifecycle_commands | |
-| C12 | Pending | storage_instructions | |
+| C08 | Integrated | history_scoring | `e04dcea` (agent `eeebed8`); 644 offline passed/27 skipped; pinned schemas, archive provenance/pagination and cancellation. |
+| C09 | Integrated | storage_instructions | `b700102` (agent `a54d43a`); 21 focused source tests, 650 offline passed/27 skipped; strict provenance and incomplete-coverage write fences. |
+| C10 | In progress | history_scoring | Native Effect server entry, event/actions/tools and terminal result integration. |
+| C11 | In progress | lifecycle_commands | Isolated packaged V1/V2 fixtures; final implementation acceptance follows C10. |
+| C12 | In progress | storage_instructions | Documentation preparation; final support claims follow C11 evidence. |
 
 The baseline review passed 490 offline tests, build and typecheck; lint had two existing unused-suppression warnings. That is the starting baseline, not migration acceptance.
+
+Combined C01-C09 verification: 625 top-level tests passed across 29 files (1,544 assertions); typecheck passed. C06/C08 integration conflicts were additive imports and optional port fields, both preserved. C07 disposal/deletion regression fix is integrated as `16e991d` (agent `414bb34`). Native provider and complete packaged product acceptance remain C11 work.
