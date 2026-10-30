@@ -71,7 +71,7 @@
     "glob": "13.0.5",
     "gray-matter": "4.0.3",
     "jsonc-parser": "^3.3.1",
-    "zod": "^4.4.3",
+    "zod": "4.6.7",
     "@opencode/client": "2.2.2",
     "@opencode/schema": "2.2.2"
   },
@@ -95,6 +95,13 @@
     },
     "effect": {
       "optional": true
+    },
+    "@opencode-ai/plugin": {
+      "optional": true
     }
+  },
+  "overrides": {
+    "zod": "4.6.7",
+    "toml": "5.0.1"
   }
 }

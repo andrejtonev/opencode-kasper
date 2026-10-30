@@ -65,6 +65,56 @@ afterEach(async () => {
 })
 
 describe("native V2 source provenance", () => {
+  test("read-only and editable source resolution never executes frontmatter", async () => {
+    const path = join(options.projectRoot, ".opencode", "agents", `${id}.md`)
+    entries = [directory(join(options.projectRoot, ".opencode"))]
+    const marker = "__kasper_frontmatter_regression"
+    const globals = globalThis as unknown as Record<string, unknown>
+    try {
+      for (const explicit of [false, true]) {
+        options.editableAgents = explicit ? { [id]: { path } } : undefined
+        for (const header of [
+          "---javascript",
+          "--- javascript",
+          "\uFEFF---javascript",
+          "---constructor",
+        ]) {
+          delete globals[marker]
+          await file(
+            path,
+            `${header}\n(() => { globalThis.${marker} = true; return {}; })()\n---\nfactory\n`,
+          )
+          const source = await new V2AgentPrompts(options).resolve(id)
+          expect(globals[marker]).toBeUndefined()
+          expect(source.complete).toBe(false)
+          expect(source.kind).toBe("readonly")
+          expect(source.candidate).toBeUndefined()
+        }
+      }
+    } finally {
+      delete globals[marker]
+    }
+  })
+  test("safe YAML and JSON frontmatter are preserved through apply and rollback", async () => {
+    const path = join(options.projectRoot, ".opencode", "agents", `${id}.md`)
+    entries = [directory(join(options.projectRoot, ".opencode"))]
+    options.editableAgents = { [id]: { path } }
+    for (const header of [
+      "---\ndescription: reviewer\n---\n",
+      "---yaml\ndescription: reviewer\n---\n",
+      '---json\n{"description":"reviewer"}\n---\n',
+      "\uFEFF---\ndescription: reviewer\n---\n",
+    ]) {
+      const original = `${header}factory\n`
+      await file(path, original)
+      const manager = new V2AgentPrompts(options)
+      expect((await manager.resolve(id)).kind).toBe("editable")
+      const backup = await manager.injectSection(id, "Rules", "new guidance")
+      expect((await readFile(path, "utf8")).startsWith(header)).toBe(true)
+      expect(await manager.rollback(id, backup)).toBe(true)
+      expect(await readFile(path, "utf8")).toBe(original)
+    }
+  })
   test("effective plugin-only prompt stays read-only and is scored as effective text", async () => {
     const manager = new V2AgentPrompts(options)
     expect(await manager.read(id)).toBe("factory")

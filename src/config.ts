@@ -3,6 +3,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { parse } from "jsonc-parser"
 import { z } from "zod"
+import { redactDiagnosticText } from "./diagnostics.js"
 import type { KasperConfig } from "./types.js"
 import { DEFAULT_CONFIG } from "./types.js"
 
@@ -65,7 +66,9 @@ export function normalizeKasperConfig(
         result[key] = parsed.data
       } else {
         process.stderr.write(
-          `[kasper] Config validation warning: "${key}" = ${JSON.stringify(raw[key])} is invalid — using default. ${parsed.error.issues.map((i) => i.message).join("; ")}\n`,
+          redactDiagnosticText(
+            `[kasper] Config validation warning: "${key}" = ${JSON.stringify(raw[key])} is invalid — using default. ${parsed.error.issues.map((i) => i.message).join("; ")}\n`,
+          ),
         )
       }
     }

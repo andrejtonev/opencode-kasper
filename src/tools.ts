@@ -1,5 +1,4 @@
 import type { ToolDefinition } from "@opencode-ai/plugin"
-import { tool } from "@opencode-ai/plugin"
 import { calendarDate, validateScoreTarget } from "./actions.js"
 import {
   applyPendingImprovement,
@@ -11,6 +10,7 @@ import {
   executeKasperStatus,
   handleBatchScoreSession,
 } from "./handlers.js"
+import { tool } from "./hosts/v1-tool.js"
 import type { KasperContext } from "./types.js"
 
 const $z = tool.schema

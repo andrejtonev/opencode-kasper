@@ -14,6 +14,7 @@ import {
 } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { curlHTTP } from "../helpers/http-client.js"
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ const DEFAULT_OPENCODE_CONFIG: Record<string, unknown> = {
 // Auth credentials for opencode serve (opencode >=1.15.x requires HTTP Basic
 // Auth on all API endpoints). Read from environment — never hardcode real
 // credentials in source. The spawned serve process inherits these from env;
-// the curl-based health-check helpers use them for the Authorization header.
+// HTTP helpers supply authentication over stdin, never through shell/argv strings.
 const _SERVER_USER = process.env.OPENCODE_SERVER_USERNAME ?? ""
 const _SERVER_PASS = process.env.OPENCODE_SERVER_PASSWORD ?? ""
 
@@ -426,29 +427,16 @@ export function stopServe(port?: number): void {
     }
     _serveProcesses.delete(targetPort)
   }
-  // Also kill any lingering process on the port
-  try {
-    execSync(`fuser -k ${targetPort}/tcp 2>/dev/null || true`, {
-      stdio: "pipe",
-    })
-  } catch {
-    // ignore
-  }
 }
 
 export function isServeRunning(port = SERVE_PORT): boolean {
   try {
-    const authFlag =
-      _SERVER_USER && _SERVER_PASS ? `-u "${_SERVER_USER}:${_SERVER_PASS}"` : ""
     // Use root `/` (returns 200 with HTML) rather than `/api/session` which
     // requires a `?limit=N` query parameter in opencode >=1.15.x.
-    const resp = execSync(
-      `curl -s -o /dev/null -w "%{http_code}" ${authFlag} http://localhost:${port}/`,
-      {
-        stdio: "pipe",
-        encoding: "utf-8",
-        timeout: 5_000,
-      },
+    const resp = curlHTTP(
+      `http://localhost:${port}/`,
+      { username: _SERVER_USER, password: _SERVER_PASS },
+      true,
     )
     return resp.trim().startsWith("2")
   } catch {
@@ -467,18 +455,12 @@ export function isServeRunning(port = SERVE_PORT): boolean {
  * crashing on a malformed upstream response.
  */
 export function fetchAPI(path: string, port = SERVE_PORT): unknown {
-  const authFlag =
-    _SERVER_USER && _SERVER_PASS ? `-u "${_SERVER_USER}:${_SERVER_PASS}"` : ""
   // opencode >=1.15.x requires a `?limit=N` query parameter on the
   // `/api/session` list endpoint (default limit=0 causes a 400 error).
   // If the caller requests the bare list endpoint, add a reasonable limit.
   const resolvedPath = path === "/api/session" ? "/api/session?limit=100" : path
   const url = `http://localhost:${port}${resolvedPath}`
-  const raw = execSync(`curl -s ${authFlag} "${url}"`, {
-    stdio: "pipe",
-    encoding: "utf-8",
-    timeout: 5_000,
-  })
+  const raw = curlHTTP(url, { username: _SERVER_USER, password: _SERVER_PASS })
   try {
     const parsed = JSON.parse(raw)
     // Detect opencode error response and return null instead

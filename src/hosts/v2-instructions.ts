@@ -89,9 +89,26 @@ function markdown(raw: string): {
   prefix: string
   valid: boolean
 } {
+  // Gray-matter has an executable JavaScript engine. Source attribution is a
+  // read operation, so reject other languages before entering any parser.
+  const normalized = raw.replace(/^\uFEFF/, "")
+  if (normalized.startsWith("---") && normalized[3] !== "-") {
+    const language = normalized.slice(3).split(/\r?\n/, 1)[0].trim()
+    if (!["", "yaml", "json"].includes(language))
+      throw new Error("Agent frontmatter supports only YAML or JSON")
+  }
+  const options = {
+    engines: {
+      javascript: {
+        parse: () => {
+          throw new Error("Executable agent frontmatter is disabled")
+        },
+      },
+    },
+  }
   let parsed: ReturnType<typeof matter>
   try {
-    parsed = matter(raw, {})
+    parsed = matter(raw, options)
   } catch {
     const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/)
     if (!match) throw new Error("Invalid agent frontmatter")
@@ -109,7 +126,7 @@ function markdown(raw: string): {
       .join("\n")
     parsed = matter(
       raw.replace(match[1], () => sanitized),
-      {},
+      options,
     )
   }
   const body = parsed.content.trim()
@@ -126,7 +143,10 @@ function markdown(raw: string): {
     (unsupported.length === 0 || native) &&
     Schema.decodeUnknownOption(ConfigAgent.Info)({ ...data, system: body })
       ._tag === "Some"
-  const header = raw.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/)?.[0] ?? ""
+  const header =
+    raw.match(
+      /^\uFEFF?---(?:[ \t]*(?:yaml|json))?[ \t]*\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/,
+    )?.[0] ?? ""
   return { body, prefix: header, valid: valid && data.disabled !== true }
 }
 

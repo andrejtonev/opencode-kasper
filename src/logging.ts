@@ -1,5 +1,6 @@
 import { appendFile, mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
+import { redactDiagnostic, redactDiagnosticText } from "./diagnostics.js"
 
 export interface LogEntry {
   ts: string
@@ -30,8 +31,8 @@ export class KasperLogger {
       event,
       ...data,
     }
-    const line = `${JSON.stringify(entry)}\n`
     try {
+      const line = `${JSON.stringify(redactDiagnostic(entry))}\n`
       await appendFile(this.logPath, line, "utf-8")
     } catch {
       /* log failure is non-fatal */
@@ -57,7 +58,18 @@ export class KasperLogger {
         text = buffer.toString("utf8") + text
         newlineCount = (text.match(/\n/g) || []).length
       }
-      return text.split(/\r?\n/).filter(Boolean).slice(-lines).join("\n")
+      return text
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(-lines)
+        .map((line) => {
+          try {
+            return JSON.stringify(redactDiagnostic(JSON.parse(line)))
+          } catch {
+            return redactDiagnosticText(line)
+          }
+        })
+        .join("\n")
     } catch {
       return ""
     } finally {

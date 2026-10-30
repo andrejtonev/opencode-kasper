@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { randomBytes } from "node:crypto"
-import { readFile, rm } from "node:fs/promises"
+import { readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { KasperLogger } from "../src/logging.js"
@@ -51,6 +51,39 @@ describe("KasperLogger", () => {
     const lines = raw.trim().split("\n")
     expect(lines.length).toBe(3)
   })
+  test("diagnostics redact credentials and identities without changing caller data", async () => {
+    const logger = new KasperLogger(testDir)
+    await logger.init()
+    const previous = process.env.KASPER_TEST_API_KEY
+    process.env.KASPER_TEST_API_KEY = "opaque-test-credential-123456"
+    const data = {
+      headers: { authorization: "Bearer test-auth-value" },
+      nested: { apiKey: "nested-secret", password: "quoted secret" },
+      error:
+        'Failed with password="quoted secret" and Bearer bearer-secret at https://user:pass@example.test/?api_key=query-secret C:\\Users\\PrivatePerson\\project contact@example.test opaque-test-credential-123456',
+    }
+    try {
+      await logger.log("failure", data)
+      const output = await readFile(logPath, "utf8")
+      for (const value of [
+        "test-auth-value",
+        "nested-secret",
+        "quoted secret",
+        "bearer-secret",
+        "user:pass",
+        "query-secret",
+        "PrivatePerson",
+        "contact@example.test",
+        "opaque-test-credential-123456",
+      ])
+        expect(output).not.toContain(value)
+      expect(data.nested.apiKey).toBe("nested-secret")
+      expect(JSON.parse(output).event).toBe("failure")
+    } finally {
+      if (previous === undefined) delete process.env.KASPER_TEST_API_KEY
+      else process.env.KASPER_TEST_API_KEY = previous
+    }
+  })
 
   test("tail returns last N lines", async () => {
     const logger = new KasperLogger(testDir, 300)
@@ -66,6 +99,23 @@ describe("KasperLogger", () => {
     expect(lines.length).toBe(2)
     expect(JSON.parse(lines[0]).n).toBe(4)
     expect(JSON.parse(lines[1]).n).toBe(5)
+  })
+
+  test("tail redacts historical credentials while preserving JSON", async () => {
+    const logger = new KasperLogger(testDir)
+    await logger.init()
+    await writeFile(
+      logPath,
+      `${JSON.stringify({ event: "legacy", password: "old-secret", nested: { apiKey: "old-key" } })}\n`,
+    )
+    const output = await logger.tail()
+    expect(output).not.toContain("old-secret")
+    expect(output).not.toContain("old-key")
+    expect(JSON.parse(output)).toEqual({
+      event: "legacy",
+      password: "[redacted]",
+      nested: { apiKey: "[redacted]" },
+    })
   })
 
   test("tail returns empty string for nonexistent log", async () => {

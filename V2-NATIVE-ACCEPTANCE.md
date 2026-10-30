@@ -78,6 +78,21 @@ Version-grounded references:
 
 ## Reproduction and checks
 
+Security remediation on 2026-10-30 additionally passed the full suite with
+**715 passed, 27 skipped, 0 failed**, 1829 assertions across 47 files. Application
+and SDK contract typechecks, the HTTP helper's strict typecheck, build and lint
+passed. Lint retains two existing unused-suppression warnings. `bun audit --json`
+returned `{}` with installed Zod 4.6.7 and TOML 5.0.1, including legacy SDK Zod
+resolution. The private launcher regressions passed four tests.
+
+Fresh packed consumers passed actual V1 1.18.23 production tool registration and
+the V1 forced-tool generation guard, and actual V2 2.2.2 production commands,
+scoring, reset/reload and child-session correlation. The V2 consumer now has
+neither plugin SDK installed: the optional legacy peer and type-only native
+imports prevent unnecessary runtime dependency installation. The V1 tool factory
+uses the patched local Zod schema with the public identity-factory contract.
+These checks use the local fixture provider and make no paid model requests.
+
 Build first: `bun install --frozen-lockfile`, `bun run build`.
 
 ```
