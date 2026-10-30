@@ -123,6 +123,95 @@ function mockCtx(overrides: Partial<KasperContext> = {}): KasperContext {
 }
 
 describe("runEvaluation", () => {
+  test("historical and current child scoring after reload derives trusted parent metadata and cannot change shared AGENTS", async () => {
+    for (const path of ["historical", "current", "batch"] as const) {
+      const config = { ...DEFAULT_CONFIG, auto_update: true }
+      const ctx = mockCtx({
+        config,
+        autoUpdateEnabled: true,
+        instructionCoverage: async () => ({ complete: true, issues: [] }),
+        automaticImprovementAllowed: async () => true,
+      })
+      const record = mock(() => {}),
+        write = mock(async () => "backup")
+      ctx.stateStore.recordSession = record as any
+      ctx.stateStore.getConfig = () => config
+      ctx.stateStore.getAggregate = () => ({
+        total_sessions: 3,
+        avg_score: 0.3,
+        top_weaknesses: [
+          { pattern: "missing test", count: 3, suggested_fix: "fix" },
+        ],
+        top_strengths: [],
+        by_agent: {},
+      })
+      ctx.agentsMd.applyGuidance = write
+      ctx.agentPrompts.resolve = async () => ({ kind: "editable" })
+      ctx.historyHost = {
+        get: async () => ({
+          id: "ses_child",
+          agent: "reviewer",
+          parentID: "ses_parent",
+          location: { directory: process.cwd() },
+          time: { created: 1, updated: 3, idle: 3 },
+        }),
+        list: async () => [],
+        read: async () => ({
+          status: "ok",
+          snapshot: {
+            sessionID: "ses_child",
+            coverage: path === "current" ? "current-window" : "archive",
+            isIdle: true,
+            messages: [
+              {
+                id: "u",
+                role: "user",
+                text: "review this",
+                toolCalls: [],
+                subagentCalls: [],
+              },
+              {
+                id: "a",
+                role: "assistant",
+                agentName: "reviewer",
+                text: "reviewed",
+                toolCalls: [],
+                subagentCalls: [],
+                terminal: true,
+              },
+            ],
+          },
+        }),
+      }
+      const judge = mock(async () =>
+        makeScoreCard({
+          overall_score: 0.2,
+          weaknesses: ["missing test"],
+          suggested_agents_md_update: "change shared rules",
+        }),
+      )
+      ctx.scorer.evaluate = judge as any
+      const result =
+        path === "batch"
+          ? (
+              await evaluateSessions(
+                ["ses_child"],
+                ctx,
+                new Map([["ses_child", "invoking-parent-agent"]]),
+              )
+            )[0]
+          : await evaluateSession("ses_child", ctx, "invoking-parent-agent", {
+              purpose: path,
+            })
+      expect(result.status).toBe("scored")
+      expect(record.mock.calls[0]?.[3]).toBe("reviewer")
+      expect(record.mock.calls[0]?.[4]).toBe("subagent")
+      expect(record.mock.calls[0]?.[5]).toBe("ses_parent")
+      expect(record.mock.calls[0]?.[8]).toBe("ses_child")
+      expect(write).not.toHaveBeenCalled()
+      expect(ctx.improvementsPending).toHaveLength(0)
+    }
+  })
   test("history preprocessing omissions mark partial cards and suppress automatic improvements", async () => {
     const toolCalls = Array.from(
       { length: MAX_TOOL_CALLS_EVAL + 1 },

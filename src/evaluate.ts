@@ -13,7 +13,7 @@ import {
   normalizeV1History,
   pendingFromHistoryTurns,
 } from "./history.js"
-import type { HistorySnapshot } from "./history-port.js"
+import type { HistorySnapshot, SessionDescriptor } from "./history-port.js"
 import { generationForContext } from "./hosts/v1-generation.js"
 import type { EvaluationRevision } from "./runtime.js"
 import type { ScorerInput } from "./scorer.js"
@@ -550,10 +550,38 @@ export async function evaluateSession(
         )
       if (read.status === "unsupported")
         return outcome("unsupported", read.reason, read.detail)
-      return evaluateHistorySession(sessionID, ctx, read.snapshot, agentHint, {
-        ...options,
-        revision,
+      const sourceDescriptor = await ctx.historyHost.get(sessionID, {
+        signal: ctx.runtime?.sessionSignal(sessionID) ?? ctx.lifetimeSignal,
       })
+      if (sourceDescriptor.id !== sessionID)
+        return outcome(
+          "failed",
+          "provenance_mismatch",
+          "Session metadata belongs to a different source session.",
+        )
+      if (!current())
+        return outcome(
+          "cancelled",
+          "cancelled",
+          "Evaluation cancelled by a lifecycle change.",
+        )
+      if (sourceDescriptor.agent)
+        ctx.agentRegistry.set(sessionID, {
+          agentName: sourceDescriptor.agent,
+          agentType: sourceDescriptor.parentID ? "subagent" : "primary",
+          parentSessionID: sourceDescriptor.parentID,
+        })
+      return evaluateHistorySession(
+        sessionID,
+        ctx,
+        read.snapshot,
+        sourceDescriptor.agent ?? agentHint,
+        {
+          ...options,
+          revision,
+          sourceDescriptor,
+        },
+      )
     } catch (error) {
       return current()
         ? outcome(
@@ -630,6 +658,7 @@ export async function evaluateHistorySession(
     minimumUserMessages?: number
     purpose?: "historical" | "current"
     revision?: EvaluationRevision
+    sourceDescriptor?: Pick<SessionDescriptor, "id" | "agent" | "parentID">
   } = {},
 ): Promise<EvaluationOutcome> {
   const revision = options.revision ?? ctx.runtime?.capture(sessionID)
@@ -660,6 +689,12 @@ export async function evaluateHistorySession(
       "failed",
       "provenance_mismatch",
       "History belongs to a different source session.",
+    )
+  if (options.sourceDescriptor && options.sourceDescriptor.id !== sessionID)
+    return outcome(
+      "failed",
+      "provenance_mismatch",
+      "Session metadata belongs to a different source session.",
     )
   if (snapshot.coverage !== "archive" && options.purpose !== "current")
     return outcome(
@@ -773,8 +808,14 @@ export async function evaluateHistorySession(
     pending.sourceSessionID = sessionID
     pending.lifecycleRevision = revision
     pending.evaluationSignal = ctx.runtime?.sessionSignal(sessionID)
-    pending.agentType = registry?.agentType ?? "primary"
-    pending.parentSessionID = registry?.parentSessionID
+    pending.agentType = options.sourceDescriptor
+      ? options.sourceDescriptor.parentID
+        ? "subagent"
+        : "primary"
+      : (registry?.agentType ?? "primary")
+    pending.parentSessionID = options.sourceDescriptor
+      ? options.sourceDescriptor.parentID
+      : registry?.parentSessionID
     if (previous?.weaknesses.length)
       pending.existingWeaknesses = previous.weaknesses
     ctx.sessionsEvaluated.delete(key)
