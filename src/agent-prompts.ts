@@ -1,4 +1,5 @@
-import { copyFile, mkdir, readdir, readFile, unlink } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { mkdir, readdir, readFile, unlink } from "node:fs/promises"
 import { basename, join } from "node:path"
 import {
   type AgentPromptSource,
@@ -6,14 +7,15 @@ import {
   defaultAgentFilePath,
   resolveAgentPromptSource,
 } from "./agent-prompt-resolver.js"
-import { acquireLock } from "./lock.js"
 import {
-  escapeRegex,
-  exists,
-  injectSectionContent,
-  timestampFilename,
-  writeTextAtomic,
-} from "./prompt-utils.js"
+  commitInstructionUpdate,
+  createInstructionBackup,
+  finishInstructionBackup,
+  readInstructionText,
+  rollbackInstruction,
+  withInstructionLock,
+} from "./instruction-transaction.js"
+import { escapeRegex, injectSectionContent } from "./prompt-utils.js"
 
 function sanitizeAgentName(name: string): string {
   return basename(name.replace(/[\\/]/g, "_"))
@@ -76,6 +78,7 @@ export class InlinePromptError extends Error {
 
 export class AgentPromptManager {
   private readonly backupsDir: string
+  private pendingBackups = new Map<string, string>()
   private sourceCache = new Map<
     string,
     { source: AgentPromptSource; ts: number }
@@ -118,9 +121,10 @@ export class AgentPromptManager {
    * Resolve the agent's prompt source. Cached for 30s per agent to avoid
    * hammering the filesystem on every improvement.
    */
-  async resolve(agentName: string): Promise<AgentPromptSource> {
+  async resolve(agentName: string, force = false): Promise<AgentPromptSource> {
     const cached = this.sourceCache.get(agentName)
     if (
+      !force &&
       cached &&
       Date.now() - cached.ts < AgentPromptManager.SOURCE_CACHE_TTL_MS
     ) {
@@ -217,7 +221,7 @@ export class AgentPromptManager {
    * (`{file:...}` or `file://...`), the file is overwritten verbatim.
    */
   async write(agentName: string, content: string): Promise<void> {
-    const source = await this.resolve(agentName)
+    const source = await this.resolve(agentName, true)
     if (source.kind === "inline") {
       throw new InlinePromptError(agentName)
     }
@@ -227,125 +231,88 @@ export class AgentPromptManager {
         // Treat it like inline: refuse to overwrite directly.
         throw new InlinePromptError(agentName)
       }
-      await appendToPluginOverridePrompt(source, content)
+      await appendToPluginOverridePrompt(
+        source,
+        content,
+        this.agentDir(agentName),
+      )
+      await this.enforceMaxBackups(agentName, 20)
       this.invalidateSourceCache(agentName)
       return
     }
-    const filePath = await this.getAgentPath(agentName)
-    const lockPath = `${filePath}.lock`
-    const unlock = await acquireLock(lockPath)
-    try {
-      await writeTextAtomic(filePath, content)
-    } finally {
-      await unlock()
+    const filePath =
+      source.kind === "missing"
+        ? defaultAgentFilePath(this.projectRoot, agentName)
+        : source.kind === "plugin_override"
+          ? source.path
+          : source.path
+    if (!filePath) throw new Error("Agent prompt source has no file path")
+    const result = await commitInstructionUpdate(
+      { path: filePath },
+      () => content,
+    )
+    const pending = this.pendingBackups.get(result.target.path)
+    if (pending) {
+      await finishInstructionBackup(pending, content)
+      this.pendingBackups.delete(result.target.path)
     }
     this.invalidateSourceCache(agentName)
   }
 
   private agentDir(agentName: string): string {
-    return join(this.backupsDir, sanitizeAgentName(agentName))
+    const id = createHash("sha256").update(agentName).digest("hex").slice(0, 12)
+    return join(this.backupsDir, `${sanitizeAgentName(agentName)}--${id}`)
   }
 
   /**
    * Snapshot the current prompt to a timestamped backup file. No-op for
-   * inline sources, `plugin_override` config targets, and missing sources
-   * (we have nothing on disk to back up — config targets are backed up via
-   * a separate kasper state file outside the scope of this method).
+   * inline and missing sources. Config overrides back up exact JSONC bytes
+   * and record the owned field for conflict-aware rollback.
    */
   async backup(
     agentName: string,
     label: string,
     maxBackups = 20,
   ): Promise<string | undefined> {
-    const source = await this.resolve(agentName)
-    if (source.kind === "missing" || source.kind === "inline") {
-      return undefined
-    }
-    if (source.kind === "plugin_override") {
-      if (source.target !== "config" && source.path) {
-        const agentBackupDir = this.agentDir(agentName)
-        await mkdir(agentBackupDir, { recursive: true })
-        const name = timestampFilename(label)
-        const dest = join(agentBackupDir, name)
-        if (await exists(source.path)) {
-          await copyFile(source.path, dest)
-        }
-        await this.enforceMaxBackups(agentName, maxBackups)
-        return dest
-      }
-      return undefined
-    }
-    const agentBackupDir = this.agentDir(agentName)
-    await mkdir(agentBackupDir, { recursive: true })
-    const name = timestampFilename(label)
-    const dest = join(agentBackupDir, name)
-    if (await exists(source.path)) {
-      await copyFile(source.path, dest)
-    }
+    const source = await this.resolve(agentName, true)
+    if (source.kind === "missing" || source.kind === "inline") return undefined
+    const path =
+      source.kind === "plugin_override" && source.target === "config"
+        ? source.configPath
+        : source.path
+    if (!path) return undefined
+    const backupDir = this.agentDir(agentName)
+    const jsonPath =
+      source.kind === "plugin_override" && source.target === "config"
+        ? source.jsonPath
+        : undefined
+    const result = await withInstructionLock(
+      { path, jsonPath },
+      async (target) => {
+        const backup = await createInstructionBackup(
+          target,
+          backupDir,
+          label,
+          await readInstructionText(target.path),
+        )
+        this.pendingBackups.set(target.path, backup)
+        return backup
+      },
+    )
     await this.enforceMaxBackups(agentName, maxBackups)
-    return dest
+    return result
   }
 
-  async rollback(agentName: string): Promise<boolean> {
-    const source = await this.resolve(agentName)
-    if (source.kind === "inline") {
-      // Nothing on disk to roll back. The original config snapshot lives
-      // in a separate kasper state file (not implemented here yet).
-      return false
-    }
-    if (source.kind === "missing") return false
-    if (source.kind === "plugin_override") {
-      if (source.target === "config" || !source.path) return false
-      const filePath = source.path
-      const lockPath = `${filePath}.lock`
-      const unlock = await acquireLock(lockPath)
-      try {
-        const agentBackupDir = this.agentDir(agentName)
-        let entries: string[] = []
-        try {
-          entries = await readdir(agentBackupDir)
-        } catch {
-          return false
-        }
-        if (entries.length === 0) return false
-        entries.sort().reverse()
-        const latest = entries[0]
-        if (await exists(filePath)) {
-          await this.backup(agentName, "pre-rollback")
-        }
-        const content = await readFile(join(agentBackupDir, latest), "utf-8")
-        await writeTextAtomic(filePath, content)
-        return true
-      } finally {
-        await unlock()
-      }
-    }
-
-    const filePath = source.path
-    const lockPath = `${filePath}.lock`
-    const unlock = await acquireLock(lockPath)
-    try {
-      const agentBackupDir = this.agentDir(agentName)
-      let entries: string[] = []
-      try {
-        entries = await readdir(agentBackupDir)
-      } catch {
-        return false
-      }
-      if (entries.length === 0) return false
-      entries.sort().reverse()
-      const latest = entries[0]
-
-      if (await exists(filePath)) {
-        await this.backup(agentName, "pre-rollback")
-      }
-
-      const content = await readFile(join(agentBackupDir, latest), "utf-8")
-      await writeTextAtomic(filePath, content)
-      return true
-    } finally {
-      await unlock()
-    }
+  async rollback(agentName: string, backupPath?: string): Promise<boolean> {
+    const entries = await this.listBackups(agentName)
+    if (!backupPath && !entries.length) return false
+    const dir = this.agentDir(agentName)
+    const result = await rollbackInstruction(
+      backupPath ?? join(dir, entries[0]),
+      dir,
+    )
+    this.invalidateSourceCache(agentName)
+    return result
   }
 
   async injectSection(
@@ -356,8 +323,9 @@ export class AgentPromptManager {
     maxBackups = 20,
     mode = "subagent",
     injectMode: "section" | "inline" = "section",
+    assertCurrent?: () => void,
   ): Promise<string | undefined> {
-    const source = await this.resolve(agentName)
+    const source = await this.resolve(agentName, true)
     if (source.kind === "inline") {
       throw new InlinePromptError(agentName)
     }
@@ -372,14 +340,16 @@ export class AgentPromptManager {
       if (!source.isAppend) {
         throw new InlinePromptError(agentName)
       }
-      let backupPath: string | undefined
-      if (backupEnabled) {
-        // Back up the config file itself so rollback is possible.
-        backupPath = await this.backup(agentName, "pre-improvement", maxBackups)
-      }
       const sectionBody = `## ${sectionName}\n${content.trim()}`
-      await appendToPluginOverridePrompt(source, sectionBody)
+      const result = await appendToPluginOverridePrompt(
+        source,
+        sectionBody,
+        backupEnabled ? this.agentDir(agentName) : undefined,
+        assertCurrent,
+      )
+      const backupPath = result.backupPath
       this.invalidateSourceCache(agentName)
+      await this.enforceMaxBackups(agentName, maxBackups)
       return backupPath
     }
 
@@ -408,56 +378,52 @@ export class AgentPromptManager {
           )
       }
     })()
-    const lockPath = `${filePath}.lock`
+    const result = await commitInstructionUpdate(
+      { path: filePath },
+      (existing) => {
+        let updated: string
+        if (injectMode === "inline") {
+          updated = appendInlineImprovement(existing, content.trim())
+        } else if (!existing.trim()) {
+          // Empty file: create with frontmatter + a fresh section.
+          const sectionBlock = `## ${sectionName}\n<!-- kasper: ${new Date().toISOString()} -->\n${content.trim()}\n`
+          const frontmatter = `---\nmode: ${mode}\n---\n\n`
+          updated = `${frontmatter + sectionBlock}\n`
+        } else {
+          // Section-mode on a non-empty file: delegate to the shared helper.
+          // The helper handles accumulation when the section already exists and
+          // appends a new section when it does not. In both cases the file ends
+          // with a trailing newline.
+          const result = injectSectionContent(
+            existing,
+            sectionName,
+            content.trim(),
+          )
+          updated = result.updated
+        }
 
-    const unlock = await acquireLock(lockPath)
-    try {
-      // Always read the actual file at filePath, regardless of source.kind.
-      // The source cache can be stale (TTL or invalidated by external writes),
-      // and the file at the conventional path may exist from a prior write
-      // even when the resolver says "missing". Use the file as the source of
-      // truth for content; use source.kind only for control flow.
-      const existing = await readFile(filePath, "utf-8").catch(() => "")
-
-      let updated: string
-      if (injectMode === "inline") {
-        updated = appendInlineImprovement(existing, content.trim())
-      } else if (!existing.trim()) {
-        // Empty file: create with frontmatter + a fresh section.
-        const sectionBlock = `## ${sectionName}\n<!-- kasper: ${new Date().toISOString()} -->\n${content.trim()}\n`
-        const frontmatter = `---\nmode: ${mode}\n---\n\n`
-        updated = `${frontmatter + sectionBlock}\n`
-      } else {
-        // Section-mode on a non-empty file: delegate to the shared helper.
-        // The helper handles accumulation when the section already exists and
-        // appends a new section when it does not. In both cases the file ends
-        // with a trailing newline.
-        const result = injectSectionContent(
-          existing,
-          sectionName,
-          content.trim(),
-        )
-        updated = result.updated
-      }
-
-      let backupPath: string | undefined
-      if (backupEnabled) {
-        backupPath = await this.backup(agentName, "pre-improvement", maxBackups)
-      }
-      await writeTextAtomic(filePath, updated)
-      // Refresh cache for this agent so subsequent reads see the change
-      this.invalidateSourceCache(agentName)
-      return backupPath
-    } finally {
-      await unlock()
-    }
+        return updated
+      },
+      {
+        backupDir: backupEnabled ? this.agentDir(agentName) : undefined,
+        assertCurrent,
+      },
+    )
+    this.invalidateSourceCache(agentName)
+    await this.enforceMaxBackups(agentName, maxBackups)
+    return result.backupPath
   }
 
   async listBackups(agentName: string): Promise<string[]> {
     const agentBackupDir = this.agentDir(agentName)
     try {
-      const entries = await readdir(agentBackupDir)
-      return entries.sort().reverse()
+      const entries = (await readdir(agentBackupDir)).filter((e) =>
+        e.endsWith(".md"),
+      )
+      return entries
+        .filter((e) => e.endsWith(".md"))
+        .sort()
+        .reverse()
     } catch {
       return []
     }
@@ -467,7 +433,7 @@ export class AgentPromptManager {
     const agentBackupDir = this.agentDir(agentName)
     let entries: string[] = []
     try {
-      entries = await readdir(agentBackupDir)
+      entries = (await readdir(agentBackupDir)).filter((e) => e.endsWith(".md"))
     } catch {
       return
     }
@@ -477,6 +443,7 @@ export class AgentPromptManager {
     for (const e of toDelete) {
       try {
         await unlink(join(agentBackupDir, e))
+        await unlink(join(agentBackupDir, `${e}.json`)).catch(() => {})
       } catch {
         /* ignore */
       }

@@ -1,20 +1,22 @@
 import { readdir, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { basename, dirname, isAbsolute, join, relative } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { parse } from "jsonc-parser"
+import { migrateInstructionSource } from "./instruction-migration.js"
 import {
-  applyEdits,
-  type ModificationOptions,
-  modify,
-  parse,
-} from "jsonc-parser"
+  commitInstructionUpdate,
+  InstructionConflictError,
+  instructionJsonValue,
+  parseInstructionJson,
+  replaceInstructionJson,
+} from "./instruction-transaction.js"
 import {
   candidateGlobalOpencodeDirs,
   dirExists,
   expandTilde,
   fileExists,
 } from "./path-utils.js"
-import { writeTextAtomic } from "./prompt-utils.js"
 
 /**
  * Resolved source of an agent's prompt.
@@ -62,6 +64,7 @@ export type AgentPromptSource =
     }
   | {
       kind: "inline"
+      jsonPath?: readonly string[]
       /** The full inline prompt string. */
       prompt: string
       /** Path of the opencode.json that holds the inline string. */
@@ -90,6 +93,7 @@ export type AgentPromptSource =
        *                  upstream prompt; kasper treats it as inline.
        */
       kind: "plugin_override"
+      jsonPath?: readonly string[]
       /**
        * The agent name this override belongs to. The resolver fills this
        * in from the JSON map key it was found under. Writers MUST use it
@@ -133,11 +137,14 @@ async function loadJsoncIfExists(
       disallowComments: false,
       allowEmptyContent: false,
     })
+    if (errors.length)
+      throw new InstructionConflictError(`invalid JSONC in ${path}`)
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return undefined
     return parsed as Record<string, unknown>
-  } catch {
-    return undefined
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
   }
 }
 
@@ -557,8 +564,8 @@ async function findOverrideInDir(
     if (base === "opencode.json" || base === "opencode.jsonc") continue
     const raw = await loadJsoncIfExists(file)
     const hit = readPluginOverrideEntry(raw, agentName)
-    if (hit)
-      return buildPluginOverride(
+    if (hit) {
+      const source = buildPluginOverride(
         // Use the canonical key the entry was found under, NOT the
         // display name the caller passed. Subsequent code in
         // appendToPluginOverridePrompt uses this name in a jsonc
@@ -569,6 +576,10 @@ async function findOverrideInDir(
         hit.promptField,
         file,
       )
+      return source.kind === "plugin_override"
+        ? { ...source, jsonPath: [hit.mapKey, hit.key, hit.promptField] }
+        : source
+    }
   }
   return undefined
 }
@@ -669,7 +680,12 @@ export async function resolveAgentPromptSource(
         return { kind: "external_file", path, configPath: entryConfig.path }
       }
       if (prompt.trim().length > 0) {
-        return { kind: "inline", prompt, configPath: entryConfig.path }
+        return {
+          kind: "inline",
+          prompt,
+          configPath: entryConfig.path,
+          jsonPath: ["agent", effectiveName, "prompt"],
+        }
       }
     }
   }
@@ -736,6 +752,7 @@ export interface PluginOverrideAppendResult {
   agentName: string
   /** New value of the field after appending. */
   newValue: string
+  backupPath?: string
 }
 
 /**
@@ -756,99 +773,72 @@ export interface PluginOverrideAppendResult {
 export async function appendToPluginOverridePrompt(
   source: Extract<AgentPromptSource, { kind: "plugin_override" }>,
   content: string,
+  backupDir?: string,
+  assertCurrent?: () => void,
 ): Promise<PluginOverrideAppendResult> {
-  const trimmed = content.trim()
-  if (!trimmed) {
-    return {
-      configPath: source.configPath,
-      mapKey: "agent",
-      promptField: source.promptField,
-      agentName: source.agentName,
-      newValue: source.value ?? "",
-    }
-  }
-  const original = await readFile(source.configPath, "utf-8")
-  const errors: Array<{ error: number; offset: number; length: number }> = []
-  const parsed = parse(original, errors, {
-    allowTrailingComma: true,
-    disallowComments: false,
-    allowEmptyContent: false,
-  })
-  const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<
-    string,
-    unknown
-  >
-
-  // Locate the entry by NAME (the value of source.agentName) under either
-  // the `agent` or `agents` map. The agent identity comes from the source
-  // — the resolver already established it during read. `source.agentName`
-  // is the canonical config key (e.g. "sisyphus"), not a display name
-  // (e.g. "Sisyphus - ultraworker"); the read path normalizes via
-  // readPluginOverrideEntry → lookupAgentEntryWithFallback. A value-based
-  // scan is unsafe and was the root cause of B1.
-  const agentName = source.agentName
-  let mapKey: "agent" | "agents" | undefined
-  for (const key of ["agent", "agents"] as const) {
-    const m = raw[key]
-    if (!m || typeof m !== "object" || Array.isArray(m)) continue
-    if ((m as Record<string, unknown>)[agentName] !== undefined) {
-      mapKey = key
-      break
-    }
-  }
-  if (!mapKey) {
-    throw new Error(
-      `appendToPluginOverridePrompt: could not locate agent "${agentName}" ` +
-        `under "agent" or "agents" in ${source.configPath}`,
-    )
-  }
-
-  // Idempotency check: split the existing value into blocks and test for
-  // an exact match. Splitting on `\n\n` avoids the substring false-positive
-  // where a longer existing block contains the new block as a prefix
-  // (e.g. existing "Be thorough and be fast" would incorrectly subsume new
-  // "Be thorough").
-  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
-  const existingBlocks = (source.value ?? "")
-    .split(/\n\s*\n+/)
-    .map((b) => norm(b))
-    .filter(Boolean)
-  if (existingBlocks.includes(norm(trimmed))) {
-    return {
-      configPath: source.configPath,
-      mapKey,
-      promptField: source.promptField,
-      agentName,
-      newValue: source.value ?? "",
-    }
-  }
-
-  const newValue = source.value
-    ? `${source.value.trimEnd()}\n\n${trimmed}\n`
-    : `${trimmed}\n`
-
-  const modOptions: ModificationOptions = {
-    formattingOptions: {
-      insertSpaces: true,
-      tabSize: 2,
+  let mapKey: "agent" | "agents" = "agent"
+  let newValue = ""
+  const result = await commitInstructionUpdate(
+    { path: source.configPath, jsonPath: source.jsonPath },
+    (original, target) => {
+      const raw = parseInstructionJson(original)
+      const maps = (["agent", "agents"] as const).filter(
+        (key) =>
+          typeof instructionJsonValue(raw, [
+            key,
+            source.agentName,
+            source.promptField,
+          ]) === "string",
+      )
+      if (source.jsonPath) {
+        mapKey = source.jsonPath[0] as "agent" | "agents"
+        if (!maps.includes(mapKey))
+          throw new InstructionConflictError(
+            "resolved override field was removed or changed type",
+          )
+      } else {
+        if (maps.length !== 1)
+          throw new InstructionConflictError(
+            "override source is missing or ambiguous",
+          )
+        mapKey = maps[0]
+      }
+      target.jsonPath = [mapKey, source.agentName, source.promptField]
+      const current = instructionJsonValue(raw, target.jsonPath) as string
+      if (
+        /^\s*\{(?:file|path):/.test(current) ||
+        current.startsWith("file://")
+      ) {
+        throw new InstructionConflictError(
+          "override changed to a file reference; resolve its source again",
+        )
+      }
+      const norm = (text: string) =>
+        text.toLowerCase().replace(/\s+/g, " ").trim()
+      const trimmed = content.trim()
+      newValue = current
+      if (
+        trimmed &&
+        !current
+          .split(/\n\s*\n+/)
+          .map(norm)
+          .includes(norm(trimmed))
+      ) {
+        newValue = current
+          ? `${current.trimEnd()}\n\n${trimmed}\n`
+          : `${trimmed}\n`
+      }
+      return replaceInstructionJson(original, target.jsonPath, newValue)
     },
-  }
-  const edits = modify(
-    original,
-    [mapKey, agentName, source.promptField],
-    newValue,
-    modOptions,
+    { backupDir, assertCurrent },
   )
-  const updated = applyEdits(original, edits)
-  if (updated !== original) {
-    await writeTextAtomic(source.configPath, updated)
-  }
   return {
     configPath: source.configPath,
     mapKey,
     promptField: source.promptField,
-    agentName,
+    agentName: source.agentName,
     newValue,
+    backupPath: result.backupPath,
   }
 }
 
@@ -863,63 +853,21 @@ export async function materializePluginOverrideToFile(
   agentName: string,
   source: Extract<AgentPromptSource, { kind: "plugin_override" }>,
   projectRoot: string,
-  options: { mode?: "primary" | "subagent" } = {},
+  options: { mode?: "primary" | "subagent"; assertCurrent?: () => void } = {},
 ): Promise<MaterializeResult> {
-  const filePath = defaultAgentFilePath(projectRoot, agentName)
-  const mode = options.mode ?? "subagent"
-
-  let fileCreated = false
-  if (!(await fileExists(filePath))) {
-    const frontmatter = `---\nmode: ${mode}\n---\n\n`
-    const body = `${(source.value ?? "").trimEnd()}\n`
-    await writeTextAtomic(filePath, frontmatter + body)
-    fileCreated = true
-  }
-
-  const configPath = source.configPath
-  const configDir = dirname(configPath)
-  const relPath = isAbsolute(filePath)
-    ? relative(configDir, filePath) || filePath
-    : filePath
-  const newPromptValue = `{file:${relPath}}`
-
-  const original = await readFile(configPath, "utf-8")
-  const errors: Array<{ error: number; offset: number; length: number }> = []
-  const parsed = parse(original, errors, {
-    allowTrailingComma: true,
-    disallowComments: false,
-    allowEmptyContent: false,
-  })
-  const raw = (parsed && typeof parsed === "object" ? parsed : {}) as Record<
-    string,
-    unknown
-  >
-  let mapKey: "agent" | "agents" = "agent"
-  // Discover the map key by scanning for the agent's entry.
-  for (const key of ["agent", "agents"] as const) {
-    const m = raw[key]
-    if (m && typeof m === "object" && !Array.isArray(m)) {
-      if ((m as Record<string, unknown>)[agentName]) {
-        mapKey = key
-        break
-      }
-    }
-  }
-  const modOptions: ModificationOptions = {
-    formattingOptions: { insertSpaces: true, tabSize: 2 },
-  }
-  const edits = modify(
-    original,
-    [mapKey, agentName, source.promptField],
-    newPromptValue,
-    modOptions,
+  if (source.target !== "config")
+    throw new InstructionConflictError("source is already file-backed")
+  return migrateInstructionSource(
+    source.configPath,
+    source.jsonPath,
+    source.agentName,
+    source.promptField,
+    source.value ?? "",
+    defaultAgentFilePath(projectRoot, agentName),
+    projectRoot,
+    options.mode ?? "subagent",
+    options.assertCurrent,
   )
-  const updated = applyEdits(original, edits)
-  const configModified = updated !== original
-  if (configModified) {
-    await writeTextAtomic(configPath, updated)
-  }
-  return { filePath, configPath, fileCreated, configModified }
 }
 
 /**
@@ -940,64 +888,26 @@ export async function materializeInlinePrompt(
   agentName: string,
   projectRoot: string,
   globalOpencodeDir?: string,
-  options: { mode?: "primary" | "subagent" } = {},
+  options: { mode?: "primary" | "subagent"; assertCurrent?: () => void } = {},
 ): Promise<MaterializeResult> {
   const source = await resolveAgentPromptSource(
     agentName,
     projectRoot,
     globalOpencodeDir,
   )
-  if (source.kind !== "inline") {
+  if (source.kind !== "inline")
     throw new Error(
       `Agent "${agentName}" prompt is not inline (source: ${source.kind}); nothing to materialize.`,
     )
-  }
-
-  const filePath = defaultAgentFilePath(projectRoot, agentName)
-  const mode = options.mode ?? "subagent"
-
-  // Build the file body. If the file already exists (rare — would mean
-  // inline and file both defined), preserve the existing body and only
-  // touch the config.
-  let fileCreated = false
-  if (!(await fileExists(filePath))) {
-    const frontmatter = `---\nmode: ${mode}\n---\n\n`
-    const body = `${source.prompt.trimEnd()}\n`
-    await writeTextAtomic(filePath, frontmatter + body)
-    fileCreated = true
-  }
-
-  // Rewrite the config: replace `prompt` with `{file:...}` pointing at the
-  // new file. Use a path relative to the config file's directory so the
-  // rewrite is portable.
-  const configPath = source.configPath
-  const configDir = dirname(configPath)
-  let relPath: string
-  if (isAbsolute(filePath)) {
-    relPath = relative(configDir, filePath) || filePath
-  } else {
-    relPath = filePath
-  }
-  const newPromptValue = `{file:${relPath}}`
-
-  const original = await readFile(configPath, "utf-8")
-  const modOptions: ModificationOptions = {
-    formattingOptions: {
-      insertSpaces: true,
-      tabSize: 2,
-    },
-  }
-  const edits = modify(
-    original,
-    ["agent", agentName, "prompt"],
-    newPromptValue,
-    modOptions,
+  return migrateInstructionSource(
+    source.configPath,
+    source.jsonPath,
+    agentName,
+    "prompt",
+    source.prompt,
+    defaultAgentFilePath(projectRoot, agentName),
+    projectRoot,
+    options.mode ?? "subagent",
+    options.assertCurrent,
   )
-  const updated = applyEdits(original, edits)
-  const configModified = updated !== original
-  if (configModified) {
-    await writeTextAtomic(configPath, updated)
-  }
-
-  return { filePath, configPath, fileCreated, configModified }
 }

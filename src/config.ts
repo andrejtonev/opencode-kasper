@@ -47,6 +47,8 @@ const KasperConfigSchema = z.object({
   strict_sanitize: boolLike(),
   agent_prompt_inject_mode: z.enum(["section", "inline"]).default("section"),
   config_version: intField(0, 9999).optional(),
+  prompt_paths: z.array(z.string().trim().min(1)).max(50).optional(),
+  agents_md_paths: z.array(z.string().trim().min(1)).max(50).optional(),
 })
 
 const fieldValidators = KasperConfigSchema.shape
@@ -84,11 +86,13 @@ async function loadConfigFromPath(
       disallowComments: false,
       allowEmptyContent: false,
     })
+    if (errors.length) throw new Error(`Invalid JSONC in ${path}`)
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
       return undefined
     return parsed as Record<string, unknown>
-  } catch {
-    return undefined
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
   }
 }
 
@@ -176,8 +180,9 @@ export async function loadKasperConfig(
   if (projectConfig) merged = { ...merged, ...projectConfig }
 
   if (directory) {
-    const opencodeJsonPath = join(directory, "opencode.json")
-    const opencodeJson = await loadConfigFromPath(opencodeJsonPath)
+    const opencodeJson =
+      (await loadConfigFromPath(join(directory, "opencode.json"))) ??
+      (await loadConfigFromPath(join(directory, "opencode.jsonc")))
     if (opencodeJson?.kasper && typeof opencodeJson.kasper === "object") {
       merged = {
         ...merged,
@@ -245,7 +250,9 @@ export async function ensureDefaultKasperConfigFile(
   // Maximum characters of generated guidance per target (AGENTS.md or agent prompt)
   "max_agent_guidance_chars": 1200,
 
-  // Days after which inactive improvements expire and are removed (0 = never)
+  // Days to retain active improvement metadata (0 = never).
+  // This archives state metadata; it does not remove guidance from prompt files.
+  // Exact source backups and receipts remain available for explicit rollback.
   "improvement_expiry_days": 60,
 
   // Reject generated improvements containing URLs, code blocks, or instruction-injection markers
@@ -260,5 +267,12 @@ export async function ensureDefaultKasperConfigFile(
 `
 
   await mkdir(configDir, { recursive: true })
-  await writeFile(join(configDir, "kasper.jsonc"), defaultContent, "utf-8")
+  try {
+    await writeFile(join(configDir, "kasper.jsonc"), defaultContent, {
+      encoding: "utf-8",
+      flag: "wx",
+    })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+  }
 }

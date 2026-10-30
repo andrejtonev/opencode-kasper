@@ -294,7 +294,7 @@ describe("backupDirNameFor", () => {
   })
 
   test("prefixes the filename and joins the directory with --", () => {
-    expect(backupDirNameFor("/home/me/work/rules/AGENTS.md")).toBe(
+    expect(backupDirNameFor("/home/me/work/rules/AGENTS.md")).toStartWith(
       "AGENTS.md--home-me-work-rules",
     )
   })
@@ -302,14 +302,20 @@ describe("backupDirNameFor", () => {
   test("sanitises unsafe characters in directory segments", () => {
     // Spaces, colons, brackets and other shell-unsafe characters become
     // single dashes. Multiple dashes collapse to one.
-    expect(backupDirNameFor("/home/me/my rules: project[x]/AGENTS.md")).toBe(
-      "AGENTS.md--home-me-my-rules-project-x",
-    )
+    expect(
+      backupDirNameFor("/home/me/my rules: project[x]/AGENTS.md"),
+    ).toStartWith("AGENTS.md--home-me-my-rules-project-x")
   })
 
   test("uses forward slashes on POSIX and backslashes on Windows transparently", () => {
-    expect(backupDirNameFor("C:\\Users\\me\\rules\\AGENTS.md")).toBe(
+    expect(backupDirNameFor("C:\\Users\\me\\rules\\AGENTS.md")).toStartWith(
       "AGENTS.md--C-Users-me-rules",
+    )
+  })
+
+  test("paths that sanitize identically do not share backups", () => {
+    expect(backupDirNameFor("/home/my rules/AGENTS.md")).not.toBe(
+      backupDirNameFor("/home/my-rules/AGENTS.md"),
     )
   })
 })

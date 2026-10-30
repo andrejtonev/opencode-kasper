@@ -40,6 +40,7 @@
  * reading them into kasper's view would just confuse the picture.
  */
 
+import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import {
@@ -301,5 +302,10 @@ export function backupDirNameFor(resolvedPath: string): string {
     .join("--")
     .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "")
-  return sanitised ? `${filename}--${sanitised}` : filename
+  const identity = resolvedPath.replace(/\\/g, "/")
+  const hash = createHash("sha256")
+    .update(process.platform === "win32" ? identity.toLowerCase() : identity)
+    .digest("hex")
+    .slice(0, 12)
+  return sanitised ? `${filename}--${sanitised}--${hash}` : filename
 }

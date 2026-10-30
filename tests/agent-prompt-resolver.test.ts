@@ -1054,7 +1054,7 @@ describe("materializePluginOverrideToFile", () => {
     expect(newConfig.agent.sisyphus.prompt_append).toMatch(/^\{file:.+\}$/)
   })
 
-  test("does NOT overwrite an existing file at the conventional path", async () => {
+  test("refuses an existing destination with different instructions", async () => {
     // If a file already exists at `<root>/.opencode/agents/<name>.md`,
     // we leave it in place and only rewrite the config. This matches
     // the inline-prompt behaviour.
@@ -1070,22 +1070,27 @@ describe("materializePluginOverrideToFile", () => {
       }),
     )
 
-    const result = await materializePluginOverrideToFile(
-      "sisyphus",
-      {
-        kind: "plugin_override",
-        agentName: "sisyphus",
-        target: "config",
-        value: "Override text.",
-        configPath,
-        promptField: "prompt_append",
-        isAppend: true,
-      },
-      projectRoot,
-    )
-    expect(result.fileCreated).toBe(false)
+    await expect(
+      materializePluginOverrideToFile(
+        "sisyphus",
+        {
+          kind: "plugin_override",
+          agentName: "sisyphus",
+          target: "config",
+          value: "Override text.",
+          configPath,
+          promptField: "prompt_append",
+          isAppend: true,
+        },
+        projectRoot,
+      ),
+    ).rejects.toThrow("different instructions")
     // The existing content is preserved.
     expect(await readFile(existingFile, "utf-8")).toBe("Already here.")
+    expect(
+      JSON.parse(await readFile(configPath, "utf-8")).agent.sisyphus
+        .prompt_append,
+    ).toBe("Override text.")
   })
 
   test("uses primary mode when specified", async () => {

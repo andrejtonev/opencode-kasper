@@ -1,21 +1,20 @@
-import {
-  copyFile,
-  mkdir,
-  readdir,
-  readFile,
-  stat,
-  unlink,
-} from "node:fs/promises"
+import { AsyncLocalStorage } from "node:async_hooks"
+import { mkdir, readdir, readFile, stat, unlink } from "node:fs/promises"
 import { join, parse } from "node:path"
 import { backupDirNameFor } from "./agents-md-resolver.js"
-import { acquireLock } from "./lock.js"
+import {
+  commitInstructionUpdate,
+  createInstructionBackup,
+  finishInstructionBackup,
+  type InstructionLocator,
+  readInstructionText,
+  rollbackInstruction,
+  withInstructionLock,
+} from "./instruction-transaction.js"
 import {
   escapeRegex,
-  exists,
   injectSectionContent,
   parseTimestampFromFilename,
-  timestampFilename,
-  writeTextAtomic,
 } from "./prompt-utils.js"
 import type { BackupEntry } from "./types.js"
 
@@ -25,6 +24,11 @@ export class AgentsMdManager {
   private cachedContent: string | null = null
   private cachedMtime = 0
   private resolvedPath: string
+  private pendingBackups = new Map<string, string>()
+  private updateContext = new AsyncLocalStorage<{
+    target: InstructionLocator
+    backupDir: string
+  }>()
 
   constructor(
     /**
@@ -85,39 +89,68 @@ export class AgentsMdManager {
   }
 
   async backup(label: string): Promise<string> {
-    const name = timestampFilename(label)
-    const dest = join(this.backupsDir, name)
-    if (await exists(this.agentsMdPath)) {
-      await copyFile(this.agentsMdPath, dest)
+    const context = this.updateContext.getStore()
+    const path = context?.target.path ?? this.agentsMdPath
+    const backupDir = context?.backupDir ?? this.backupsDir
+    const takeBackup = async (target: InstructionLocator) => {
+      const dest = await createInstructionBackup(
+        target,
+        backupDir,
+        label,
+        await readInstructionText(target.path),
+      )
+      this.pendingBackups.set(target.path, dest)
+      return dest
     }
-    await this.enforceMaxBackups()
-    return dest
+    const result = context
+      ? await takeBackup(context.target)
+      : await withInstructionLock({ path }, takeBackup)
+    await this.enforceMaxBackups(backupDir)
+    return result
   }
 
-  async write(content: string): Promise<void> {
-    const lockPath = `${this.agentsMdPath}.lock`
-    const unlock = await acquireLock(lockPath)
-    try {
-      await writeTextAtomic(this.agentsMdPath, content)
-      this.invalidateCache()
-    } finally {
-      await unlock()
-    }
+  async write(content: string, assertCurrent?: () => void): Promise<void> {
+    await this.lockedUpdate(async () => content, assertCurrent)
   }
 
   async lockedUpdate(
     updater: (existing: string) => Promise<string>,
+    assertCurrent?: () => void,
   ): Promise<void> {
-    const lockPath = `${this.agentsMdPath}.lock`
-    const unlock = await acquireLock(lockPath)
-    try {
-      const existing = await this.read()
-      const updated = await updater(existing)
-      await writeTextAtomic(this.agentsMdPath, updated)
-      this.invalidateCache()
-    } finally {
-      await unlock()
+    const path = this.agentsMdPath
+    const backupDir = this.backupsDir
+    let updated = ""
+    const result = await commitInstructionUpdate(
+      { path },
+      async (existing, target) =>
+        this.updateContext.run({ target, backupDir }, async () => {
+          updated = await updater(existing)
+          return updated
+        }),
+      { assertCurrent },
+    )
+    const pending = this.pendingBackups.get(result.target.path)
+    if (pending) {
+      await finishInstructionBackup(pending, updated)
+      this.pendingBackups.delete(result.target.path)
     }
+    this.invalidateCache()
+  }
+
+  async applyGuidance(
+    content: string,
+    assertCurrent?: () => void,
+  ): Promise<string | undefined> {
+    const path = this.agentsMdPath
+    const backupDir = this.backupsDir
+    const result = await commitInstructionUpdate(
+      { path },
+      (existing) =>
+        this.injectSection(existing, "Kasper Inferred Instructions", content),
+      { backupDir, label: "manual-apply", assertCurrent },
+    )
+    this.invalidateCache()
+    return result.backupPath
   }
 
   async read(): Promise<string> {
@@ -137,11 +170,14 @@ export class AgentsMdManager {
     }
   }
 
-  async listBackups(): Promise<BackupEntry[]> {
+  async listBackups(backupDir = this.backupsDir): Promise<BackupEntry[]> {
     const files: BackupEntry[] = []
     try {
-      const entries = await readdir(this.backupsDir)
-      for (const e of entries.sort().reverse()) {
+      const entries = await readdir(backupDir)
+      for (const e of entries
+        .filter((name) => name.endsWith(".md"))
+        .sort()
+        .reverse()) {
         const parsed = parse(e)
         const parts = parsed.name.split("--")
         const label =
@@ -149,7 +185,7 @@ export class AgentsMdManager {
             ? parts.slice(2).join("--")
             : parts.slice(1).join("--")
         files.push({
-          path: join(this.backupsDir, e),
+          path: join(backupDir, e),
           timestamp: parseTimestampFromFilename(parsed.name),
           label: label || "unknown",
         })
@@ -161,37 +197,26 @@ export class AgentsMdManager {
     return files
   }
 
-  async rollback(): Promise<boolean> {
-    const lockPath = `${this.agentsMdPath}.lock`
-    let unlock: (() => Promise<void>) | undefined
-    try {
-      unlock = await acquireLock(lockPath)
-
-      const backups = await this.listBackups()
-      if (backups.length === 0) return false
-      const latest = backups[0]
-
-      if (await exists(this.agentsMdPath)) {
-        await this.backup("pre-rollback")
-      }
-
-      const content = await readFile(latest.path, "utf-8")
-      await writeTextAtomic(this.agentsMdPath, content)
-      return true
-    } finally {
-      if (unlock) {
-        await unlock().catch(() => {})
-      }
-    }
+  async rollback(backupPath?: string): Promise<boolean> {
+    const backupDir = this.backupsDir
+    const backups = await this.listBackups()
+    if (!backupPath && backups.length === 0) return false
+    const result = await rollbackInstruction(
+      backupPath ?? backups[0].path,
+      backupDir,
+    )
+    this.invalidateCache()
+    return result
   }
 
-  private async enforceMaxBackups(): Promise<void> {
-    const backups = await this.listBackups()
+  private async enforceMaxBackups(backupDir = this.backupsDir): Promise<void> {
+    const backups = await this.listBackups(backupDir)
     if (backups.length <= this.maxBackups) return
     const toDelete = backups.slice(this.maxBackups)
     for (const b of toDelete) {
       try {
         await unlink(b.path)
+        await unlink(`${b.path}.json`).catch(() => {})
       } catch {
         /* ignore */
       }

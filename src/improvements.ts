@@ -13,6 +13,7 @@ import { showToast } from "./utils.js"
 export async function applyImprovement(
   pending: ImprovementRecord,
   ctx: KasperContext,
+  assertCurrent?: () => void,
 ): Promise<string> {
   const patterns = pending.weaknesses ?? [pending.reason]
 
@@ -31,9 +32,15 @@ export async function applyImprovement(
         ...pending,
         target: "agents_md",
       }
-      return applyAgentsMdImprovement(rerouted, patterns, ctx, {
-        rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
-      })
+      return applyAgentsMdImprovement(
+        rerouted,
+        patterns,
+        ctx,
+        {
+          rerouteNote: `Rerouted from agent_prompt:"${pending.agent_name}" — built-in agent has no defined prompt; improvement applied to AGENTS.md instead.`,
+        },
+        assertCurrent,
+      )
     }
 
     const promptExisted = await ctx.agentPrompts.exists(pending.agent_name)
@@ -54,6 +61,7 @@ export async function applyImprovement(
       BACKUP_MAX_VERSIONS,
       agentMode,
       ctx.config.agent_prompt_inject_mode,
+      assertCurrent,
     )
     ctx.stateStore.recordImprovement({
       ...pending,
@@ -78,7 +86,7 @@ export async function applyImprovement(
     return `${pending.agent_name} agent prompt updated:\n> ${pending.reason.slice(0, 200)}\n\nRestore from .opencode/kasper/backups/ if needed${hint}${restartNote}`
   }
 
-  return applyAgentsMdImprovement(pending, patterns, ctx)
+  return applyAgentsMdImprovement(pending, patterns, ctx, {}, assertCurrent)
 }
 
 async function applyAgentsMdImprovement(
@@ -86,18 +94,10 @@ async function applyAgentsMdImprovement(
   patterns: string[],
   ctx: KasperContext,
   opts: { rerouteNote?: string } = {},
+  assertCurrent?: () => void,
 ): Promise<string> {
-  let backupPath = ""
-  await ctx.agentsMd.lockedUpdate(async (existing) => {
-    if (BACKUP_ENABLED) {
-      backupPath = await ctx.agentsMd.backup("manual-apply")
-    }
-    return ctx.agentsMd.injectSection(
-      existing,
-      "Kasper Inferred Instructions",
-      pending.reason,
-    )
-  })
+  const backupPath =
+    (await ctx.agentsMd.applyGuidance(pending.reason, assertCurrent)) ?? ""
   ctx.stateStore.recordImprovement({ ...pending, backup_path: backupPath })
   ctx.stateStore.resetWeaknessCounts(patterns)
   showToast(
