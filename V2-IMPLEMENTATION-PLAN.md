@@ -47,9 +47,9 @@ No force resets, global config rewrites, publication, or title-based deletion of
 
 | Chunk | Status | Agent | Commit/evidence |
 | --- | --- | --- | --- |
-| C01 | Pending | history_scoring | |
-| C02 | Pending | lifecycle_commands | |
-| C03 | Pending | storage_instructions | |
+| C01 | In progress | history_scoring | Isolated `migration/c01-history` worktree; real tool/checkpoint regressions. |
+| C02 | In progress | lifecycle_commands | Isolated `migration/c02-scoring` worktree; numeric/grouping regressions. |
+| C03 | In progress | storage_instructions | Isolated `migration/c03-storage` worktree; disk merge/lock/write regressions. |
 | C04 | Pending | storage_instructions | |
 | C05 | Pending | lifecycle_commands | |
 | C06 | Pending | lifecycle_commands | |
